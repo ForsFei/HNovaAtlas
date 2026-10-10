@@ -1,0 +1,48 @@
+@import "tailwindcss";
+@import "./tokens.css";
+@import "./typography.css";
+@import "./search.css";
+@import "./mdx-components.css";
+@import "./interactive.css";
+
+@theme inline {
+  --color-background: var(--background);
+  --color-surface: var(--surface);
+  --color-surface-hover: var(--surface-hover);
+  --color-border: var(--border);
+  --color-primary: var(--text-primary);
+  --color-secondary: var(--text-secondary);
+  --color-accent: var(--accent);
+  --color-accent-soft: var(--accent-soft);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-danger: var(--danger);
+}
+
+html { scroll-behavior: smooth; scroll-padding-top: 90px; }
+body {
+  margin: 0;
+  background: var(--background);
+  color: var(--text-primary);
+  font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+button, a, select, summary { -webkit-tap-highlight-color: transparent; }
+button, a, summary { transition: background-color var(--motion-duration), border-color var(--motion-duration), color var(--motion-duration); }
+button, summary, select { cursor: pointer; }
+::selection { background: var(--selection); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 4px; }
+.container-shell { width: min(calc(100% - 48px), var(--content-width)); margin-inline: auto; }
+.atlas-grid {
+  background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+.eyebrow { color: var(--accent); font: 12px/1.5 ui-monospace, monospace; letter-spacing: .14em; text-transform: uppercase; }
+.panel { border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+details > summary { list-style: none; }
+details > summary::-webkit-details-marker { display: none; }
+@media (max-width: 640px) { .container-shell { width: calc(100% - 32px); } }
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  *, *::before, *::after { transition-duration: 0ms !important; animation-duration: 0ms !important; }
+}

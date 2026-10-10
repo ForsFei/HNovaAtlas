@@ -1,0 +1,56 @@
+---
+id: wpf-mvvm
+title: WPF MVVM 与数据绑定
+description: 从绑定源与绑定目标理解 View 和 ViewModel 的连接。
+tags: [WPF, MVVM, Binding]
+difficulty: beginner
+status: published
+updated: "2026-09-29"
+order: 10
+---
+
+## 从绑定关系开始
+
+WPF 数据绑定连接一个绑定目标与一个绑定源。在 MVVM 中，视图通常通过 `DataContext` 访问 ViewModel 暴露的数据。
+
+## 一个属性绑定
+
+```xml filename="MainWindow.xaml" {1}
+<TextBlock Text="{Binding DisplayName}" />
+```
+
+这段 XAML 将 `Text` 绑定到当前数据上下文中的 `DisplayName`。排查问题时，先确认数据上下文，再检查属性路径。
+
+<Tabs label="观察绑定两端">
+  <Tab value="target" label="绑定目标">
+
+这里的绑定目标是视图中 `TextBlock` 的 `Text` 属性。它接收绑定系统提供的值。
+
+  </Tab>
+  <Tab value="source" label="绑定源">
+
+绑定源是当前 `DataContext` 指向对象的 `DisplayName` 属性；在 MVVM 中通常由 ViewModel 提供。
+
+  </Tab>
+</Tabs>
+
+## 数据变化如何通知视图
+
+绑定源实现 `INotifyPropertyChanged`，可以通知绑定系统属性已变化。集合增删通知与单个元素的属性变化，是两个需要分别处理的问题。
+
+<Callout type="warning" title="绑定不是轮询">
+
+属性值改变后，需要正确发出变化通知。仅修改字段，并不保证视图会自动更新。
+
+</Callout>
+
+## 检查顺序
+
+1. 目标控件的 `DataContext` 是否正确？
+2. 属性路径是否存在？
+3. 绑定方向是否符合交互需求？
+4. 源变化时是否发出通知？
+
+## 参考资料
+
+[Microsoft Learn：WPF 数据绑定概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/)

@@ -1,0 +1,38 @@
+---
+id: ethercat-process-image
+title: 过程映像：主站如何使用 PDO
+description: 区分主站输入与输出的内存视图，理解数据方向、偏移和周期之间的关系。
+tags: [EtherCAT, PDO, 过程映像]
+difficulty: beginner
+status: published
+updated: "2026-10-09"
+order: 14
+related: [ethercat-pdo, ethercat-pdo-mapping]
+prerequisite: [ethercat-pdo-mapping]
+---
+
+## 两个方向，不是一块万能内存
+
+主站应用需要写入将要发送给从站的**输出过程数据**，并读取从站返回的**输入过程数据**。在采用 CoE 的常见命名里，从站接收的输出数据称 RxPDO，从站发送的输入数据称 TxPDO。方向始终要先说明“谁在收、谁在发”。
+
+过程映像是应用访问这些数据的视图。PDO Mapping 描述交换的字段；过程映像还要回答应用在哪个偏移、以什么数据类型读取或写入。对象字典索引不能直接当作过程映像的 Byte 偏移。
+
+## 跟随一轮交换
+
+1. 应用更新本轮主站输出视图中的字段。
+2. 主站组织周期过程数据并发出 EtherCAT 帧。
+3. 帧经过从站时，控制器在转发过程中读取对应输出数据、插入输入数据。
+4. 帧返回主站后，应用通过输入视图使用收到的数据。
+
+这是理解数据方向的**概念顺序**，不是应用线程调度、分布式时钟或精确采样时刻的时序图。主站 API、同步方式和数据有效性检查须依据实际系统。
+
+## Cycle Time 改变什么
+
+若仅做算术换算，1000 µs 对应每秒 1000 个周期，500 µs 对应每秒 2000 个周期。但“设定周期”不等于硬件一定能稳定达到，也不说明报文在网络中的延迟。PDO 映射的字段数量和宽度影响过程数据大小；是否适合目标周期还需测量整个系统。
+
+在 [PDO 过程数据实验](/labs/ethercat-pdo/) 中拖动 Cycle Time，同时观察示例字段大小不变，再点击不同从站核对输入、输出的独立偏移。
+
+## 参考资料
+
+- [EtherCAT Technology Group：技术原理](https://www.ethercat.org/en/technology.html)
+- [Beckhoff：Process image](https://infosys.beckhoff.com/content/1033/ep6002/7849366027.html)

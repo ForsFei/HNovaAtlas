@@ -1,0 +1,47 @@
+---
+id: ethercat-pdo-mapping
+title: PDO Mapping：字段如何进入周期数据
+description: 从字段方向、位长度和排列顺序理解 PDO 映射，并在交互实验中观察偏移变化。
+tags: [EtherCAT, PDO, Mapping]
+difficulty: beginner
+status: published
+updated: "2026-10-09"
+order: 12
+related: [ethercat-pdo, ethercat-process-image]
+prerequisite: [ethercat-pdo]
+---
+
+## 映射回答什么问题
+
+PDO Mapping 说明应用对象中的哪些条目参加周期性过程数据交换，以及每个条目占多少位。它关心的是**字段内容、方向、位长度与顺序**，而不是“对象索引就是内存地址”。
+
+在支持 CoE 的设备中，RxPDO 从**设备视角**接收主站输出，TxPDO 从设备发送主站输入。例如控制字通常是输出方向，状态字通常是输入方向。具体字段能否修改、怎样分组，取决于设备及其配置，不应把教学示例当作通用设备定义。
+
+## 一个简化的字节布局
+
+假设三个相同的示例从站，每站的输出仅有 16 bit 控制字，输入仅有 16 bit 状态字，并且两侧都从 Byte 0 顺序排列：
+
+| 从站 | 主站输出 / RxPDO | 主站输入 / TxPDO |
+| --- | --- | --- |
+| 1 | Byte 0–1 | Byte 0–1 |
+| 2 | Byte 2–3 | Byte 2–3 |
+| 3 | Byte 4–5 | Byte 4–5 |
+
+若每站再各增加一个 32 bit 位置字段，那么每站在对应方向占 6 Byte，下一站的起点依次变为 Byte 6、12。这里把输入和输出**分别**从 0 编址；它们是两张方向不同的过程数据视图。
+
+<Callout type="warning" title="这不是设备配置表">
+
+真实 PDO 可能有位级字段、不同从站大小、可选分配、打包和对齐差异。配置时应核对具体型号的 ESI、设备手册与主站显示的过程映像，不能直接套用上面的偏移。
+
+</Callout>
+
+## 动手观察
+
+打开 [PDO 过程数据实验](/labs/ethercat-pdo/)，切换“基础”和“扩展”映射，再改变从站数量。重点观察：映射改变的是**每站字段宽度**，从而改变后续从站的示例偏移；Cycle Time 并不改变这些字段的字节宽度。
+
+下一篇：[过程映像：主站如何使用 PDO](/knowledge/industrial/ethercat/communication/process-image/)。
+
+## 参考资料
+
+- [Beckhoff：Process Data Objects (PDO)](https://infosys.beckhoff.com/content/1033/cx1500_fb_510/3222417931.html)
+- [Beckhoff：Adapt process image](https://infosys.beckhoff.com/content/1033/epp1xxx/15127234443.html)

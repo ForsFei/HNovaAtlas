@@ -1,0 +1,31 @@
+.knowledge-prose .atlas-component-body > :first-child { margin-top: 0; }
+.knowledge-prose .atlas-component-body > :last-child { margin-bottom: 0; }
+.knowledge-prose .atlas-callout { background: var(--surface); border-left: 3px solid var(--accent); }
+.atlas-callout-title { display: flex; align-items: center; gap: 8px; color: var(--accent); margin-bottom: 10px; }
+.atlas-callout[data-kind="tip"] { border-left-color: var(--success); }
+.atlas-callout[data-kind="tip"] .atlas-callout-title { color: var(--success); }
+.atlas-callout[data-kind="warning"] { border-left-color: var(--warning); }
+.atlas-callout[data-kind="warning"] .atlas-callout-title { color: var(--warning); }
+.atlas-callout[data-kind="danger"] { border-left-color: var(--danger); }
+.atlas-callout[data-kind="danger"] .atlas-callout-title { color: var(--danger); }
+.atlas-callout .atlas-callout-title strong { color: inherit; }
+.atlas-accordion, .atlas-tabs, .atlas-diagram { margin: 24px 0; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); min-width: 0; }
+.atlas-accordion > summary { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 20px; font-size: 14px; font-weight: 600; }
+.atlas-accordion > summary svg { flex-shrink: 0; transition: transform var(--motion-duration); }
+.atlas-accordion[open] > summary { border-bottom: 1px solid var(--border); }
+.atlas-accordion[open] > summary svg { transform: rotate(180deg); }
+.atlas-accordion-content, .atlas-tabpanel { padding: 20px; }
+.atlas-tablist { display: flex; gap: 4px; overflow-x: auto; padding: 8px 10px 0; border-bottom: 1px solid var(--border); }
+.atlas-tablist > button { flex-shrink: 0; padding: 10px 14px; font-size: 14px; color: var(--text-secondary); border-bottom: 2px solid transparent; }
+.atlas-tablist > button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft); }
+.atlas-tablist > button:focus-visible { outline-offset: -3px; }
+.atlas-tabpanel[hidden] { display: none; }
+.atlas-diagram > figcaption { padding: 12px 16px; border-bottom: 1px solid var(--border); color: var(--text-secondary); font-size: 13px; }
+.atlas-diagram-canvas { overflow-x: auto; padding: 20px 12px; }
+.atlas-diagram-canvas svg { display: block; margin: auto; height: auto; min-width: 600px; }
+.knowledge-prose .atlas-diagram-status { padding: 24px 16px; margin: 0; font-size: 14px; }
+.atlas-diagram-retry { margin: 0 16px 16px; border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px; color: var(--accent); font-size: 13px; }
+.atlas-diagram-source { border-top: 1px solid var(--border); }
+.atlas-diagram-source > summary { padding: 10px 16px; font-size: 13px; color: var(--text-secondary); }
+.knowledge-prose .atlas-diagram-source pre { margin: 0; border: 0; border-top: 1px solid var(--border); border-radius: 0 0 var(--radius) var(--radius); font-size: 13px; }
+@media (max-width: 640px) { .atlas-accordion-content, .atlas-tabpanel { padding: 16px; } }

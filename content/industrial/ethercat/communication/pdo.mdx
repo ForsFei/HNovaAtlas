@@ -1,0 +1,86 @@
+---
+id: ethercat-pdo
+title: EtherCAT PDO
+description: 理解过程数据对象、映射与主站过程映像之间的关系。
+tags: [EtherCAT, PDO, 过程数据]
+difficulty: beginner
+status: published
+updated: "2026-09-29"
+order: 10
+related: [ethercat-introduction, ethercat-pdo-mapping, ethercat-process-image, ethercat-sdo]
+prerequisite: [ethercat-introduction]
+---
+
+## PDO 表达什么
+
+在采用 CoE 的 EtherCAT 设备中，PDO（Process Data Object）用于表达输入和输出过程数据。它把需要交换的对象条目组织起来，例如控制字、状态字和位置值。
+
+<Callout type="info" title="先确定观察视角">
+
+RxPDO 和 TxPDO 的命名通常以从站设备为视角：RxPDO 由设备接收，TxPDO 由设备发送。对照设备文档确认方向，不要只凭主站应用中的“输入/输出”名称判断。
+
+</Callout>
+
+## 映射与过程映像
+
+可以把两者分开理解：
+
+1. **PDO Mapping** 描述交换哪些对象条目，以及条目的位长度。
+2. **过程映像** 是主站应用读取或写入这些过程数据的内存视图。
+
+映射定义了数据内容，应用代码还需要知道过程映像中的布局。数据类型、偏移和方向必须一致。
+
+```mermaid caption="从对象条目到主站应用"
+flowchart LR
+  A[对象字典条目] --> B[PDO 映射]
+  B --> C[过程数据交换]
+  C --> D[主站过程映像]
+  D --> E[应用读取与写入]
+```
+
+<Tabs label="区分映射和过程映像">
+  <Tab value="mapping" label="PDO Mapping">
+
+映射描述**交换哪些条目**与各条目的位长度。查看对象索引、子索引和排列顺序。
+
+  </Tab>
+  <Tab value="image" label="过程映像">
+
+过程映像是应用使用的内存视图。核对字节偏移、数据类型和设备方向，不能把索引号直接当作内存偏移。
+
+  </Tab>
+</Tabs>
+
+## 配置时需要核对的内容
+
+| 项目 | 需要确认的问题 |
+| --- | --- |
+| 方向 | 数据由主站发送，还是由从站返回？ |
+| 大小 | 每个条目占多少位或字节？ |
+| 顺序 | 条目在映射中如何排列？ |
+| 可配置性 | 设备允许修改映射，还是使用固定 PDO？ |
+
+不要把某一设备的 PDO 布局当成所有设备的通用布局。配置应依据 ESI 和对应设备文档。
+
+<Accordion title="为什么映射相同，应用读到的数据仍可能不对？">
+
+即使条目相同，应用使用的偏移、长度或类型也可能与主站配置不一致。先对照实际过程映像，再核对每个字段的读取方式；不要只检查对象索引。
+
+</Accordion>
+
+## 自测与回顾
+
+<Quiz question="PDO 和 SDO 哪个适合周期性实时数据？" options={["PDO", "SDO", "两者相同"]} answer={0} explanation="PDO 用于周期性交换过程数据；SDO 用于按对象索引访问参数。它们承担不同用途，不能直接互换。" />
+
+<FlashCard front="PDO 的英文全称是什么？" back="Process Data Object（过程数据对象）。它组织需要交换的输入与输出过程数据。" />
+
+<FlashCard front="PDO Mapping 和过程映像有什么区别？" back="Mapping 定义交换哪些对象条目及其位长度；过程映像是主站应用读取与写入这些数据的内存视图。" />
+
+## 下一步
+
+继续阅读 [PDO Mapping](/knowledge/industrial/ethercat/communication/pdo-mapping/) 和 [过程映像](/knowledge/industrial/ethercat/communication/process-image/)，或打开 [PDO 过程数据实验](/labs/ethercat-pdo/) 观察字段、偏移和帧经过从站的示意过程。需要按对象索引访问参数时，再阅读 [EtherCAT SDO](/knowledge/industrial/ethercat/communication/sdo/)。
+
+## 参考资料
+
+- [Beckhoff：Process data](https://infosys.beckhoff.com/content/1033/tc3_io_intro/1344982411.html)
+- [Beckhoff：设备过程数据配置](https://infosys.beckhoff.com/content/1033/elm2xxx/1037003019.html)

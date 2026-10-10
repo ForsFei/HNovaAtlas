@@ -1,0 +1,32 @@
+---
+id: ethercat-sdo
+title: EtherCAT SDO
+description: 认识 CoE 对象字典与邮箱参数访问。
+tags: [EtherCAT, SDO, CoE]
+difficulty: beginner
+status: published
+updated: "2026-09-29"
+order: 20
+related: [ethercat-pdo]
+---
+
+## 从对象字典看参数
+
+在支持 CoE 的设备中，对象字典用于组织可访问的参数。阅读设备文档时，通常需要关注对象索引、子索引、数据类型和访问权限。
+
+## 邮箱访问与过程数据
+
+SDO 用于访问对象字典中的数据。理解它时，应把邮箱参数访问与 PDO 过程数据交换分开：两者服务于不同的访问需求。
+
+| 关注点 | 过程数据 | 参数访问 |
+| --- | --- | --- |
+| 阅读入口 | PDO 与过程映像 | 对象字典与 CoE 邮箱 |
+| 配置检查 | 布局、大小与方向 | 索引、类型与权限 |
+
+## 查看设备能力
+
+配置工具显示哪些对象，以及是否能读取对象描述，取决于设备提供的能力。先查看设备文档，再确认工具读取到的对象字典。
+
+## 参考资料
+
+[Beckhoff：CoE 邮箱配置](https://infosys.beckhoff.com/content/1033/tc3_io_intro/1357984011.html)

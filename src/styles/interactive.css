@@ -1,0 +1,37 @@
+.atlas-learning { min-width: 0; margin: 28px 0; padding: 20px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface); }
+.knowledge-prose .atlas-learning-eyebrow { margin: 0 0 10px; font-size: 11px; letter-spacing: .08em; color: var(--accent); }
+.knowledge-prose .atlas-learning-title { margin: 0 0 18px; color: var(--text-primary); font-weight: 600; line-height: 1.6; }
+.atlas-quiz-options { display: grid; gap: 8px; }
+.atlas-quiz-options > button { display: flex; gap: 12px; align-items: center; min-height: 48px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 8px; text-align: left; color: var(--text-primary); }
+.atlas-quiz-options > button:hover { background: var(--surface-hover); }
+.atlas-quiz-options > button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); }
+.atlas-quiz-options > button[data-result="correct"] { border-color: var(--success); }
+.atlas-quiz-options > button[data-result="incorrect"] { border-color: var(--warning); }
+.atlas-option-letter { display: flex; align-items: center; justify-content: center; width: 24px; height: 24px; flex-shrink: 0; border-radius: 4px; background: var(--surface-hover); font: 12px/1 ui-monospace, monospace; }
+.knowledge-prose .atlas-quiz-feedback p { margin: 10px 0; font-size: 14px; }
+.atlas-quiz-feedback[data-result="correct"] .atlas-feedback-label { color: var(--success); font-weight: 600; }
+.atlas-quiz-feedback[data-result="incorrect"] .atlas-feedback-label { color: var(--warning); font-weight: 600; }
+.atlas-learning-button { min-height: 40px; padding: 8px 12px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; color: var(--accent); }
+.atlas-learning-button:hover:not(:disabled) { background: var(--accent-soft); }
+.atlas-learning-button:disabled { cursor: default; color: var(--text-secondary); opacity: .55; }
+.atlas-learning-reference { margin-top: 18px; border-top: 1px solid var(--border); }
+.atlas-learning-reference > summary { padding-top: 12px; font-size: 13px; color: var(--text-secondary); }
+.atlas-flashcard-face { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 24px; width: 100%; min-height: 180px; padding: 24px 20px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-hover); color: var(--text-primary); }
+.atlas-flashcard-face[data-revealed="true"] { background: var(--accent-soft); border-color: var(--accent); }
+.atlas-flashcard-content { white-space: pre-line; text-align: center; font-size: 17px; line-height: 1.8; }
+.atlas-flashcard-content[hidden] { display: none; }
+.atlas-flashcard-hint { font-size: 12px; color: var(--text-secondary); }
+.knowledge-prose .atlas-step-nav { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 18px; padding: 0; list-style: none; }
+.atlas-step-nav li + li { margin: 0; }
+.atlas-step-nav button { display: flex; align-items: center; gap: 8px; min-height: 42px; border: 1px solid var(--border); border-radius: 6px; padding: 8px 12px; font-size: 13px; color: var(--text-secondary); text-align: left; }
+.atlas-step-nav button[aria-current="step"] { color: var(--accent); background: var(--accent-soft); border-color: var(--accent); }
+.atlas-step-panel { padding: 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface-hover); }
+.knowledge-prose .atlas-step-count { margin: 0 0 12px; color: var(--text-primary); font-size: 14px; font-weight: 600; }
+.knowledge-prose .atlas-learning-text { white-space: pre-line; }
+.atlas-step-panel .atlas-learning-text { margin: 0; font-size: 14px; }
+.atlas-step-states { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 160px), 1fr)); gap: 8px; margin-top: 16px; }
+.atlas-step-states > div { min-width: 0; padding: 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); }
+.atlas-step-states dt { font-size: 12px; color: var(--text-secondary); }
+.atlas-step-states dd { margin-top: 4px; font: 13px/1.6 ui-monospace, Consolas, monospace; color: var(--accent); overflow-wrap: anywhere; }
+.atlas-step-controls { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; }
+@media (max-width: 640px) { .atlas-learning { padding: 16px; } }

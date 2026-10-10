@@ -1,0 +1,6 @@
+site: out
+glob: knowledge/**/*.html
+include_characters: "#+."
+exclude_selectors:
+  - .line-number
+  - .atlas-code-toolbar

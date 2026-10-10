@@ -1,0 +1,39 @@
+---
+id: ethercat-introduction
+title: EtherCAT 入门
+description: 从主站、从站和帧的处理方式理解 EtherCAT。
+tags: [EtherCAT, 工业以太网]
+difficulty: beginner
+status: published
+updated: "2026-09-29"
+order: 10
+related: [ethercat-pdo, ethercat-sdo]
+---
+
+## 从网络中的角色开始
+
+EtherCAT 是用于工业控制的以太网技术。**主站**组织通信，从站在报文经过时读取属于自己的输出数据，并写入输入数据。
+
+这种处理方式称为 *processing on the fly*。理解它时，可以先观察数据沿网络经过设备的过程，再讨论具体的数据对象和同步方式。
+
+## 三个阅读入口
+
+- **设备**：主站和从站承担什么职责？
+- **数据**：哪些数据需要周期交换，哪些参数按需访问？
+- **时间**：设备在什么时刻采样或更新输出？
+
+这三个入口分别对应网络组织、过程数据和同步机制。学习 PDO 前，先区分设备身份与数据方向。
+
+<aside aria-label="阅读提示">
+  主站视角的输出，是发往从站的数据；主站视角的输入，是从从站读取的数据。
+</aside>
+
+## 从设备描述到过程数据
+
+设备的 ESI 文件描述其能力，例如过程数据、映射选项和支持的同步方式。它帮助配置工具理解设备，但现场配置仍应与具体型号和版本匹配。
+
+接下来阅读 [EtherCAT PDO](/knowledge/industrial/ethercat/communication/pdo/) 和 [EtherCAT SDO](/knowledge/industrial/ethercat/communication/sdo/)，理解两类数据访问的用途。
+
+## 参考资料
+
+[EtherCAT Technology Group：技术概览](https://www.ethercat.org/en/technology.html)

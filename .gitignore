@@ -1,0 +1,13 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.env*
+!.env.example
+next-env.d.ts
+playwright-report/
+test-results/
+src/generated/
+task_plan.md
+progress.md
+findings.md

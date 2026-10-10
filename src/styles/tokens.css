@@ -1,0 +1,59 @@
+:root {
+  color-scheme: light;
+  --background: #f8fafc;
+  --surface: #ffffff;
+  --surface-hover: #eef2f7;
+  --border: #dde3ed;
+  --text-primary: #172033;
+  --text-secondary: #526078;
+  --accent: #245bc5;
+  --accent-soft: #eaf0ff;
+  --success: #16734e;
+  --warning: #986218;
+  --danger: #bb3546;
+  --grid: #e9edf4;
+  --selection: #cbdcff;
+  --overlay: #00000080;
+  --syntax-foreground: var(--text-primary);
+  --syntax-background: var(--surface);
+  --syntax-token-comment: #65738a;
+  --syntax-token-string: #186548;
+  --syntax-token-keyword: #9a2861;
+  --syntax-token-constant: #245bc5;
+  --syntax-token-function: #6b42a1;
+  --syntax-token-parameter: #86581b;
+  --syntax-token-punctuation: var(--text-secondary);
+  --syntax-token-link: var(--accent);
+  --syntax-token-string-expression: var(--syntax-token-string);
+  --syntax-token-inserted: var(--success);
+  --syntax-token-deleted: var(--danger);
+  --syntax-token-changed: var(--warning);
+  --radius: 12px;
+  --content-width: 1280px;
+  --reading-width: 820px;
+  --motion-duration: 180ms;
+}
+
+[data-theme="dark"] {
+  color-scheme: dark;
+  --background: #090b10;
+  --surface: #0f1218;
+  --surface-hover: #151922;
+  --border: #252c39;
+  --text-primary: #e8edf6;
+  --text-secondary: #99a5b9;
+  --accent: #8aafff;
+  --accent-soft: #182640;
+  --success: #7ed4ac;
+  --warning: #e1bd78;
+  --danger: #f394a3;
+  --grid: #151a24;
+  --selection: #284a7c;
+  --overlay: #000000a6;
+  --syntax-token-comment: #91a0b8;
+  --syntax-token-string: #8dd9b2;
+  --syntax-token-keyword: #f09ac2;
+  --syntax-token-constant: #8aafff;
+  --syntax-token-function: #c1a4ef;
+  --syntax-token-parameter: #e1bd78;
+}
