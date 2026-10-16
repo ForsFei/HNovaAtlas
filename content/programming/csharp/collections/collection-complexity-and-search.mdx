@@ -1,0 +1,92 @@
+---
+id: csharp-collection-complexity
+title: 集合操作复杂度：批量查找、扩容与二分
+description: 从实际操作序列估算 List、HashSet、Dictionary 的成本，辨别摊还复杂度、排序前提与比较器边界。
+tags: [CSharp, 集合, 算法复杂度, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 17
+prerequisite: [csharp-collection-selection]
+related: [csharp-linq, csharp-query-boundaries]
+---
+
+## 先描述工作负载，再说“大 O”
+
+[集合选型与相等性](/knowledge/programming/csharp/collections/collection-selection-and-equality/)已经介绍各类型的用途。真正估算成本时，还要问：集合有多少项 `n`？要做多少次查询 `m`？数据是否已经排序？结果是否需要保持输入顺序？时间复杂度描述的是规模增长趋势，不是某台机器上的毫秒数，也没有包括所有分配、哈希计算、缓存命中和数据源成本。
+
+| 操作 | 典型量级 | 关键前提 |
+| --- | --- | --- |
+| `List<T>[index]` | O(1) | 索引有效；不代表按值查找快 |
+| `List<T>.Contains(value)` | O(n) | 逐项比较；在开头找到可提前结束 |
+| `List<T>.Add(value)` | 摊还 O(1) | 扩容那一次复制现有项，可能是 O(n) |
+| `List<T>.Insert(0, value)` | O(n) | 后续元素需要移动 |
+| `HashSet<T>.Contains`、`Dictionary<TKey,TValue>.ContainsKey` | 通常接近 O(1) | 依赖良好的哈希与相等比较，不能保证每次都是常数 |
+| `List<T>.Sort`、已排序列表的 `BinarySearch` | O(n log n)、O(log n) | 排序和查找必须使用一致的排序比较器 |
+
+这些是**操作级**估算。若只查一次，小列表线性扫描可能比建立哈希索引更直接；若同一批数据要查 `m` 次，列表逐次扫描上界约 O(n × m)，先建集合再查询的典型总成本约 O(n + m)，但要多用 O(n) 存储。哈希查找也受碰撞、比较器成本和扩容影响；不要把表格读成最坏情况保证。
+
+## 扩容与“摊还”
+
+`List<T>` 的 `Count` 是元素数，`Capacity` 是当前底层空间。容量足够时末尾 `Add` 是 O(1)；不够时要申请更大的空间并复制，单次可能 O(n)。把许多次追加合起来分析，才有“摊还 O(1)”的说法。不要误解为每次追加都严格 O(1)。
+
+若**可信且合理**地知道预计数量，可以用 `new List<T>(estimatedCount)` 或 `EnsureCapacity` 减少扩容；`EnsureCapacity` 不改变 `Count`。不要把未经约束的外部数字直接当预分配容量，否则可能造成不必要的大内存申请。对小集合或未知规模，让集合自行增长通常更简单。
+
+## 二分查找的隐藏成本
+
+`BinarySearch` 只对**已经按同一比较器排序**的列表有意义。返回非负值表示找到；负值的按位取反 `~index` 是保持顺序的插入位置。查找虽是 O(log n)，插入到列表中间仍可能移动 O(n) 个元素。若每插入一项都要重新 `Sort`，更不能只报查询的 O(log n)。
+
+还要区分排序比较器 `IComparer<T>` 和相等比较器 `IEqualityComparer<T>`。前者决定先后，后者决定哈希集合/字典中的“同一个键”；业务若用忽略大小写的 ID，排序、查找和去重应选一致的规则，否则会出现“集合认为相同、二分却找不到”的矛盾。
+
+## 完整可运行例子
+
+下面对同一批设备 ID 做成员判断，验证列表扫描与集合索引结果一致；再验证排序、二分和插入位置。代码断言的是**行为**，不把一次运行时间当作复杂度证明。
+
+```csharp filename="Program.cs"
+using System.Collections.Generic;
+
+StringComparer comparer = StringComparer.OrdinalIgnoreCase;
+List<string> devices = ["pump-C", "pump-A", "pump-B", "pump-A"];
+string[] requested = ["PUMP-A", "pump-B", "missing"];
+
+bool[] scanned = requested.Select(id => devices.Contains(id, comparer)).ToArray();
+var index = new HashSet<string>(devices, comparer);
+bool[] indexed = requested.Select(index.Contains).ToArray();
+Require(scanned.SequenceEqual(indexed), "两种查询应遵循相同比较规则");
+Require(index.Count == 3 && indexed.SequenceEqual([true, true, false]), "去重与查询结果");
+
+var sorted = devices.Distinct(comparer).ToList();
+sorted.Sort(comparer);
+int found = sorted.BinarySearch("PUMP-B", comparer);
+Require(found >= 0 && comparer.Equals(sorted[found], "pump-B"), "二分查找");
+
+int missing = sorted.BinarySearch("pump-BB", comparer);
+Require(missing < 0, "不存在的项返回负数");
+sorted.Insert(~missing, "pump-BB");
+Require(sorted.SequenceEqual(["pump-A", "pump-B", "pump-BB", "pump-C"], comparer),
+    "按同一比较器插入后仍有序");
+
+var reserved = new List<int>(capacity: 16);
+Require(reserved.Count == 0 && reserved.Capacity >= 16, "预留空间不等于添加元素");
+reserved.Add(42);
+Require(reserved.Count == 1, "Add 才改变元素数");
+
+Console.WriteLine("集合查询、二分与容量断言通过。");
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+```
+
+仓库示例：`dotnet run --project examples/csharp-collection-complexity/CollectionComplexityReview.csproj`；正文完整代码块由 `npm run test:csharp-articles` 单独编译。`Enumerable.Contains` 在这里使用相等比较器重载；直接 `List<T>.Contains(value)` 使用默认相等规则。若 ID 大小写规则不同，不能把这两个调用的结果直接比较。
+
+## 自测与面试追问
+
+1. 一万个设备 ID，只查一次和查十万次，分别会怎样考虑列表与哈希集合？除了时间，还要考虑什么？
+2. 为什么 `List<T>.Add` 可以说“摊还 O(1)”，却不能说“每次 O(1)”？`Count` 与 `Capacity` 有何不同？
+3. 已排序列表二分找到插入位置后，整个插入操作还是 O(log n) 吗？为什么？
+4. 为什么 `Sort(StringComparer.Ordinal)` 后用 `BinarySearch(value, StringComparer.OrdinalIgnoreCase)` 不可靠？
+5. 复杂度表能证明哈希表每次查找都比小列表快吗？你会如何基于真实工作负载测量？
+
+参考：[Microsoft Learn：集合与数据结构](https://learn.microsoft.com/en-us/dotnet/standard/collections/)、[`List<T>.Add`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.list-1.add)、[`List<T>.Contains`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.list-1.contains)、[`List<T>.BinarySearch`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.list-1.binarysearch)、[`List<T>.Sort`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.list-1.sort)、[`Dictionary<TKey,TValue>.ContainsKey`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.generic.dictionary-2.containskey)。

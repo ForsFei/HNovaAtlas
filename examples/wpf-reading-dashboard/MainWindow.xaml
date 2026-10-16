@@ -1,0 +1,90 @@
+<Window x:Class="WpfReadingDashboard.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="模拟设备读数面板" Width="800" Height="640" MinWidth="560" MinHeight="460"
+        Closing="Window_Closing">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <StackPanel>
+            <TextBlock Text="模拟设备读数面板" FontSize="22" FontWeight="SemiBold" />
+            <TextBlock Text="教学用本地数据；不连接、不控制真实设备。" Margin="0,5,0,0" Foreground="DimGray" />
+        </StackPanel>
+
+        <WrapPanel Grid.Row="1" Margin="0,18,0,12">
+            <Button Content="读取一批" Click="Load_Click" IsEnabled="{Binding CanLoad}" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="模拟读取失败" Click="Fail_Click" IsEnabled="{Binding CanLoad}" Padding="12,6" Margin="0,0,8,0" />
+            <Button Content="取消读取" Click="Cancel_Click" IsEnabled="{Binding CanCancel}" Padding="12,6" />
+        </WrapPanel>
+
+        <StackPanel Grid.Row="2" Margin="0,0,0,16">
+            <TextBlock Text="{Binding StatusText}" TextWrapping="Wrap" />
+            <TextBlock Margin="0,5,0,0">
+                <Run Text="总数：" /><Run Text="{Binding ReadingCount, Mode=OneWay}" />
+                <Run Text="  报警：" /><Run Text="{Binding AlertCount, Mode=OneWay}" />
+                <Run Text="  本地阈值：" /><Run Text="{Binding Threshold, Mode=OneWay}" /><Run Text=" °C" />
+            </TextBlock>
+        </StackPanel>
+
+        <WrapPanel Grid.Row="3" Margin="0,0,0,12" VerticalAlignment="Center">
+            <TextBlock Text="阈值" VerticalAlignment="Center" Margin="0,0,7,0" />
+            <TextBox Width="60" Margin="0,0,7,0"
+                     Text="{Binding ThresholdText, UpdateSourceTrigger=PropertyChanged, ValidatesOnDataErrors=True}" />
+            <Button Content="应用本地阈值" Command="{Binding ApplyThresholdCommand}" Padding="8,4" Margin="0,0,7,0" />
+            <Button Content="撤销编辑" Command="{Binding CancelEditCommand}" Padding="8,4" Margin="0,0,16,0" />
+            <TextBlock Text="{Binding ValidationError}" Foreground="Firebrick" VerticalAlignment="Center" />
+        </WrapPanel>
+
+        <Grid Grid.Row="4">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+            </Grid.RowDefinitions>
+            <WrapPanel Margin="0,0,0,9">
+                <TextBlock Text="筛选设备" VerticalAlignment="Center" Margin="0,0,7,0" />
+                <TextBox Width="130" Margin="0,0,16,0"
+                         Text="{Binding DeviceFilter, UpdateSourceTrigger=PropertyChanged}" />
+                <CheckBox Content="仅显示报警" IsChecked="{Binding AlertsOnly}" VerticalAlignment="Center" />
+            </WrapPanel>
+            <ListBox x:Name="ReadingsList" Grid.Row="1"
+                     ScrollViewer.CanContentScroll="True"
+                     VirtualizingPanel.IsVirtualizing="True"
+                     VirtualizingPanel.VirtualizationMode="Recycling">
+                <ListBox.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Margin="4,3">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="85" />
+                                <ColumnDefinition Width="150" />
+                                <ColumnDefinition Width="130" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <TextBlock Text="{Binding Id, StringFormat=编号 {0}}" />
+                            <TextBlock Grid.Column="1" Text="{Binding Device}" />
+                            <TextBlock Grid.Column="2" Text="{Binding Temperature, StringFormat={}{0} °C}" />
+                            <TextBlock Grid.Column="3" Text="{Binding AlertText}">
+                                <TextBlock.Style>
+                                    <Style TargetType="TextBlock">
+                                        <Setter Property="Foreground" Value="ForestGreen" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsAlert}" Value="True">
+                                                <Setter Property="Foreground" Value="Firebrick" />
+                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </TextBlock.Style>
+                            </TextBlock>
+                        </Grid>
+                    </DataTemplate>
+                </ListBox.ItemTemplate>
+            </ListBox>
+        </Grid>
+    </Grid>
+</Window>

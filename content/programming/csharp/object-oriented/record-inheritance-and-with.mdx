@@ -1,0 +1,91 @@
+---
+id: csharp-record-inheritance-with
+title: record 继承与 with：运行时类型、相等性和浅复制
+description: 用最小记录层级验证派生类型相等、基类视图下的 with、派生成员设置和可变引用共享。
+tags: [CSharp, record, OOP, 相等性, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-15"
+order: 42
+prerequisite: [csharp-value-equality]
+related: [csharp-inheritance-polymorphism, csharp-readonly-struct-copies, csharp-immutable-collections-snapshots]
+---
+
+## 为什么单个 record 的例子还不够
+
+[值语义与相等性](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/)已经证明：`record class` 仍是引用类型，但编译器生成成员值相等；`with` 创建新记录，对可变引用成员通常只是浅复制。一旦建立 `DeviceEvent → ReadingEvent / AlarmEvent` 层级，又多出两个容易误判的问题：只看基类字段时能否把不同事件判为相等？变量静态类型为 `DeviceEvent` 时，`with` 会不会把派生信息“切掉”？
+
+答案分别是**不能**和**不会**。记录继承的生成相等性包含运行时记录类型，派生记录还比较继承与自身成员。`with` 从基类类型变量出发时，结果保留操作数的运行时派生类型；但初始化器只能写编译时类型可见的成员。这个“运行时保留、编译时限制”是重点，不要混成“`with` 总能改任意派生属性”。这些规则适用于 `record class` 的继承；`record struct` 不能继承另一个记录。[C# record 语言参考](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record)给出了运行时类型比较与 `with` 的正式说明。
+
+| 表达式 | 比较或复制规则 | 本例结果 |
+| --- | --- | --- |
+| 两个 `ReadingEvent`，所有成员相等 | 同一运行时类型，比较基类与派生成员 | 相等，即使不是同一对象 |
+| `DeviceEvent` 与 `ReadingEvent`，`DeviceId` 相等 | 运行时类型不同 | 不相等 |
+| `ReadingEvent` 与 `AlarmEvent`，共同字段相等 | 运行时类型不同 | 不相等 |
+| `DeviceEvent x = new ReadingEvent(...); x with { DeviceId = ... }` | 克隆运行时类型；初始化器受静态类型约束 | 仍为 `ReadingEvent` |
+
+## 用一个层级验证
+
+运行 `dotnet run --project examples/csharp-record-hierarchy/RecordHierarchyReview.csproj`。示例不用数据库、网络或定时器；下方是与项目源码一致的完整 `Program.cs`。
+
+```csharp filename="Program.cs"
+int[] samples = [10, 20];
+DeviceEvent reading = new ReadingEvent("pump-A", 72, samples);
+DeviceEvent same = new ReadingEvent("pump-A", 72, samples);
+DeviceEvent sameContentsNewArray = new ReadingEvent("pump-A", 72, [10, 20]);
+DeviceEvent plain = new("pump-A");
+DeviceEvent alarm = new AlarmEvent("pump-A", 72);
+
+Check(reading == same && !ReferenceEquals(reading, same),
+    "same runtime record type and members have value equality");
+Check(reading != sameContentsNewArray,
+    "array members compare by reference, not by sequence");
+Check(reading != plain && reading != alarm,
+    "equal base members do not erase runtime type differences");
+Check(new HashSet<DeviceEvent> { reading, same, plain, alarm }.Count == 3,
+    "record equality and hash codes agree in a set");
+
+DeviceEvent moved = reading with { DeviceId = "pump-B" };
+Check(moved is ReadingEvent { Value: 72 },
+    "with from a base-typed variable retains the runtime derived type");
+Check(!ReferenceEquals(reading, moved) && reading.DeviceId == "pump-A" &&
+      moved.DeviceId == "pump-B", "with creates a new record");
+
+ReadingEvent retuned = ((ReadingEvent)reading) with { Value = 73 };
+Check(retuned.Value == 73 && ((ReadingEvent)reading).Value == 72,
+    "cast to the derived type before setting derived members");
+samples[0] = 99;
+Check(((ReadingEvent)moved).Samples[0] == 99 && retuned.Samples[0] == 99,
+    "with copies a reference to the mutable array, not its elements");
+Console.WriteLine("record 继承、相等性与 with 复制验证通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+public record DeviceEvent(string DeviceId);
+public record ReadingEvent(string DeviceId, int Value, int[] Samples)
+    : DeviceEvent(DeviceId);
+public record AlarmEvent(string DeviceId, int Severity)
+    : DeviceEvent(DeviceId);
+```
+
+`reading` 和 `same` 的静态类型都是 `DeviceEvent`，运行时都是 `ReadingEvent`，三个对应成员也相等，所以 `==` 为真。`ReferenceEquals` 为假，说明**值相等不是同一对象**。`HashSet<DeviceEvent>` 也把这两个值去重，体现生成的相等与哈希契约配套。`plain` 只有相同的设备 ID，但运行时类型不同；`alarm` 也不能因名字和数字碰巧相同就与读数事件相等。
+
+数组比较揭示第二层边界：`sameContentsNewArray` 的数组元素与 `samples` 一样，但 `int[]` 默认按数组对象身份比较，所以两个 `ReadingEvent` 仍不相等。`with` 对 `Samples` 的复制也只是复制数组引用：原数组一个元素改成 99，`moved` 和 `retuned` 都会看见。记录生成的是**成员级**相等和复制，不是递归比较或深度克隆。
+
+## 静态类型、运行时类型与建模取舍
+
+`moved` 的声明类型是 `DeviceEvent`，因此 `reading with { Value = 73 }` 不能编译：编译器在基类视图上找不到 `Value`。示例显式转换为 `ReadingEvent` 后再设置派生成员；只有已知或已用模式匹配验证实际类型时才应这样转换，不要把无条件强转写成业务分支的默认方案。也可以在事件的具体分支中直接使用具体记录类型。
+
+这里用可变数组刻意暴露边界，**不是推荐把可变数组放进记录键里**。若需要真正可长期保存或作为集合键的快照，应在构造边界复制输入，避免把内部可变引用直接暴露出去，并按业务定义内容相等或使用适合的不可变值成员。`IReadOnlyList<T>` 只限制接口上的写操作，不自动复制或冻结底层集合；继续看[不可变集合与快照](/knowledge/programming/csharp/collections/immutable-collections-and-snapshots/)。对于以身份和可变生命周期为核心的实体，也不应仅因 `record` 写法简洁就采用值相等；[Microsoft Learn 的类型选择建议](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/records)特别提醒 ORM 跟踪实体常需要引用身份。
+
+## 面试自测
+
+1. 两个分别装在 `DeviceEvent` 变量里的 `ReadingEvent`，只要 `DeviceId` 相同就相等吗？还要看什么？
+2. 为什么 `new ReadingEvent("A", 1, [2])` 与另一个写法完全相同的实例默认不相等？
+3. `DeviceEvent e = new ReadingEvent(...); var copy = e with { DeviceId = "B" };`，`copy` 的声明类型与运行时类型分别是什么？能在初始化器中直接写 `Value` 吗？
+4. `with` 之后原数组被改，为什么两个记录都会观察到变化？要得到独立快照应在哪个边界处理？
+
+参考：[Microsoft Learn：record 语言参考](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/record)、[record 类型与选型](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/records)。

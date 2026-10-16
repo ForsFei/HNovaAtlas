@@ -1,0 +1,77 @@
+---
+id: csharp-extension-methods
+title: 扩展方法：像实例方法一样调用的静态方法
+description: 解释 this 接收者、命名空间、实例成员优先级、空接收者与 API 设计边界。
+tags: [CSharp, 扩展方法, LINQ, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 45
+prerequisite: [csharp-parameters-overloads, csharp-classes-interfaces]
+related: [csharp-linq, csharp-generic-methods-constraints]
+---
+
+## 为已有类型增加便捷调用形式
+
+不能或不应该修改原类型时，可把一个静态方法写成“像实例方法”的调用形式。经典写法要求方法位于非嵌套、非泛型的静态类中，第一个参数用 `this` 标记接收者。它不会真的修改原类型，也不能凭此访问原类型的私有成员；`value.NormalizeKey()` 可以理解为 `TextExtensions.NormalizeKey(value)` 的调用语法。
+
+```csharp
+namespace Atlas.Text;
+
+public static class TextExtensions
+{
+    public static string NormalizeKey(this string value) =>
+        value.Trim().ToUpperInvariant();
+}
+```
+
+调用处需要能看到扩展方法所在命名空间，例如 `using Atlas.Text;`。这也是为什么同一方法在一个文件能调用，在另一文件却找不到。现代 C# 还有 extension block 的新语法；这里先掌握广泛使用的经典写法。
+
+## 解析规则与空值陷阱
+
+若类型有适用的实例方法，调用实例方法优先于同名扩展方法。扩展方法不适合“覆盖”第三方类型的行为，也不能用于多态重写。它本质是静态调用，所以 `null` 接收者也可能进入扩展方法；如果方法内部立即访问接收者成员，就会抛异常。要么显式拒绝 `null`，要么在契约里清楚定义如何处理。
+
+LINQ 的许多操作也通过扩展方法提供流畅调用，但“链式写法”不意味着立即执行或零成本；可接着读[LINQ 查询](/knowledge/programming/csharp/collections/linq/)和[查询边界](/knowledge/programming/csharp/collections/query-boundaries/)。
+
+下面整段可放进 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+using Atlas.Text;
+
+Console.WriteLine("  atlas  ".NormalizeKey()); // ATLAS
+Console.WriteLine(TextExtensions.NormalizeKey(" atlas ")); // ATLAS
+
+string? missing = null;
+try
+{
+    _ = missing!.NormalizeKey(); // 调用会进入方法，再由显式检查抛异常
+}
+catch (ArgumentNullException)
+{
+    Console.WriteLine("null 被拒绝");
+}
+
+namespace Atlas.Text
+{
+    public static class TextExtensions
+    {
+        public static string NormalizeKey(this string value)
+        {
+            ArgumentNullException.ThrowIfNull(value);
+            return value.Trim().ToUpperInvariant();
+        }
+    }
+}
+```
+
+设计扩展方法时，让名称说明转换或查询的含义，明确是否有分配、是否延迟执行，并避免给过宽的 `object` 类型塞进含糊的通用方法。若需要访问对象内部状态、维护不变量或参与多态，优先考虑原类型的成员或接口。
+
+## 自测与追问
+
+1. 同名实例方法与扩展方法都适用时，`obj.Method()` 调用谁？
+2. 扩展方法为什么不能访问接收者的 `private` 字段？
+3. `null` 接收者为什么有时不会在调用点立刻失败？如何把行为写清楚？
+
+可运行验证还在 `examples/csharp-foundations-part2`。方法设计先读[参数与重载](/knowledge/programming/csharp/fundamentals/parameters-and-overloads/)。
+
+参考：[Microsoft Learn：实现和调用扩展方法](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/how-to-implement-and-call-a-custom-extension-method)。

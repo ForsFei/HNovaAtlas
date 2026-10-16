@@ -1,0 +1,101 @@
+---
+id: csharp-static-abstract-generic-math
+title: 静态抽象接口成员与泛型数学：能相加，不等于同一种数
+description: 自定义静态抽象加法契约，再用 INumber<T> 验证泛型平均值的空输入、整数截断与数值语义。
+tags: [CSharp, 泛型, 静态抽象接口成员, 数值, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-14"
+order: 15
+prerequisite: [csharp-generic-methods-constraints, csharp-explicit-default-interface-members]
+related: [csharp-generic-api-design, csharp-numeric-parsing-rounding, csharp-user-defined-operators-conversions]
+---
+
+## 为什么普通接口约束还不够
+
+普通实例接口可以要求 `value.Render()`，但不能让无约束的泛型方法直接写 `T.Zero` 或 `left + right`。加法运算符属于类型的静态能力；静态抽象接口成员让接口能声明这种能力，再由实现类型提供它。泛型方法写 `where T : IAdditiveQuantity<T>` 后，编译器才允许通过类型参数 `T` 调用静态成员。
+
+以下完整 `Program.cs` 同时包含一个自定义数量类型和内置泛型数值接口的例子。运行：`dotnet run --project examples/csharp-static-abstract-math/StaticAbstractMathReview.csproj`。
+
+```csharp filename="Program.cs"
+using System.Numerics;
+
+Energy total = Sum<Energy>([new(1.25m), new(2.5m)]);
+Check(total.KilowattHours == 3.75m, "custom static contract sums quantities");
+Check(Mean<int>([1, 2]) == 1, "integer division truncates");
+Check(Mean<decimal>([1m, 2m]) == 1.5m, "decimal retains the fraction");
+Check(Mean<decimal>([]) is null, "empty input has no mean");
+Console.WriteLine("静态抽象契约与泛型数值边界断言全部通过。");
+
+static T Sum<T>(IEnumerable<T> values) where T : IAdditiveQuantity<T>
+{
+    T total = T.Zero;
+    foreach (T value in values)
+        total += value;
+    return total;
+}
+
+static T? Mean<T>(IReadOnlyList<T> values) where T : struct, INumber<T>
+{
+    if (values.Count == 0) return null;
+    T total = T.Zero;
+    foreach (T value in values)
+        total += value;
+    return total / T.CreateChecked(values.Count);
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public interface IAdditiveQuantity<TSelf> where TSelf : IAdditiveQuantity<TSelf>
+{
+    static abstract TSelf Zero { get; }
+    static abstract TSelf operator +(TSelf left, TSelf right);
+}
+
+public readonly record struct Energy : IAdditiveQuantity<Energy>
+{
+    public decimal KilowattHours { get; }
+
+    public Energy(decimal kilowattHours)
+    {
+        if (kilowattHours < 0) throw new ArgumentOutOfRangeException(nameof(kilowattHours));
+        KilowattHours = kilowattHours;
+    }
+
+    public static Energy Zero => new(0m);
+    public static Energy operator +(Energy left, Energy right)
+        => new(left.KilowattHours + right.KilowattHours);
+}
+```
+
+## 自定义契约：从方法体倒推最小能力
+
+`Sum<T>` 只需要初始零值和加法；它不需要比较、除法、解析或格式化。所以 `IAdditiveQuantity<TSelf>` 只声明 `Zero` 与 `operator +`，而非强迫领域数量类型实现完整的 `INumber<T>`。这里的 `TSelf` 模式把操作数与结果限制为同一种实现类型。`Energy` 保持千瓦时单位，并在构造时拒绝负值；求和不会把它默默变成无单位的 `decimal`。
+
+调用形态是 `T.Zero`，不是先创建一个 `IAdditiveQuantity<Energy>` 对象，再经实例接口调用。它也不同于上一课的默认**实例**接口成员：默认方法体可由接口引用调用；静态抽象成员要求实现类型提供静态定义，主要给受约束的泛型算法使用。
+
+本例空序列的求和结果定义为零。这个约定对加法量合理，但不是所有业务聚合的唯一选择：若空输入表示缺测，应使用可空结果或显式失败，而非凭借有 `Zero` 就假设“没有数据等于测得零”。
+
+## `INumber<T>` 解决语法，不解决业务数值语义
+
+.NET 的 `INumber<T>` 已组合了常见数值能力，允许 `Mean<T>` 在泛型方法中使用 `T.Zero`、`+`、`/` 与 `T.CreateChecked(count)`。`CreateChecked` 把整数计数转成 `T`；当目标类型无法表示该值时会抛出，而非悄悄截断。这里 `where T : struct` 是为了让 `T?` 明确表示可空值，并不是所有泛型数学算法必需的约束。
+
+但是 `INumber<T>` 没有承诺所有数值类型的除法都保留小数：`Mean<int>([1, 2])` 得 `1`，`Mean<decimal>([1m, 2m])` 得 `1.5m`。若 API 业务上需要带小数的平均值，就固定输出类型、明确转换策略，或为整数与小数设计不同重载；不能仅把 `T` 加上 `INumber<T>` 约束就宣称得到了统一的“数学平均值”。
+
+本教学实现也没有定义大数据量时的累加溢出、精度损失或浮点特殊值策略。`checked`、更宽的累加类型、补偿求和、舍入模式等要依输入类型与业务要求选择。对金额，还需明确货币单位，不能把泛型数字当作金额领域模型。
+
+## 面试自测与练习
+
+1. 删除 `where T : IAdditiveQuantity<T>` 后，为什么 `T.Zero` 与 `total += value` 不能编译？
+2. 为新类型实现 `IAdditiveQuantity<TSelf>`，但不提供 `Zero` 或 `operator +`，编译器会在定义类型还是运行 `Sum` 时发现？
+3. 为什么 `Mean<int>` 与 `Mean<decimal>` 对同一组 `1, 2` 得到不同结果？把结果赋给 `decimal` 变量会恢复被截断的部分吗？
+4. 若空序列代表设备未上报，你会保留 `Sum` 返回零的契约，还是修改返回类型？说明依据。
+
+验收标准：能从算法所需操作选择接口约束，并把数值类型的截断、溢出、空输入与单位视为独立契约，而不是交给泛型语法“自动处理”。
+
+## 参考
+
+[Microsoft Learn：静态虚接口成员](https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/interface-implementation/static-virtual-interface-members) · [泛型数学](https://learn.microsoft.com/en-us/dotnet/standard/generics/math) · [`CreateChecked` API](https://learn.microsoft.com/en-us/dotnet/api/system.numerics.inumberbase-1.createchecked?view=net-10.0)

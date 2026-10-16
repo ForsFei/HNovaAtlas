@@ -1,0 +1,71 @@
+---
+id: csharp-io-network-streams
+title: 网络 I/O 与消息边界：读到字节不等于读到一条消息
+description: 区分 HTTP 响应流与 TCP 字节流，设计长度前缀、上限、短读、超时和所有权。
+tags: [CSharp, IO, HttpClient, TCP, NetworkStream, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-12"
+order: 40
+prerequisite: [csharp-io-async-files, csharp-io-encoding-paths]
+related: [csharp-io-testable-http-download, tcp-handshake, csharp-cancellation-throttling]
+---
+
+## HTTP 响应也是流，但先有协议语义
+
+下载大响应时，默认缓冲整份正文可能占用大量内存。以下是**方法片段**：调用方提供管理生命周期的 `HttpClient`、经过允许列表审查的 `Uri`、可写目标流和取消令牌；方法负责释放本次请求的响应，不擅自释放共享客户端或调用方的目标流。
+
+```csharp filename="DownloadAsync.cs"
+static async Task DownloadAsync(HttpClient client, Uri address,
+    Stream destination, CancellationToken cancellationToken)
+{
+    using HttpResponseMessage response = await client.GetAsync(
+        address, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    response.EnsureSuccessStatusCode();
+
+    await using Stream body = await response.Content.ReadAsStreamAsync(cancellationToken);
+    await body.CopyToAsync(destination, cancellationToken);
+}
+```
+
+`ResponseHeadersRead` 让请求在收到响应头后即可继续处理正文，不代表无条件安全：仍需限制响应体大小、设置合理超时、检查重定向和目标地址，尤其当 URL 来自外部输入时。目标若是文件，取消或故障后也可能留下半成品。HTTP 状态码与内容类型是应用协议问题，`Stream` 本身不判断它们。
+
+接着读[可测试 HTTP 下载](/knowledge/programming/csharp/io/testable-http-download/)：通过注入内存响应验证状态码、实际字节上限与正文取消，不依赖外部网站。
+
+## TCP 只有字节序列，没有应用层“消息”
+
+`TcpClient.GetStream()` 给出 `NetworkStream`。一端 `WriteAsync` 一次 100 字节，另一端可能分多次读到；两次写入也可能被一次读取收下。必须为业务定义消息边界，例如固定头、长度前缀或明确的分隔符。下面是读取 **4 字节大端长度 + UTF-8 载荷** 的方法片段：
+
+```csharp filename="ReadFrameAsync.cs"
+using System.Buffers.Binary;
+using System.Text;
+
+static async Task<string> ReadFrameAsync(Stream input, CancellationToken token)
+{
+    byte[] header = new byte[4];
+    await input.ReadExactlyAsync(header, token);
+    int length = BinaryPrimitives.ReadInt32BigEndian(header);
+    if (length < 0 || length > 1024 * 1024)
+        throw new InvalidDataException("帧长度超出 1 MiB 限制");
+
+    byte[] payload = new byte[length];
+    await input.ReadExactlyAsync(payload, token);
+    return new UTF8Encoding(false, true).GetString(payload);
+}
+```
+
+`ReadExactlyAsync` 在字节不足而到达 EOF 时会失败，不会把半帧当成功。长度上限必须在分配载荷缓冲区之前检查；否则对端可先声明巨大长度造成内存压力。1 MiB 只是教学示例上限，真实协议应另行设计。UTF-8 严格解码避免非法字节被悄悄替换。网络读写还应有超时/取消、关闭连接、重复帧与错误帧策略。
+
+如果协议已经是 HTTP，就优先使用 `HttpClient` 管理状态码、标头和连接，而不是自己在 `NetworkStream` 上手写 HTTP。更底层的握手与连接状态可回看[TCP 三次握手](/knowledge/computer-science/network/transport/tcp-handshake/)；连接建立不等于业务帧完整到达。
+
+## 面试自测与练习
+
+1. 为什么一次 `ReadAsync` 的返回值不能当作一条 TCP 消息的长度？
+2. 对端发送长度为 10、实际只发送 4 字节就关闭，`ReadExactlyAsync` 应怎样结束？
+3. HTTP 大文件下载中，为什么 `ResponseHeadersRead` 后仍需内容大小限制和取消？谁负责关闭响应、目标流和共享 `HttpClient`？
+
+验收标准：能明确区分传输层字节、应用层帧和业务处理成功三个阶段。
+
+## 参考
+
+[Microsoft Learn：HttpClient 缓冲与请求生命周期](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpclient) · [TcpClient 与 NetworkStream](https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/sockets/tcp-classes) · [Stream.ReadAsync](https://learn.microsoft.com/en-us/dotnet/api/system.io.stream.readasync)

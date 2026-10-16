@@ -1,0 +1,159 @@
+---
+id: csharp-io-complete-file-publication
+title: 文件完整发布：临时文件、校验、冲突与失败清理
+description: 用可运行的本地文件示例把异步写入与正式发布分开，验证取消、长度错误及目标重名。
+tags: [CSharp, IO, FileStream, CancellationToken, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 35
+prerequisite: [csharp-io-async-files, csharp-async-disposal-ownership]
+related: [csharp-io-streams-ownership, csharp-io-encoding-paths, csharp-io-testable-http-download]
+---
+
+## 写完字节，不等于可以发布
+
+[异步文件 I/O](/knowledge/programming/csharp/io/async-files-and-cancellation/)已经说明：直接写正式路径时，取消或异常可能留下半个文件。若消费者只应看到完整的新文件，可把过程拆成四步：在**目标目录**创建唯一临时文件、边写边核对大小、关闭写入句柄、最后把临时文件移动到正式名称。失败时只清理本次操作拥有的临时文件，不能碰已有正式文件。
+
+本篇先限定一个明确场景：**发布一个原本不存在的新文件，不覆盖旧文件**。目标目录已由调用方准备好；输入流由调用方拥有，发布方法不会替它释放。示例使用临时测试目录，不会改动你的知识库文件。
+
+| 边界 | 处理方式 |
+| --- | --- |
+| 目标名已存在 | `File.Move` 抛异常，原目标不覆盖；清理本次临时文件 |
+| 输入少于或多于预期字节数 | 抛 `InvalidDataException`，不发布；写入过程中限制上限 |
+| 复制过程中取消 | 传播 `OperationCanceledException`，不发布；清理本次临时文件 |
+| 临时文件清理也失败 | 同时保留原始失败与清理失败，交由调用方处理孤儿文件 |
+
+## 完整示例
+
+在仓库根目录执行 `dotnet run --project examples/csharp-file-publication/FilePublicationReview.csproj`。`CancelOnSecondReadStream` 是测试替身：第一次只交付四字节，第二次读取前取消，因此能稳定覆盖“已经写了一部分”而非靠定时器碰运气。最后只递归删除示例自己创建的随机测试目录。
+
+```csharp filename="Program.cs"
+using System.Text;
+
+DirectoryInfo sandbox = Directory.CreateTempSubdirectory("hnova-publish-");
+try
+{
+    byte[] data = Encoding.UTF8.GetBytes("pump-A,72\n");
+    string published = Path.Combine(sandbox.FullName, "readings.csv");
+    using (var source = new MemoryStream(data))
+        await PublishNewAsync(source, published, data.Length, CancellationToken.None);
+    Check(await File.ReadAllTextAsync(published) == "pump-A,72\n", "complete file is visible");
+
+    using (var source = new MemoryStream(data))
+        await ExpectAsync<IOException>(() => PublishNewAsync(source, published,
+            data.Length, CancellationToken.None));
+    Check(await File.ReadAllTextAsync(published) == "pump-A,72\n",
+        "an existing target is not overwritten");
+
+    string invalid = Path.Combine(sandbox.FullName, "invalid.csv");
+    using (var source = new MemoryStream(data))
+        await ExpectAsync<InvalidDataException>(() => PublishNewAsync(source, invalid,
+            data.Length + 1, CancellationToken.None));
+    Check(!File.Exists(invalid), "a failed length check publishes nothing");
+
+    string canceled = Path.Combine(sandbox.FullName, "canceled.csv");
+    using var stop = new CancellationTokenSource();
+    using (var source = new CancelOnSecondReadStream(data, stop))
+        await ExpectAsync<OperationCanceledException>(() => PublishNewAsync(source,
+            canceled, data.Length, stop.Token));
+    Check(!File.Exists(canceled), "cancellation after one written chunk publishes nothing");
+    Check(Directory.GetFiles(sandbox.FullName, "*.tmp").Length == 0,
+        "failed attempts remove their own temporary files");
+    Console.WriteLine("文件发布、冲突、校验失败与取消断言全部通过。");
+}
+finally
+{
+    sandbox.Delete(recursive: true); // Only the directory created for this example.
+}
+
+static async Task PublishNewAsync(Stream source, string destination, long expectedBytes,
+    CancellationToken cancellationToken)
+{
+    if (expectedBytes < 0) throw new ArgumentOutOfRangeException(nameof(expectedBytes));
+    string fullPath = Path.GetFullPath(destination);
+    string directory = Path.GetDirectoryName(fullPath)!;
+    string temporary = Path.Combine(directory,
+        $".{Path.GetFileName(fullPath)}.{Guid.NewGuid():N}.tmp");
+    bool ownsTemporary = false;
+    try
+    {
+        await using (var output = new FileStream(temporary, FileMode.CreateNew,
+            FileAccess.Write, FileShare.None, bufferSize: 81920, useAsync: true))
+        {
+            ownsTemporary = true;
+            byte[] buffer = new byte[81920];
+            long written = 0;
+            int count;
+            while ((count = await source.ReadAsync(buffer, cancellationToken)) != 0)
+            {
+                if (count > expectedBytes - written)
+                    throw new InvalidDataException("Input exceeds the expected byte count.");
+                await output.WriteAsync(buffer.AsMemory(0, count), cancellationToken);
+                written += count;
+            }
+            if (written != expectedBytes)
+                throw new InvalidDataException("Input ended before the expected byte count.");
+            await output.FlushAsync(cancellationToken);
+        }
+        cancellationToken.ThrowIfCancellationRequested();
+        File.Move(temporary, fullPath); // No overwrite; the caller must own the target name.
+        ownsTemporary = false;
+    }
+    catch (Exception original)
+    {
+        if (ownsTemporary)
+        {
+            try { File.Delete(temporary); }
+            catch (Exception cleanup) { throw new AggregateException(original, cleanup); }
+        }
+        throw;
+    }
+}
+
+static async Task ExpectAsync<T>(Func<Task> action) where T : Exception
+{
+    try { await action(); }
+    catch (T) { return; }
+    throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+sealed class CancelOnSecondReadStream(byte[] bytes, CancellationTokenSource stop)
+    : MemoryStream(bytes)
+{
+    private int reads;
+
+    public override ValueTask<int> ReadAsync(Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        if (++reads == 2) stop.Cancel();
+        return base.ReadAsync(buffer[..Math.Min(buffer.Length, 4)], cancellationToken);
+    }
+}
+```
+
+`FileMode.CreateNew` 防止临时名碰撞时覆盖别人的文件。`File.Move` 不要求先调用 `File.Exists(destination)`：先检查再移动仍有竞态，直接让不覆盖的移动在目标已存在时失败才是这里的冲突边界。异常处理只删除 `ownsTemporary` 所指向的本次临时文件；若删除失败，`AggregateException` 同时保留原错误与清理错误，生产调用方应记录并排查孤儿文件。`finally` 删除随机测试目录仅属于演示程序，**不是**发布方法在生产目录的清理策略。
+
+## 这段代码没有保证什么
+
+`FlushAsync` 使流的缓冲数据下传，但不等于磁盘、文件系统或远端挂载已承诺断电后仍可恢复。`File.Move` 可以跨卷移动，跨卷时可能转为复制再删除；因此本例特意在目标目录创建临时文件，避免这一类跨卷路径。不过，即使同目录，也不能从一次本机测试推导出所有文件系统的原子性或持久化保证。若产品要求断电安全，需要针对目标操作系统、文件系统、同步策略和恢复流程做独立设计与测试。
+
+本例还**不处理覆盖现有文件**。若要升级已有正式文件，不要先删除旧版再移动新版，那会制造空窗；应研究目标平台上的 `File.Replace`、备份、并发读者与失败恢复语义。输入长度仅是完整性检查的一项；不可信输入还需内容格式、哈希/签名、路径授权、配额和安全检查。尤其不要把外部输入直接拼进 `destination`，也不要让用户提供的路径绕过允许的目录边界。
+
+## 自测与延伸
+
+1. 把长度检查改成只在发布后执行，会留下什么正式文件？
+2. 两个调用者同时发布同一个目标名，为什么事先 `File.Exists` 不能保证安全？当前方法哪一个会失败？
+3. 若输入流在第二次读取时抛 `IOException`，发布方法会如何处理临时文件？清理自身也失败时调用方能看到哪些错误？
+4. 若需求从“新建”改为“替换旧版”，哪些备份、读者和崩溃恢复问题需要重新设计？
+
+验收标准：能区分“资源关闭”“完整文件发布”“替换已有文件”和“断电持久化”四个不同承诺，并指出代码实际证明了哪一个。
+
+## 参考
+
+[Microsoft Learn：File.Move](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.move?view=net-10.0) · [File.Replace](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.replace?view=net-10.0) · [FileStream.FlushAsync](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flushasync?view=net-10.0)

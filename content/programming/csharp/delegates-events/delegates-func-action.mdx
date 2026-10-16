@@ -1,0 +1,72 @@
+---
+id: csharp-delegates-func-action
+title: 委托、Func 与 Action：把行为作为参数
+description: 从类型安全的方法引用、函数参数到多播调用，区分返回值和异常的边界。
+tags: [CSharp, 委托, Func, Action, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-control-flow-methods, csharp-parameters-overloads]
+related: [csharp-lambda-closures, csharp-events-lifecycle]
+---
+
+## 委托描述一种方法签名
+
+委托是类型安全的“可调用值”：它规定参数与返回类型，实例可以指向匹配的命名方法或 Lambda。这样一个统计方法就可以把筛选规则交给调用者，而不是为“超温”“低温”“设备 A”各写一份循环。
+
+下面是一份可独立运行的 `Program.cs`：
+
+```csharp filename="Program.cs"
+Reading[] readings = [new("pump-A", 72.5), new("pump-B", 68.0)];
+
+AlarmRule high = reading => reading.Value >= 70;
+Func<Reading, bool> forPumpA = reading => reading.DeviceId == "pump-A";
+Action<string> report = Console.WriteLine;
+
+report($"超温条数：{Count(readings, item => high(item))}");  // 1
+report($"设备 A 条数：{Count(readings, forPumpA)}"); // 1
+
+static int Count(IEnumerable<Reading> source, Func<Reading, bool> predicate)
+{
+    int result = 0;
+    foreach (Reading item in source)
+        if (predicate(item)) result++;
+    return result;
+}
+
+public record Reading(string DeviceId, double Value);
+public delegate bool AlarmRule(Reading reading);
+```
+
+自定义 `AlarmRule` 是一个**命名的委托类型**，便于把领域含义写进 API；`Func<Reading, bool>` 表示“输入 Reading、返回 bool”，`Action<string>` 表示“输入字符串、无返回值”。`Count` 接受 `Func`，示例用 Lambda 调用 `high` 作适配：签名相同的两个不同委托类型并不能简单当成同一个类型直接赋值。并非每个场景都需要自定义委托；签名有特殊语义或要附加命名契约时再声明。
+
+## 委托不等于立刻调用
+
+把 `Console.WriteLine` 赋给 `Action<string>` 只是保存可调用目标，只有执行 `report("...")` 才调用。委托可为 `null`，公开可选回调时要使用可空标注并检查，例如 `callback?.Invoke(message)`。回调在哪条线程、何时调用、能否重入、异常由谁处理，不能从 `Func` 或 `Action` 签名自动看出，应由 API 文档说明。
+
+## 多播调用的边界
+
+委托可用 `+=` 组合多个处理器，调用时按调用列表顺序同步执行。下面可预测的输出为 `A`、`B`：
+
+```csharp filename="Program.cs"
+Action notify = () => Console.WriteLine("A");
+notify += () => Console.WriteLine("B");
+notify();
+```
+
+若第一个处理器抛出未捕获异常，后续处理器不会自动继续执行。若多播委托有返回值，直接调用得到的是**最后一个处理器**的返回值；因此不要用多播 `Func<T>` 收集所有结果。需要隔离每个处理器的失败或汇总多个结果时，应明确遍历 `GetInvocationList()` 并定义异常/顺序策略，而不是期待 `+=` 自动提供容错。
+
+`event` 建立在委托上，但比公开委托字段限制更多：外部只能订阅或退订，不能随意覆盖和触发。它适合发布通知；下一专题会专门讨论生命周期。
+
+## 面试自测与练习
+
+1. `Func<int, string>` 与 `Action<int>` 的参数和返回分别是什么？`Predicate<int>` 可表示哪类规则？
+2. 将两个有返回值的函数用 `+=` 组合，直接调用拿到几个返回值？
+3. 第一处理器抛异常时第二处理器是否执行？如果业务要求全部执行，应由哪一层制定策略？
+
+验收标准：能写出一个接受行为参数的方法，并说明委托创建、调用和多播异常各发生在何时。
+
+## 参考
+
+[Microsoft Learn：委托、Lambda 与事件](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/delegates-lambdas) · [使用委托](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/delegates/using-delegates)

@@ -1,0 +1,43 @@
+<Window x:Class="WpfBindingNotifications.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="WPF 绑定与通知" Width="640" Height="480"
+        MinWidth="520" MinHeight="360">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="{Binding PanelTitle, Mode=OneWay}"
+                   FontSize="24" FontWeight="SemiBold" />
+
+        <StackPanel Grid.Row="1" Margin="0,16,0,16">
+            <TextBlock Text="编辑标题（输入时立即更新上方文字）" />
+            <TextBox Text="{Binding PanelTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                     Margin="0,6,0,0" />
+        </StackPanel>
+
+        <ListBox Grid.Row="2" ItemsSource="{Binding Readings}">
+            <ListBox.ItemTemplate>
+                <DataTemplate>
+                    <StackPanel Orientation="Horizontal" Margin="4">
+                        <TextBlock Text="{Binding DeviceId}" Width="120" />
+                        <TextBlock Text="{Binding Temperature}" />
+                        <TextBlock Text=" °C" />
+                    </StackPanel>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+
+        <StackPanel Grid.Row="3" Orientation="Horizontal" Margin="0,16,0,0">
+            <Button Content="增加一项" Click="AddReading_Click" Padding="12,6" />
+            <Button Content="移除末项" Click="RemoveLastReading_Click"
+                    Margin="8,0,0,0" Padding="12,6" />
+            <Button Content="首项 +1°C" Click="IncreaseFirstTemperature_Click"
+                    Margin="8,0,0,0" Padding="12,6" />
+        </StackPanel>
+    </Grid>
+</Window>

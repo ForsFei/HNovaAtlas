@@ -1,0 +1,72 @@
+---
+id: csharp-collections-generics
+title: 集合与泛型：管理多条读数
+description: 对比数组、List、Dictionary、HashSet 和 IEnumerable，理解泛型与集合修改的边界。
+tags: [CSharp, 集合, 泛型]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-classes-interfaces]
+related: [csharp-collection-selection, csharp-generic-methods-constraints, csharp-linq]
+---
+
+## 先按访问方式选集合
+
+| 需求 | 常用类型 | 关键特征 |
+| --- | --- | --- |
+| 固定长度、按位置访问 | `T[]` | 长度固定，元素仍可修改 |
+| 追加、插入、按位置访问 | `List<T>` | 顺序明确，可增长 |
+| 按唯一键查找 | `Dictionary<TKey, TValue>` | 键不可重复，查找前要考虑不存在 |
+| 去重、判断是否存在 | `HashSet<T>` | 不应依赖它的显示顺序 |
+| 只需逐项读取 | `IEnumerable<T>` | 抽象迭代能力，不保证可索引或可重复枚举 |
+
+`<T>` 表示元素类型由使用者指定。`List<double>` 只放 `double`；编译器能防止把设备名误塞进去，也让读取时不必手动转型。泛型不仅是少写代码，更是把约束放进类型系统。
+
+## 一份可运行示例
+
+```csharp filename="Program.cs"
+List<Reading> readings =
+[
+    new("pump-A", 68.5),
+    new("pump-B", 71.0),
+    new("pump-A", 72.5)
+];
+
+Dictionary<string, int> counts = new(StringComparer.Ordinal);
+HashSet<string> deviceIds = new(StringComparer.Ordinal);
+
+foreach (Reading reading in readings)
+{
+    deviceIds.Add(reading.DeviceId);
+    counts.TryGetValue(reading.DeviceId, out int count);
+    counts[reading.DeviceId] = count + 1;
+}
+
+foreach (string deviceId in deviceIds.OrderBy(id => id))
+    Console.WriteLine($"{deviceId}: {counts[deviceId]} 条");
+
+public record Reading(string DeviceId, double Value);
+```
+
+这里显式使用 `StringComparer.Ordinal`，按字符的精确值比较设备 ID；如果业务希望忽略大小写，可一致地使用 `StringComparer.OrdinalIgnoreCase`。`TryGetValue` 避免为新键直接读取索引而抛异常。最后排序仅为了稳定展示，不暗示 `HashSet` 本身有排序保证。
+
+## 暴露最小需要的能力
+
+方法若只要遍历，可接收 `IEnumerable<Reading>`，这样数组和列表都能传入；若确实要按索引读取，则使用更具体的 `IReadOnlyList<Reading>`。`IReadOnlyList<T>` 限制调用方通过此接口修改，但不自动让底层列表或元素不可变。不要把「只读视图」误解为「不可变快照」。
+
+## 修改与枚举的陷阱
+
+遍历 `List<T>` 时不要同时向同一个列表增删元素；枚举器通常会检测到修改并抛异常。需要筛选删除可用 `RemoveAll`，或先生成新列表。`Dictionary` 索引器在键不存在时读取会抛 `KeyNotFoundException`；写入索引器则会新增或覆盖。键能否重复、大小写是否敏感，应由业务明确规定。
+
+## 动手练习
+
+1. 给示例增加同一设备的第三条读数，确认总数正确；改用忽略大小写比较器，观察 `pump-A` 与 `PUMP-A` 是否合并。
+2. 写 `double Average(IEnumerable<Reading> items)`，考虑空集合时是抛异常、返回可空值，还是使用 Try 模式，并说明选择。
+3. 用 `HashSet<string>` 找出第二批数据中新出现的设备 ID；输出前排序，确保多次运行结果一致。
+
+验收标准：能解释为何没有「一种集合适合所有场景」，并能处理字典键不存在的情况。下一章将用 LINQ 简化常见查询。
+
+## 参考
+
+[Microsoft Learn：常用集合](https://learn.microsoft.com/en-us/dotnet/standard/collections/commonly-used-collection-types) · [泛型概述](https://learn.microsoft.com/en-us/dotnet/standard/generics/)

@@ -1,0 +1,96 @@
+---
+id: csharp-parameters-overloads
+title: 方法参数与重载：值传递、ref、out、in
+description: 用可预测的代码理解引用类型参数、参数修饰符、可选参数和重载选择，拆解常见面试误区。
+tags: [CSharp, 方法, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 40
+prerequisite: [csharp-control-flow-methods]
+related: [csharp-dotnet-terminology, csharp-chapter-map, csharp-readonly-struct-copies]
+---
+
+## 先回答最容易说错的问题
+
+「把一个类实例传给方法，就是按引用传递吗？」不是。C# 普通参数默认按值传递：参数收到的是实参值的一份副本。对于引用类型，这份值恰好是对象引用的副本。因此方法可以沿这个引用修改同一个对象，但给参数变量重新赋值，不会改变调用方变量。`ref`、`out`、`in` 等修饰符才引入不同形式的按引用传递。
+
+先不要记术语，预测下面四行输出。整段可直接放入新建控制台项目的 `Program.cs`。
+
+```csharp filename="Program.cs"
+List<int> numbers = [1];
+Append(numbers);
+Console.WriteLine(string.Join(",", numbers)); // 1,2
+
+ReplaceLocal(numbers);
+Console.WriteLine(string.Join(",", numbers)); // 仍是 1,2
+
+ReplaceCaller(ref numbers);
+Console.WriteLine(string.Join(",", numbers)); // 9
+
+static void Append(List<int> values) => values.Add(2);
+static void ReplaceLocal(List<int> values) => values = [7];
+static void ReplaceCaller(ref List<int> values) => values = [9];
+```
+
+`Append` 修改对象；`ReplaceLocal` 只让局部参数指向另一个列表；`ReplaceCaller` 通过 `ref` 改写调用方的变量。把「对象会不会被修改」和「调用方变量会不会重新指向」分开，面试时就不容易混淆。
+
+## `ref`、`out`、`in` 的契约
+
+| 修饰符 | 调用前必须初始化？ | 被调方法能改写参数变量？ | 常见用途 |
+| --- | --- | --- | --- |
+| 无 | 是，传入一个值 | 只能改自己的参数副本 | 默认选择 |
+| `ref` | 是 | 可以，调用方可见 | 明确要读写调用方变量 |
+| `out` | 否 | 必须在正常返回前赋值 | Try 模式的额外结果 |
+| `in` | 是 | 不能对参数赋值 | 大值类型的只读按引用传递 |
+
+`in` 对某些表达式可能创建临时副本，不应简单理解为「永不复制」。这些修饰符对 API 使用者是很明显的信号；如果只需返回一个结果，普通返回值通常更清晰。`async` 方法不能声明 `ref`、`out`、`in` 参数，异步多结果可返回元组或自定义类型。
+
+```csharp filename="Program.cs"
+string raw = "72.5";
+if (double.TryParse(raw, out double temperature))
+    Console.WriteLine($"温度：{temperature:F1}");
+
+int count = 2;
+Increase(ref count);
+Console.WriteLine(count); // 3
+
+static void Increase(ref int value) => value++;
+```
+
+`TryParse` 用布尔返回值表明成功，`out` 给出解析后的数值。它与「抛异常后捕获」不是同一种控制流。练习时也要留意当前文化区域：`double.TryParse(string, out double)` 使用当前区域设置，处理协议文本时应指定格式与文化。
+
+## 重载、命名参数与可选参数
+
+重载允许同名方法有不同参数列表；编译器根据调用位置可见的候选方法选择匹配的签名。不能仅靠返回类型重载。可选参数把默认值写在声明处，命名参数使某些布尔开关更易读，但不要堆出多种含糊的重载组合。
+
+```csharp filename="Program.cs"
+Console.WriteLine(Format(72.5));
+Console.WriteLine(Format(value: 72.5, unit: "°C"));
+Console.WriteLine(Format(72));
+
+static string Format(double value, string unit = "°C") => $"{value:F1} {unit}";
+static string Format(int value) => $"{value} 个";
+```
+
+第三次调用优先匹配 `int` 版本，不会因为 `double` 版本有默认参数就选它。重载选择是编译期规则；若业务语义不同（数量与温度），起不同方法名往往比巧妙重载更清楚。`params` 可让最后一个数组参数接受多个同类型实参，但也可能让重载解析更复杂，使用前先保证 API 读起来不含糊。
+
+## 高频面试追问
+
+**问：引用类型参数能修改原对象，是否意味着它按引用传递？** 答：不能这样推断。默认复制的是对象引用；能经由副本访问同一个对象，但不能默认重绑定调用方变量。用上面的 `ReplaceLocal` 与 `ReplaceCaller` 反例说明。
+
+**问：什么时候选 `out`，什么时候返回元组？** 答：`TryXxx` 模式有清晰的成功/失败与额外值时，`out` 与 .NET 常用 API 一致；多个始终存在的结果可以返回元组或命名记录。考虑调用者可读性，不只看语法是否能写。
+
+**问：`ref` 能直接接收属性吗？** 答：普通属性访问是方法调用语义，不是可按 `ref` 传递的变量；需要先取到局部变量，或重新设计 API。特殊的按引用返回属性另有规则，不能和普通属性混为一谈。
+
+## 动手练习与验收
+
+1. 把 `List<int>` 换成自定义 `Device` 类，分别修改属性和给参数重新赋值，画出调用前后的两个变量与对象关系。
+2. 实现 `TryReadTemperature(string? text, out double value)`：空字符串、非数字和非有限数都失败。再写一个返回 `(bool Success, double Value)` 的版本，比较调用代码。
+3. 故意写两个只差返回类型的 `Format` 方法，记录编译器错误；再写两个参数类型不同的合法重载。
+
+验收标准：不看本文就能解释四行输出、画清默认传参与 `ref` 的区别，并说明 `out` 的赋值责任。它属于[C# 基础章节](/knowledge/programming/csharp/chapters/)的方法专题。
+
+## 参考
+
+[Microsoft Learn：方法参数和修饰符](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/method-parameters) · [方法概览](https://learn.microsoft.com/en-us/dotnet/csharp/methods)

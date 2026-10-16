@@ -1,0 +1,71 @@
+---
+id: python-setup
+title: 安装 Python 与 VS Code
+description: 在 Windows 上从零安装 Python 和 VS Code，并验证安装是否成功。
+tags: [Python, 环境搭建, Windows]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 20
+prerequisite: [python-why]
+related: [python-first-program]
+---
+
+## 需要安装什么
+
+写 Python 程序只需要两样东西：
+
+1. **Python 解释器**：真正运行代码的程序。你写的每一行代码都由它翻译给计算机执行。
+2. **代码编辑器**：写代码的地方。本系列使用微软免费开源的 VS Code，它对 Python 支持很好。
+
+<Callout type="warning" title="安装 Python 时最关键的一步">
+
+Windows 安装 Python 的第一个界面，底部有一个 **"Add python.exe to PATH"** 复选框，**务必勾选**。很多初学者"装好了却运行不了"，就是因为漏掉了这一步。它的作用是让系统在任何位置都能找到 Python。
+
+</Callout>
+
+## 安装 Python
+
+跟随下面的步骤操作：
+
+<Stepper title="在 Windows 上安装 Python" steps={[
+  { title: "下载安装包", description: "打开 python.org/downloads，点击黄色的 Download Python 按钮，下载最新版安装包。" },
+  { title: "勾选 Add to PATH", description: "双击运行安装包。在第一个界面底部勾选 Add python.exe to PATH，再点击 Install Now。", states: [{ label: "Add python.exe to PATH", value: "已勾选" }] },
+  { title: "等待安装完成", description: "安装程序会自动完成安装。出现 Setup was successful 后点击 Close。" },
+  { title: "验证安装", description: "按 Win + R，输入 cmd 回车打开命令行，输入 python --version。看到 Python 3.x.x 的版本号说明安装成功。", states: [{ label: "python --version", value: "Python 3.13.x" }] }
+]} />
+
+如果验证时提示"不是内部或外部命令"，说明安装时漏勾了 PATH。最简单的解决办法：卸载后重新安装，记得勾选。
+
+## 安装 VS Code
+
+1. 打开 code.visualstudio.com，下载 Windows 版并安装。
+2. 安装时保持默认选项即可，"添加到 PATH"一项建议保持勾选。
+3. 打开 VS Code，点击左侧活动栏的"扩展"图标（四个方块），搜索 **Python**，安装微软官方的 Python 扩展。它提供代码高亮、错误提示和一键运行。
+
+## 认识命令行
+
+命令行（终端）是输入文字命令操作计算机的窗口，接下来会经常用到。记住两个基本操作就够了：
+
+| 操作 | 命令 | 说明 |
+|------|------|------|
+| 打开命令行 | `Win + R` 后输入 `cmd` | 也可以在 VS Code 中选择"终端 → 新建终端" |
+| 查看某条命令的帮助 | 命令后加 `--help` | 例如 `python --help` |
+
+<Callout type="info" title="VS Code 自带终端">
+
+推荐直接用 VS Code 里的终端：菜单栏选择"终端 → 新建终端"。它自动定位到当前打开的文件夹，省去手动切换目录的麻烦。
+
+</Callout>
+
+## 动手试一试
+
+1. 完成上述安装，并在命令行运行 `python --version` 确认版本号。
+2. 在命令行输入 `python` 并回车，看到 `>>>` 提示符后输入 `2 + 3` 再回车，观察输出。这就是后面要讲的交互模式，玩完后输入 `exit()` 退出。
+
+<Quiz
+  question="安装 Python 时漏勾 'Add python.exe to PATH' 会发生什么？"
+  options={["Python 无法正常安装", "命令行里输入 python 会提示找不到命令", "写好的程序会运行出错", "没有任何影响"]}
+  answer={1}
+  explanation="PATH 是系统查找程序的路径列表。不加入 PATH，命令行就找不到 python，会提示「不是内部或外部命令」。程序本身仍能运行，只是不方便从命令行启动。"
+/>

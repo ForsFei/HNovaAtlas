@@ -1,0 +1,127 @@
+---
+id: csharp-chapter-map
+title: C# 复习章节总纲
+description: 按技术主题推进 C# 基础、数据处理、多线程、泛型、委托、反射和 I/O；每章融入进阶边界与面试追问。
+tags: [CSharp, 学习路线, 面试]
+difficulty: beginner
+status: published
+updated: "2026-10-13"
+order: 90
+prerequisite: [csharp-learning-path]
+related: [csharp-dotnet-terminology, csharp-yield-iterators, csharp-inheritance-polymorphism]
+---
+
+## 阅读约定
+
+这份总纲参考你原来语雀目录的主题与推进顺序，但不会机械照搬旧层级。每一章同时处理三件事：基础规则、进阶使用边界、常见面试追问。它们是同一个知识点的不同深度，不拆成互不相干的「语法」「进阶」「面试」三套页面。
+
+已写的课程保留原 URL，避免阅读书签失效；随着章节补强，我们会调整本页的顺序和链接。八章是复习主线，不宣称已穷尽 C# 的全部语言与平台主题。可先用[入门学习路线](/knowledge/programming/csharp/overview/)完成第一遍，再按本页回顾。
+
+## 第一章：C# 基础
+
+学完抽象类与接口后，补读[显式接口实现与默认接口成员](/knowledge/programming/csharp/object-oriented/explicit-and-default-interface-members/)：两个同名 `Render()` 分别映射到导出和审计契约，默认接口方法只经接口视图调用。配套断言：`dotnet run --project examples/csharp-interface-dispatch/InterfaceDispatchReview.csproj`。
+
+理解内置表达式求值后，补读[自定义运算符与转换契约](/knowledge/programming/csharp/fundamentals/user-defined-operators-and-conversions/)：以非负字节数验证加法溢出、显式转换、相等和哈希。配套断言：`dotnet run --project examples/csharp-operator-contracts/OperatorContractsReview.csproj`。
+
+读完“类型与空值”后，可先补[可空引用契约与流分析](/knowledge/programming/csharp/fundamentals/nullable-contracts-and-flow-analysis/)：它把条件检查、构造初始化与运行时守卫连接起来。配套断言：`dotnet run --project examples/csharp-nullable-contracts/NullableContractsReview.csproj`。
+
+读完类型选择与转换后，再看[数值解析与舍入契约](/knowledge/programming/csharp/fundamentals/numeric-parsing-and-rounding/)：用同一数字文本的两种解释说明为什么协议要指定文化和 `NumberStyles`，再比较 `ToEven` 与显式舍入模式。可运行 `dotnet run --project examples/csharp-numeric-contracts/NumericContractsReview.csproj` 核对断言。
+
+在[数组与字符串](/knowledge/programming/csharp/fundamentals/arrays-and-strings/)之后，补读[Unicode 文本：char、Rune、文本元素与规范化](/knowledge/programming/csharp/fundamentals/unicode-text-elements-and-normalization/)：区别代码单元、标量值与可见文本元素，并为标识符明确规范化契约。配套断言：`dotnet run --project examples/csharp-unicode-text/UnicodeTextReview.csproj`。
+
+本章先建立语言与运行平台的区别，然后复习数据类型、关键字和对象模型。每篇不只列定义，还要求你预测输出、解释边界和做一段小练习。
+
+| 小节 | 进度 | 内容与追问 |
+| --- | --- | --- |
+| .NET 介绍 | [术语、运行过程与发展脉络](/knowledge/programming/csharp/fundamentals/dotnet-terminology/) | C#、.NET、CLR、SDK、Runtime、程序集分别是什么？ |
+| 数据类型 | [类型与空值](/knowledge/programming/csharp/fundamentals/types-and-nullability/) → [类型选择、转换与装箱](/knowledge/programming/csharp/fundamentals/data-types-and-conversions/) → [数组与字符串](/knowledge/programming/csharp/fundamentals/arrays-and-strings/) → [枚举与 Flags](/knowledge/programming/csharp/fundamentals/enums-and-flags/) → [元组与解构](/knowledge/programming/csharp/fundamentals/tuples-and-deconstruction/) | `var` 是动态类型吗？枚举转换后必定是声明的值吗？元组复制是否深拷贝？ |
+| 关键字与方法 | [模式匹配与 switch](/knowledge/programming/csharp/fundamentals/pattern-matching/) → [运算符与表达式求值](/knowledge/programming/csharp/fundamentals/operators-and-evaluation/) → [方法参数与重载](/knowledge/programming/csharp/fundamentals/parameters-and-overloads/) → [扩展方法](/knowledge/programming/csharp/fundamentals/extension-methods/) → [访问修饰符、`const` 与 `readonly`](/knowledge/programming/csharp/fundamentals/access-const-readonly/) → [yield 与迭代器](/knowledge/programming/csharp/fundamentals/yield-and-iterators/) | 优先级和调用顺序是一回事吗？实例方法与扩展方法谁优先？枚举何时执行？ |
+| 面向对象 | [类、记录与接口](/knowledge/programming/csharp/object-oriented/classes-and-interfaces/) → [属性与索引器](/knowledge/programming/csharp/object-oriented/properties-and-indexers/) → [构造函数与不变量](/knowledge/programming/csharp/object-oriented/constructors-and-invariants/) → [抽象类与接口](/knowledge/programming/csharp/object-oriented/abstract-classes-and-interfaces/) → [显式实现与默认成员](/knowledge/programming/csharp/object-oriented/explicit-and-default-interface-members/) → [值语义与相等性](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/) → [record 继承与 with](/knowledge/programming/csharp/object-oriented/record-inheritance-and-with/) → [继承与多态](/knowledge/programming/csharp/object-oriented/inheritance-and-polymorphism/) → [组合与依赖注入](/knowledge/programming/csharp/object-oriented/composition-and-dependency-injection/) | `init` 能否保证对象深度不可变？接口与抽象类如何选？两个同名接口成员如何分派？ |
+
+[第一个程序](/knowledge/programming/csharp/fundamentals/first-program/)和[流程与方法](/knowledge/programming/csharp/fundamentals/control-flow-and-methods/)仍是第一章的入门前置内容。面试时不要只背一句话，至少能写一个最小反例证明自己的理解。
+
+面向对象中的值语义之后，继续读[readonly struct 与防御性复制](/knowledge/programming/csharp/object-oriented/readonly-struct-and-defensive-copies/)：用 `in` 参数的反例区分只读承诺、隐藏副本和深度不可变。运行 `dotnet run --project examples/csharp-readonly-struct/ReadonlyStructReview.csproj` 可核对输出。
+
+若使用记录层级，在值语义之后先读[record 继承与 with](/knowledge/programming/csharp/object-oriented/record-inheritance-and-with/)：判断运行时类型是否参与相等、基类变量复制后是否保留派生信息，以及可变数组为何仍被共享。配套断言：`dotnet run --project examples/csharp-record-hierarchy/RecordHierarchyReview.csproj`。
+
+本批三个基础补强专题可通过 `dotnet run --project examples/csharp-foundations-review/FoundationsReview.csproj` 运行随仓库示例。
+
+枚举、元组和扩展方法的验证示例：`dotnet run --project examples/csharp-foundations-part2/FoundationsPart2.csproj`。
+
+表达式求值与短路的验证示例：`dotnet run --project examples/csharp-expressions/ExpressionsReview.csproj`。
+
+组合与依赖替换的验证示例：`dotnet run --project examples/csharp-composition-di/CompositionReview.csproj`。
+
+## 第二章：数据存储与处理
+
+选好基础集合后，补读[不可变集合与快照](/knowledge/programming/csharp/collections/immutable-collections-and-snapshots/)：实测 `IReadOnlyList<T>` 视图、数组复制与 `ImmutableArray<T>`，再辨认可变元素的浅复制。配套断言：`dotnet run --project examples/csharp-immutable-snapshots/ImmutableSnapshotsReview.csproj`。
+
+在 JSON 基础契约之后，补读[JSON 多态契约与类型辨别符](/knowledge/programming/csharp/collections/json-polymorphism-and-discriminators/)：显式登记两种设备消息，验证未知类型与业务无效值的失败边界。配套断言：`dotnet run --project examples/csharp-json-polymorphism/JsonPolymorphismReview.csproj`。
+
+读完基础 LINQ 后，插读[LINQ 连接与键语义](/knowledge/programming/csharp/collections/linq-joins-and-key-semantics/)：同一组设备数据对照 `Join`、`GroupJoin`、`LeftJoin`，看清缺失与重复键。配套断言：`dotnet run --project examples/csharp-linq-joins/LinqJoinsReview.csproj`。
+
+进入集合前，可在第一章的数组之后补读[Span、Memory 与 ArrayPool](/knowledge/programming/csharp/fundamentals/spans-memory-and-pooling/)：它解释数组视图、异步缓冲与池化租期，配套断言为 `dotnet run --project examples/csharp-spans-memory/SpansMemoryReview.csproj`。
+
+随后读[ref struct、scoped 与 stackalloc](/knowledge/programming/csharp/fundamentals/ref-struct-scoped-and-stackalloc/)：把视图的引用生存期、栈上小缓冲及异步方法里的局部作用域讲清楚。配套断言：`dotnet run --project examples/csharp-ref-safety/RefSafetyReview.csproj`。
+
+顺序是集合 → LINQ → 结构化数据与时间 → 数据库。先读[集合与泛型基础](/knowledge/programming/csharp/collections/collections-and-generics/)、[集合选型与相等性](/knowledge/programming/csharp/collections/collection-selection-and-equality/)、[不可变集合与快照](/knowledge/programming/csharp/collections/immutable-collections-and-snapshots/)及[集合操作复杂度](/knowledge/programming/csharp/collections/collection-complexity-and-search/)，再读[LINQ 查询](/knowledge/programming/csharp/collections/linq/)与[查询边界](/knowledge/programming/csharp/collections/query-boundaries/)。结构化数据分别讲[JSON 契约与兼容](/knowledge/programming/csharp/collections/json-contracts/)、[JSON 多态与辨别符](/knowledge/programming/csharp/collections/json-polymorphism-and-discriminators/)、[时间点、偏移与时区](/knowledge/programming/csharp/collections/time-and-time-zones/)和[XML 安全读取](/knowledge/programming/csharp/collections/xml-processing/)；最后以[ADO.NET、参数化查询与事务](/knowledge/programming/csharp/collections/database-access/)建立概念，再用[SQLite 本地集成验证](/knowledge/programming/csharp/collections/sqlite-integration-test/)实际运行。集合、LINQ、JSON 和 XML 的基础示例可用 `dotnet run --project examples/csharp-data-processing/DataProcessing.csproj`，时间边界用 `dotnet run --project examples/csharp-time-zones/TimeZonesReview.csproj`，复杂度与二分示例可用 `dotnet run --project examples/csharp-collection-complexity/CollectionComplexityReview.csproj`，SQLite 示例可用 `dotnet run --project examples/csharp-sqlite/SqliteReview.csproj`。相关的文件与资源释放基础见[异常与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)。本章区分 ADO.NET 基础概念与更高层 ORM，也不把 SQLite 的行为直接等同于 SQL Server。
+
+## 第三章：多线程与异步
+
+在掌握 `Task` 后补读[Task 与 ValueTask 的契约](/knowledge/programming/csharp/concurrency/task-vs-valuetask/)：解释哪些情况下值得考虑 `ValueTask`，以及为何要一次消费、如何转成 Task 参与组合。配套断言：`dotnet run --project examples/csharp-task-valuetask/TaskValueTaskReview.csproj`。
+
+使用多个 Task 时，再读[Task 组合的故障与超时](/knowledge/programming/csharp/concurrency/task-composition-faults-and-timeouts/)：明确 `WhenAll` 等全部、`WhenAny` 返回赢家任务，以及 `WaitAsync` 超时并不停止原任务。配套断言：`dotnet run --project examples/csharp-task-composition/TaskCompositionReview.csproj`。
+
+接着读[await 恢复到哪里](/knowledge/programming/csharp/concurrency/synchronization-context-and-configureawait/)：用受控 `SynchronizationContext` 解释默认回送、`ConfigureAwait(false)`、已完成任务与 `AsyncLocal` 传播，避免用线程号猜规则。配套断言：`dotnet run --project examples/csharp-async-context/AsyncContextReview.csproj`。
+
+学完同步 `yield` 和 `async / await` 后，插读[异步流：逐项读取、取消与提前退出](/knowledge/programming/csharp/concurrency/async-streams-and-cancellation/)：它把 `IAsyncEnumerable<T>`、`await foreach` 与异步释放串起来。配套断言：`dotnet run --project examples/csharp-async-streams/AsyncStreamsReview.csproj`。这与后面的 Channel 不同：异步迭代本身不承诺独立生产者、缓冲或并行。
+
+先读[Thread、线程池与 Task](/knowledge/programming/csharp/concurrency/threads-threadpool-tasks/)和既有的[async / await、并发 I/O 与取消](/knowledge/programming/csharp/concurrency/async-await/)，再深入[共享状态与 `lock`](/knowledge/programming/csharp/concurrency/lock-and-shared-state/)、[内存可见性与原子操作](/knowledge/programming/csharp/concurrency/visibility-and-atomicity/)、[受控并发测试](/knowledge/programming/csharp/concurrency/controlled-concurrency-tests/)、[并发集合与 Channel](/knowledge/programming/csharp/concurrency/concurrent-collections-and-channels/)、[取消、超时与限流](/knowledge/programming/csharp/concurrency/cancellation-and-throttling/)及[异步管线故障与取消](/knowledge/programming/csharp/concurrency/channel-failure-and-cancellation/)。基础验证示例可用 `dotnet run --project examples/csharp-concurrency/ConcurrencyReview.csproj` 运行，原子更新与快照示例用 `dotnet run --project examples/csharp-atomicity/AtomicityReview.csproj`，受控交错案例用 `dotnet run --project examples/csharp-concurrency-tests/ConcurrencyTestReview.csproj`，管线故障案例用 `dotnet run --project examples/csharp-channel-failures/ChannelFailureReview.csproj`。关键是区分「并发处理多个任务」「多个线程执行」「非阻塞等待」，以及单字段原子操作与多字段业务不变量；能说明某段代码究竟保护了什么数据，而不是笼统地说“加锁就安全”。
+
+## 第四章：泛型
+
+学过泛型约束后，补读[静态抽象接口成员与泛型数学](/knowledge/programming/csharp/generics/static-abstract-members-and-generic-math/)：自定义数量加法契约，再比较 `int` 与 `decimal` 平均值。配套断言：`dotnet run --project examples/csharp-static-abstract-math/StaticAbstractMathReview.csproj`。
+
+从[集合中的泛型应用](/knowledge/programming/csharp/collections/collections-and-generics/)出发，接着读[泛型方法与约束](/knowledge/programming/csharp/generics/methods-and-constraints/)、[静态抽象成员与泛型数学](/knowledge/programming/csharp/generics/static-abstract-members-and-generic-math/)、[协变与逆变](/knowledge/programming/csharp/generics/variance/)、[泛型 API 设计与运行时类型](/knowledge/programming/csharp/generics/api-design-and-runtime/)。基础示例可用 `dotnet run --project examples/csharp-generics/GenericsReview.csproj` 验证。面试问题不只问 `List<T>` 的写法，还要解释为什么 `List<Derived>` 不能直接赋给 `List<Base>`，以及 `IEnumerable<T>` 为什么可能可以转换。
+
+## 第五章：委托和事件
+
+从[方法](/knowledge/programming/csharp/fundamentals/control-flow-and-methods/)与[对象](/knowledge/programming/csharp/object-oriented/classes-and-interfaces/)出发，依次学习[委托、`Func` 与 `Action`](/knowledge/programming/csharp/delegates-events/delegates-func-action/)、[Lambda 与闭包](/knowledge/programming/csharp/delegates-events/lambda-and-closures/)和[事件与订阅生命周期](/knowledge/programming/csharp/delegates-events/events-and-lifecycle/)。本仓库示例可用 `dotnet run --project examples/csharp-delegates-events/DelegatesEventsReview.csproj` 验证。重点追问：事件与公开委托字段的权限边界，闭包捕获的是变量还是当时的值；长寿命发布者为何要管理退订。
+
+## 第六章：反射和特性
+
+先读[特性与元数据](/knowledge/programming/csharp/reflection/attributes-and-metadata/)，分清声明、读取和业务动作；再读[`Type`、程序集与成员](/knowledge/programming/csharp/reflection/type-and-members/)，学会指定成员签名并处理查找失败；最后用[反射创建与表达式树](/knowledge/programming/csharp/reflection/factory-and-boundaries/)串起受限规则工厂、运行时代价和裁剪边界。本仓库示例可用 `dotnet run --project examples/csharp-reflection/ReflectionReview.csproj` 验证。面试时要能解释为什么特性不会自动执行，以及已知类型时为什么优先考虑接口或显式注册。
+
+## 第七章：I/O 操作
+
+在预算门槛之后，读[HTTP 端到端截止时间与取消](/knowledge/programming/csharp/io/http-end-to-end-deadline-and-cancellation/)：同一链接令牌贯穿发送与正文读取，实际验证两段在途操作均可取消。配套断言：`dotnet run --project examples/csharp-http-end-to-end-deadline/HttpDeadlineReview.csproj`。
+
+学完有限 HTTP 重试后，补读[Retry-After 与预算](/knowledge/programming/csharp/io/http-retry-after-and-budget/)：用模拟时间验证 503/429 等待提示、预算不足时停止和等待取消。配套断言：`dotnet run --project examples/csharp-http-retry-budget/HttpRetryBudgetReview.csproj`。
+
+完成单次 HTTP 下载的限额与故障验证后，补读[HTTP 重试与幂等边界](/knowledge/programming/csharp/io/http-retry-and-idempotency/)：用可控响应辨认 503、400、尝试次数和写请求重复副作用。配套断言：`dotnet run --project examples/csharp-http-retry/HttpRetryReview.csproj`。
+
+学完异步文件 I/O 后，补[文件完整发布：临时文件、校验与失败清理](/knowledge/programming/csharp/io/complete-file-publication/)：用新建目标的例子验证部分写入取消不会暴露正式文件，也辨认它不保证断电持久或覆盖旧文件。配套断言：`dotnet run --project examples/csharp-file-publication/FilePublicationReview.csproj`。
+
+先用[异常边界与筛选](/knowledge/programming/csharp/reliability/exception-boundaries-and-filters/)复习“预期输入失败、筛选、重抛和上下文包装”，再讨论文件/网络资源；配套断言：`dotnet run --project examples/csharp-exception-boundaries/ExceptionBoundariesReview.csproj`。
+
+在文件与网络 I/O 前，先读[托管内存、GC 与 IDisposable](/knowledge/programming/csharp/reliability/managed-memory-and-disposal/)，厘清对象回收与资源关闭的不同责任。配套断言：`dotnet run --project examples/csharp-memory-lifecycle/MemoryLifecycleReview.csproj`。
+
+接着读[`IAsyncDisposable` 与 `await using`](/knowledge/programming/csharp/reliability/async-disposal-and-ownership/)：验证异步清理会被等待、异常离开仍清理，并区分资源拥有者与借用者。配套断言：`dotnet run --project examples/csharp-async-disposal/AsyncDisposalReview.csproj`。
+
+先读已有的[异常、文件读取和资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)，再依次学[流、缓冲与所有权](/knowledge/programming/csharp/io/streams-and-ownership/)、[文本编码与路径](/knowledge/programming/csharp/io/encoding-and-paths/)、[异步文件 I/O 与取消](/knowledge/programming/csharp/io/async-files-and-cancellation/)、[网络 I/O 与消息边界](/knowledge/programming/csharp/io/network-streams-and-framing/)以及[可测试 HTTP 下载](/knowledge/programming/csharp/io/testable-http-download/)。基础示例可用 `dotnet run --project examples/csharp-io/IoReview.csproj` 验证；HTTP 限额与故障示例用 `dotnet run --project examples/csharp-http-download/HttpDownloadReview.csproj`，前者网络部分只使用本机回环，后者用注入响应而不访问外网。重点追问：一次 `ReadAsync` 为何不等于一条消息、取消后目标为何可能有半成品、路径规范化为何不等于授权。
+
+## 第八章：测试与质量
+
+在异常边界和异步基础之后，先读[ActivitySource 与追踪](/knowledge/programming/csharp/reliability/activity-source-and-tracing/)：用可控监听器验证一次操作内父子步骤的 `TraceId`、跨 `await` 上下文和错误状态。配套断言：`dotnet run --project examples/csharp-activity-tracing/ActivityTracingReview.csproj`。
+
+接着读[.NET 指标：Counter、Histogram 与当前值](/knowledge/programming/csharp/reliability/metrics-counters-histograms-and-gauges/)：用 MeterListener 对照事件增量、耗时样本和按需读取的当前值，区分追踪与指标。配套断言：`dotnet run --project examples/csharp-metrics/MetricsReview.csproj`。
+
+然后读[.NET 结构化日志：模板、异常与作用域](/knowledge/programming/csharp/reliability/structured-logging-and-scopes/)：把单次边界事件的模板字段、异常对象和共享上下文与前两篇对照。配套断言：`dotnet run --project examples/csharp-structured-logging/StructuredLoggingReview.csproj`。
+
+从前几章的控制台断言走到[单元测试：边界用例、替身与集成测试分工](/knowledge/programming/csharp/testing/unit-tests-and-boundaries/)：在真实 xUnit 项目中验证设备告警阈值、无效输入和出口故障。执行 `dotnet test examples/csharp-unit-testing/ReadingAlerts.Tests/ReadingAlerts.Tests.csproj`。再对照[SQLite 本地集成验证](/knowledge/programming/csharp/collections/sqlite-integration-test/)，辨认替身测试能证明什么，以及哪些行为必须交给真实依赖验证。
+
+## 怎样检验是否掌握
+
+每个小节完成后，尝试不用笔记回答：①规则；②一段能运行的例子；③一个反例；④真实项目何时会遇到。答不出某一步，就回到对应文章运行代码。这里不设打卡、积分或强制弹题；练习服务于理解。
+
+本系列为本站原创整理，以[Microsoft Learn C# 文档](https://learn.microsoft.com/en-us/dotnet/csharp/)和各篇列出的原始资料核对语言规则。

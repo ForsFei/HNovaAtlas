@@ -1,0 +1,63 @@
+---
+id: csharp-first-program
+title: 第一个 C# 程序：从源码到运行
+description: 创建控制台项目，理解顶级语句、变量、插值字符串与编译运行的过程。
+tags: [CSharp, .NET, 入门]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-learning-path]
+related: [csharp-types-nullability]
+---
+
+## 学习目标
+
+完成后，你应能解释 `.cs` 源文件、`.csproj` 项目文件和 `dotnet run` 各自负责什么；能改动输入、预测输出，而不是只会复制 Hello World。
+
+## 创建与运行
+
+在准备存放代码的目录打开终端，执行：
+
+```text
+dotnet new console -n SensorDemo
+cd SensorDemo
+dotnet run
+```
+
+`dotnet new` 创建项目；`.csproj` 指定目标框架、编译选项和依赖；`Program.cs` 放源代码。`dotnet run` 会按需还原依赖、编译，再启动程序。改完代码重新运行才能看到变化。IDE 的运行按钮只是替你执行类似过程，不是 C# 语言的一部分。
+
+## 写一个有意义的程序
+
+把 `Program.cs` 的内容替换为下面完整示例。现代控制台模板支持「顶级语句」：入口代码可以直接写在文件顶部，不必为了入门先写 `Program` 类和 `Main` 方法。
+
+```csharp filename="Program.cs"
+string device = "泵站 A";
+double temperature = 72.5;
+double limit = 70.0;
+bool isHot = temperature >= limit;
+
+Console.WriteLine($"设备：{device}");
+Console.WriteLine($"温度：{temperature:F1} °C");
+Console.WriteLine($"是否超限：{isHot}");
+```
+
+输出中的 `F1` 表示固定一位小数。`$"...{表达式}..."` 是字符串插值；花括号中的表达式在运行时求值。`=` 是赋值，`>=` 是比较，比较的结果是 `bool`。变量声明的左边是类型，右边是初始值；这里用 `double` 演示测量值，不意味着所有带小数的业务数据都应该用它，金额通常考虑 `decimal`。
+
+## 编译错误和运行错误不是一回事
+
+删除一处结尾分号再执行 `dotnet run`，编译器会给出文件位置与错误编号；程序尚未开始运行。恢复分号后再尝试把 `limit` 改成 `75.0`，程序能运行但结果会变化。这种「结果不符合预期」是逻辑问题，不是编译器能替你发现的错误。读报错时先看第一条有意义的诊断和对应行，不必被后续连带错误吓住。
+
+`Console.WriteLine` 写到标准输出，适合学习和小型命令行工具；它不会自动保存数据。源码在编辑器里显示的文字也不会因为运行一次就变成永久数据库。
+
+## 动手练习
+
+1. 再加入 `string unit = "°C";`，让输出中的单位来自变量。
+2. 分别把温度改为 `69.9`、`70.0`、`70.1`，先预测 `isHot`，再运行验证边界值。
+3. 额外输出超出阈值多少度。未超限时可先允许负数，下一章以后再改善表达。
+
+验收标准：能够独立创建项目，说明为什么 `70.0` 算超限，以及分号缺失属于哪类问题。下一章会进一步解释为什么 `double`、`bool`、`string` 有不同的行为。
+
+## 参考
+
+[Microsoft Learn：开始学习 C#](https://learn.microsoft.com/en-us/dotnet/csharp/get-started/) · [Hello World 教程](https://learn.microsoft.com/en-us/dotnet/csharp/tour-of-csharp/tutorials/hello-world)

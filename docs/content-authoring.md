@@ -76,7 +76,7 @@ npm start
 
 但 MDX 正文仍是可执行源代码。只编译已审核的仓库内容，AI 生成内容先作为待审草稿；不要把未经审核的文件导入编译链路。开发模式也会编译草稿。
 
-目前支持正文、链接、列表、GFM 表格、代码高亮和 JSX，以及自动目录、复制、知识导航、静态全文搜索。Phase 7 提供 Callout、Tabs/Tab、Accordion 与 Mermaid，详见 [MDX 组件指南](mdx-components.md)。Phase 8 提供 Quiz / FlashCard / Stepper，详见 [学习组件指南](interactive-components.md)。使用 JSX 组件的文章必须采用 `.mdx` 扩展名；普通 `.md` 用于纯 Markdown。标签聚合页尚未实现。
+目前支持正文、链接、列表、GFM 表格、代码高亮和 JSX，以及自动目录、复制、知识导航、静态全文搜索与标签聚合。Phase 7 提供 Callout、Tabs/Tab、Accordion 与 Mermaid，详见 [MDX 组件指南](mdx-components.md)。Phase 8 提供 Quiz / FlashCard / Stepper，详见 [学习组件指南](interactive-components.md)。使用 JSX 组件的文章必须采用 `.mdx` 扩展名；普通 `.md` 用于纯 Markdown。
 
 ## 文章目录与代码块
 
@@ -95,6 +95,10 @@ npm start
 Shiki 在构建端处理，语法颜色由 tokens.css 统一控制并随主题切换。未知语言降级为纯文本。支持 Shiki 内置语言，例如 csharp、xml、json、javascript、typescript、python、bash。
 
 上一篇/下一篇按当前技术目录深度优先的知识顺序排列（目录和文章的 order），不按更新时间。关联知识优先使用 `related` 的显式顺序，随后按同技术与共同标签推荐，最多四篇且不推荐草稿或当前文章。
+
+### 系列课程示例：C#
+
+`content/programming/csharp/overview.mdx` 是课程入口；`fundamentals`、`object-oriented`、`collections`、`reliability`、`concurrency` 的 `_meta.yml` 决定大章节顺序，文章的 `order` 决定章内顺序。新增 C# 课程文章时，同时更新总览的阅读表和对应的 `prerequisite` / `related` ID。代码示例应标明是完整 `Program.cs` 还是接在前一个片段中的局部示例；标准控制台示例可用 `examples/csharp-reading-analyzer` 对照验证。该系列刻意以正文、代码和练习为主，不为每个概念添加交互组件。
 
 修改本地 remark / rehype 插件实现后应重新编译内容；Turbopack 的 MDX 缓存可能不追踪插件文件本身。改变插件配置或重新保存相关内容会使编译签名更新。
 

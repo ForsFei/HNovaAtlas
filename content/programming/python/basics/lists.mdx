@@ -1,0 +1,108 @@
+---
+id: python-lists
+title: 列表
+description: 用列表把一组数据放在一起，学习增删改查和排序。
+tags: [Python, 列表, list]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 60
+prerequisite: [python-loops]
+related: [python-dicts-sets]
+---
+
+## 一组数据放在一起
+
+记录全班同学的分数，总不能写 40 个变量。**列表**（list）把多个值按顺序装进一个变量，用方括号包住、逗号分隔：
+
+```python filename="list-basic.py"
+scores = [92, 85, 77, 100, 63]
+names = ["小明", "小红", "小刚"]
+mixed = [1, "two", 3.0, True]     # 类型可以混搭（不推荐滥用）
+empty = []                        # 空列表
+```
+
+## 按下标取用
+
+和字符串一样，下标从 0 开始，也支持负下标和切片：
+
+```python filename="list-index.py"
+scores = [92, 85, 77, 100, 63]
+print(scores[0])     # 92，第一个
+print(scores[-1])    # 63，最后一个
+print(len(scores))   # 5，长度
+print(scores[1:3])   # [85, 77]，切片（含头不含尾）
+print(100 in scores) # True，判断是否存在
+```
+
+## 列表是"可变"的
+
+字符串改不了单个字符，但列表可以随时增删改：
+
+```python filename="list-mutable.py"
+todo = ["写作业", "洗碗"]
+todo[0] = "写数学作业"        # 修改
+todo.append("跑步")           # 末尾添加
+todo.insert(1, "看书")        # 插到指定位置
+todo.remove("洗碗")           # 按值删除
+last = todo.pop()             # 弹出末尾元素
+print(todo)                   # ['写数学作业', '看书']
+```
+
+常用方法速查：
+
+| 方法 | 作用 |
+|------|------|
+| `append(x)` | 末尾添加 x |
+| `insert(i, x)` | 在下标 i 处插入 x |
+| `remove(x)` | 删除第一个值为 x 的元素 |
+| `pop()` | 取出并删除末尾元素 |
+| `sort()` | 原地从小到大排序 |
+| `reverse()` | 原地反转 |
+
+## 遍历列表
+
+for 和列表是天生一对：
+
+```python filename="for-list.py"
+scores = [92, 85, 77]
+
+for s in scores:
+    print(s)
+
+# 需要下标时用 enumerate，同时拿到序号和值
+for index, s in enumerate(scores):
+    print(f"第 {index + 1} 个：{s}")
+```
+
+## 一个实用组合：统计
+
+```python filename="stats.py"
+scores = [92, 85, 77, 100, 63]
+print(sum(scores))   # 417  求和
+print(max(scores))   # 100  最大
+print(min(scores))   # 63   最小
+print(len(scores))   # 5    个数
+print(sum(scores) / len(scores))   # 83.4 平均分
+```
+
+<Callout type="info" title="排序的两种方式">
+
+`scores.sort()` 直接修改原列表，返回 None；`sorted(scores)` 不动原列表，返回排好序的新列表。想保留原始顺序就用 `sorted()`。降序都加参数 `reverse=True`。
+
+</Callout>
+
+## 动手试一试
+
+1. 建一个购物清单列表，添加三件商品，再删除一件，打印最终结果。
+2. 求列表 `[3, 7, 1, 9, 4]` 的最大值——先自己用循环写，再用 `max()` 验证。
+3. 把一组名字按字母顺序排序后输出。
+
+<Quiz
+  question="nums = [1, 2, 3] 后执行 nums.append([4, 5])，len(nums) 是多少？"
+  options={["5", "4", "3", "报错"]}
+  answer={1}
+  explanation="append 把 [4, 5] 整个当作一个元素追加进去，列表变成 [1, 2, 3, [4, 5]]，共 4 个元素。想逐个追加要用 extend(nums2) 或 +=。"
+/>
+
+<FlashCard front="sort() 和 sorted() 有什么区别？" back="sort() 原地修改列表并返回 None；sorted() 返回一个排好序的新列表，原列表不变。" />

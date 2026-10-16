@@ -1,0 +1,194 @@
+---
+id: csharp-io-http-end-to-end-deadline
+title: HTTP 端到端截止时间：发送与正文读取共用一次取消
+description: 用同一个链接取消令牌覆盖响应头和正文读取，并以可控处理器与流验证在途取消。
+tags: [CSharp, HttpClient, 取消, 超时, 流, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-15"
+order: 49
+prerequisite: [csharp-io-http-retry-after-budget, csharp-io-testable-http-download]
+related: [csharp-cancellation-throttling, csharp-task-composition-faults-timeouts, csharp-io-http-retry-idempotency]
+---
+
+## 预算检查与在途取消不是同一件事
+
+上一篇[Retry-After 与预算](/knowledge/programming/csharp/io/http-retry-after-and-budget/)只在**下一步开始前**判断时间是否足够。假设请求已经发出，服务端迟迟不返回响应头；或响应头很快返回，正文却一直不继续发送：仅在重试循环外检查预算都无法停止当前等待。
+
+本篇只处理**一次 GET 的发送与响应正文读取**，不重新实现重试策略。核心是创建链接调用方令牌的 `CancellationTokenSource`，只安排一次 `CancelAfter`，然后把同一个令牌传给 `SendAsync`、`ReadAsStreamAsync` 和 `ReadAsync`。这样预算不会在收到响应头之后重新计时。调用方主动取消也沿同一路径传入。这里的“端到端”特指这一段客户端 HTTP 操作，不包括上层业务事务、落盘、后续解析或服务器端执行。
+
+### 为什么不能只设置 HttpClient.Timeout？
+
+`ResponseHeadersRead` 让 `SendAsync` 在响应头到达后完成，正文尚未读完。官方文档明确指出，此模式下 `HttpClient.Timeout` 只覆盖到响应头，**不会自动覆盖后续正文读取**。下例把共享 `HttpClient.Timeout` 设为无限，刻意让调用级预算只有一个计时来源；实际应用若还保留共享超时，两个时间限制中较短者可能先触发，观测与归因就要明确区分。请勿为每个请求新建 `HttpClient` 来解决超时问题。
+
+## 可运行验证：三种在途场景
+
+运行 `dotnet run --project examples/csharp-http-end-to-end-deadline/HttpDeadlineReview.csproj`。代码不访问网络：处理器卡在响应头前，替身流卡在正文读取时；测试等待它们真正进入相应阶段后，分别由调用方或 50ms 截止计时器取消。计时器案例只断言最终取消，不断言精确耗时。完整代码如下。
+
+```csharp filename="Program.cs"
+using System.Net;
+
+Uri address = new("https://example.invalid/data");
+
+using (var handler = new BlockingHeaderHandler())
+using (var client = NewClient(handler))
+using (var caller = new CancellationTokenSource())
+{
+    Task<int> pending = ReadOneByteAsync(client, address, TimeSpan.FromSeconds(5), caller.Token);
+    await handler.Entered.Task;
+    caller.Cancel();
+    await ExpectCanceledAsync(pending);
+    Check(handler.Canceled && handler.Calls == 1, "caller cancellation reached SendAsync");
+}
+
+using (var handler = new BlockingHeaderHandler())
+using (var client = NewClient(handler))
+{
+    Task<int> pending = ReadOneByteAsync(client, address, TimeSpan.FromMilliseconds(50),
+        CancellationToken.None);
+    await handler.Entered.Task;
+    await ExpectCanceledAsync(pending);
+    Check(handler.Canceled && handler.Calls == 1, "deadline canceled an in-flight send");
+}
+
+using (var body = new BlockingBodyStream())
+using (var handler = new BodyHandler(body))
+using (var client = NewClient(handler))
+using (var caller = new CancellationTokenSource())
+{
+    Task<int> pending = ReadOneByteAsync(client, address, TimeSpan.FromSeconds(5), caller.Token);
+    await body.Entered.Task;
+    caller.Cancel();
+    await ExpectCanceledAsync(pending);
+    Check(body.Canceled && handler.Calls == 1, "caller cancellation reached body ReadAsync");
+}
+
+using (var body = new BlockingBodyStream())
+using (var handler = new BodyHandler(body))
+using (var client = NewClient(handler))
+{
+    Task<int> pending = ReadOneByteAsync(client, address, TimeSpan.FromMilliseconds(50),
+        CancellationToken.None);
+    await body.Entered.Task;
+    await ExpectCanceledAsync(pending);
+    Check(body.Canceled && handler.Calls == 1, "same deadline covered body ReadAsync");
+}
+
+Console.WriteLine("发送截止时间、调用方取消和正文读取取消均已验证。");
+
+static HttpClient NewClient(HttpMessageHandler handler) =>
+    new(handler, disposeHandler: false) { Timeout = Timeout.InfiniteTimeSpan };
+
+static async Task<int> ReadOneByteAsync(HttpClient client, Uri address, TimeSpan budget,
+    CancellationToken callerToken)
+{
+    if (budget <= TimeSpan.Zero) throw new ArgumentOutOfRangeException(nameof(budget));
+    using var deadline = CancellationTokenSource.CreateLinkedTokenSource(callerToken);
+    deadline.CancelAfter(budget);
+    using var request = new HttpRequestMessage(HttpMethod.Get, address);
+    using var response = await client.SendAsync(request,
+        HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+    response.EnsureSuccessStatusCode();
+    Stream body = await response.Content.ReadAsStreamAsync(deadline.Token);
+    byte[] buffer = new byte[1];
+    return await body.ReadAsync(buffer, deadline.Token);
+}
+
+static async Task ExpectCanceledAsync(Task task)
+{
+    try { await task; }
+    catch (OperationCanceledException) { return; }
+    throw new Exception("Expected cancellation");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+sealed class BlockingHeaderHandler : HttpMessageHandler
+{
+    public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public int Calls { get; private set; }
+    public bool Canceled { get; private set; }
+
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        Calls++;
+        Entered.TrySetResult();
+        try { await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Canceled = true;
+            throw;
+        }
+        throw new Exception("Unreachable");
+    }
+}
+
+sealed class BodyHandler(BlockingBodyStream body) : HttpMessageHandler
+{
+    public int Calls { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        Calls++;
+        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StreamContent(body)
+        });
+    }
+}
+
+sealed class BlockingBodyStream : Stream
+{
+    public TaskCompletionSource Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    public bool Canceled { get; private set; }
+    public override bool CanRead => true;
+    public override bool CanSeek => false;
+    public override bool CanWrite => false;
+    public override long Length => throw new NotSupportedException();
+    public override long Position { get => throw new NotSupportedException(); set => throw new NotSupportedException(); }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer,
+        CancellationToken cancellationToken = default)
+    {
+        Entered.TrySetResult();
+        try { await Task.Delay(Timeout.InfiniteTimeSpan, cancellationToken); }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Canceled = true;
+            throw;
+        }
+        throw new Exception("Unreachable");
+    }
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count,
+        CancellationToken cancellationToken) =>
+        ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override void Flush() => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+}
+```
+
+## 读懂所有权和失败语义
+
+`using var response` 会释放响应及其内容；这里从内容取得的 `Stream` 由响应内容拥有，因此不另行释放同一流。生产代码若把流交给别的组件，要明确由谁关闭。`ReadAsync` 的返回值可能小于缓冲区长度，也可能为零表示结束；示例只读一个字节，是为了聚焦取消，不是完整下载器。完整下载仍需循环、大小上限和部分结果处理，见[可测试的 HTTP 限额下载](/knowledge/programming/csharp/io/testable-http-download/)。
+
+`OperationCanceledException`（包括 `TaskCanceledException`）不能只凭异常类型断言“是调用方取消”还是“预算耗尽”。二者可能竞态发生；如需对外返回分类结果，应检查调用方与自身截止令牌状态，定义同时触发时的优先级，并记录阶段、预算与原因。不要把超时误说成服务器已回滚：客户端停止等待或关闭连接，不保证服务器未处理请求。尤其是写请求，是否允许重试仍要回到[幂等与重试边界](/knowledge/programming/csharp/io/http-retry-and-idempotency/)。
+
+如果把本篇做法接到上篇的多次尝试中，应在**整个调用外层**创建一次链接截止令牌，并把它传给每次发送、每次正文读取与每次等待；不能每次重试都重置总预算。令牌是协作取消：不接收令牌或忽略取消的底层操作仍可能继续，必要时还需有限缓冲、资源释放与故障观测。
+
+## 面试自测
+
+1. `ResponseHeadersRead` 返回后，为什么 `HttpClient.Timeout` 不能替你约束后续慢正文？
+2. `CancelAfter` 如果放在每次重试内部，会怎样改变“总预算”的含义？
+3. 同时发生调用方取消与截止时间到期时，为什么只看 `TaskCanceledException` 不够？
+4. 一次 POST 客户端超时，能否据此断定服务器没有产生副作用？
+
+参考：[HttpCompletionOption 与超时范围](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption?view=net-10.0)、[HttpClient.Timeout](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpclient.timeout?view=net-10.0)、[CancellationTokenSource.CancelAfter](https://learn.microsoft.com/en-us/dotnet/api/system.threading.cancellationtokensource.cancelafter?view=net-10.0)。

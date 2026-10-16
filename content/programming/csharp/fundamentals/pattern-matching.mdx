@@ -1,0 +1,75 @@
+---
+id: csharp-pattern-matching
+title: 模式匹配与 switch：把分支写成可检查的规则
+description: 练习 is、类型/属性/关系/列表模式，解释匹配顺序、空值与非穷尽 switch 的失败边界。
+tags: [CSharp, 模式匹配, switch, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 35
+prerequisite: [csharp-control-flow-methods, csharp-types-nullability]
+related: [csharp-arrays-strings, csharp-value-equality]
+---
+
+## `is` 同时检查形状和取得值
+
+传统代码先 `if (value is Reading)`，再强转；声明模式可一步检查并得到强类型局部变量。`is null` 与重载过的 `==` 不同，适合明确的空值判断。下面完整示例可作为 `Program.cs` 运行：
+
+```csharp filename="Program.cs"
+object? input = new Reading("pump-A", 72.5);
+
+if (input is Reading { DeviceId: { Length: > 0 }, Value: >= 70 } reading)
+    Console.WriteLine($"{reading.DeviceId} 预警"); // pump-A 预警
+
+Console.WriteLine(input is not null); // True
+
+public sealed record Reading(string DeviceId, double Value);
+```
+
+属性模式先确认对象符合类型，再匹配成员。`DeviceId: { Length: > 0 }` 还隐含该字符串非空；如果 `DeviceId` 为空或 `null`，整条模式不匹配。写模式是为了突出业务条件，不是为了把所有判断压成一行；成员访问有副作用或规则很长时，显式变量与 `if` 可能更好读。
+
+## `switch` 表达式按顺序选第一个匹配臂
+
+把较严格的条件放前面，最后明确处理其他情况：
+
+```csharp filename="Program.cs"
+object? input = new Reading("pump-A", 82);
+string status = input switch
+{
+    Reading { Value: >= 80 } => "危险",
+    Reading { Value: >= 70 } => "预警",
+    Reading => "正常",
+    null => "缺失",
+    _ => "不支持的输入"
+};
+Console.WriteLine(status); // 危险
+
+public sealed record Reading(string DeviceId, double Value);
+```
+
+如果把 `Reading => "正常"` 放在前面，后续两个 `Reading` 分支永远无法命中，编译器会报不可达。`_` 是兜底；去掉兜底且传入未覆盖的值时，`switch` 表达式会在运行时失败。编译器通常会警告非穷尽匹配，但不能假设每种复杂模式都能被静态证明完整。要让新增业务状态被迫显式处理，可把 `_` 分支写成 `throw new ArgumentOutOfRangeException(...)`，并在测试中覆盖边界，而不是默认吞成“正常”。
+
+## 关系、逻辑和列表模式
+
+`>= 70 and < 80` 可表达一个区间；`or` 表达二选一。对支持长度与索引访问的序列，还能用列表模式检查形状：
+
+```csharp filename="Program.cs"
+int[] samples = [68, 72, 85];
+Console.WriteLine(samples is [< 70, >= 70 and < 80, >= 80]); // True
+Console.WriteLine(samples is [_, _, _]); // True：恰好三个元素
+```
+
+列表模式不是“遍历任意 `IEnumerable<T>` 的通用语法”，它要求可计数、可索引的形状。数据校验若牵涉长度、单位、外部 I/O 或多条错误信息，独立方法可能比巨大模式更清楚。
+
+## 面试自测与练习
+
+1. 输入读数为 85 时，为什么需要先判断 `>= 80` 再判断 `>= 70`？
+2. `input is Reading { DeviceId: { Length: > 0 } }` 对 `DeviceId == null` 会匹配吗？
+3. 去掉 `_` 后遇到新类型输入，编译和运行分别可能怎样提示问题？
+4. 为什么 `[_, _, _]` 不能直接用于只有 `IEnumerable<int>` 接口的变量？
+
+验收标准：能说明匹配顺序、兜底策略和模式真正读取了哪些成员。
+
+## 参考
+
+[Microsoft Learn：模式匹配概览](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/functional/pattern-matching) · [`switch` 表达式](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/switch-expression) · [列表模式](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/patterns/list-patterns)

@@ -1,0 +1,102 @@
+---
+id: csharp-sqlite-integration-test
+title: SQLite 集成验证：把参数、Reader 和事务真正跑起来
+description: 用无需外部数据库服务的内存 SQLite，复现 ADO.NET 参数化查询、提交、约束失败和回滚。
+tags: [CSharp, ADO.NET, SQLite, 数据库, 集成测试, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 55
+prerequisite: [csharp-database-access]
+related: [csharp-exceptions-disposal, csharp-query-boundaries, csharp-unit-tests-boundaries]
+---
+
+## 从概念骨架走到真实数据库
+
+[数据库访问入门](/knowledge/programming/csharp/collections/database-access/)使用 SQL Server 解释 `Connection → Command → Reader/Transaction`，但需要另外准备服务器和表。本篇换用 `Microsoft.Data.Sqlite` 与**同一条打开的内存连接**，让你在本机运行真实 SQL 与约束，不接触生产数据。它验证的是 ADO.NET 生命周期和失败边界，**不是** SQL Server 驱动行为的替身。
+
+仓库提供 .NET 10 示例：
+
+```text
+dotnet run --project examples/csharp-sqlite/SqliteReview.csproj
+```
+
+项目固定 `Microsoft.Data.Sqlite` 10.0.12；首次运行需要 NuGet 恢复。预期输出是“SQLite 集成示例通过：参数、Reader、提交与回滚。”；任一断言不成立则程序抛异常、以失败退出。不需要容器、账号、端口或数据库文件。
+
+## 内存库的边界：连接就是生命周期
+
+```csharp
+using var connection = new SqliteConnection("Data Source=:memory:");
+connection.Open();
+```
+
+`Data Source=:memory:` 每次打开一条连接就创建独立数据库；关闭连接，数据随之消失。所以示例的建表、插入、查询和回滚验证都在**同一连接**上完成。不要把连接拆成多个 `using`，然后期待后一个连接看见前一个连接的数据。SQLite 另有具名共享内存库模式，但需要 `Mode=Memory;Cache=Shared` 且至少保留一条连接；本篇不引入它，以免把连接共享与事务概念搅在一起。
+
+示例建两张表：`Readings(DeviceId TEXT, Value REAL)` 和 `Audit(Message TEXT)`。`Value` 有 `CHECK (Value >= 0)`，用于制造真实的第二条语句失败，而不是手动抛异常冒充数据库错误。真实项目要设计迁移、索引、约束与数据保存策略；本篇的建表只服务于学习测试。
+
+## 参数只代表值，不代表 SQL 结构
+
+示例插入和查询都使用参数：
+
+```csharp
+using var command = connection.CreateCommand();
+command.CommandText = "SELECT COUNT(*) FROM Readings WHERE DeviceId = $deviceId";
+command.Parameters.AddWithValue("$deviceId", deviceId);
+long count = (long)command.ExecuteScalar()!;
+```
+
+当 `deviceId` 是 `pump-A' OR 1=1 --` 时，查询应返回 `0`，而不是把引号、`OR` 和注释符解释成新的 WHERE 逻辑。仓库示例对此有断言。参数化也不意味着可以把表名、列名或排序片段直接从用户输入拼到 SQL 中；动态 SQL 结构仍需允许列表。
+
+SQLite 的 `TEXT`、`REAL`、`INTEGER` 类型与 SQL Server 的 `nvarchar(64)`、`float` 等并不完全等价。例如 SQLite 不会自动把你写的列长度声明当成严格长度约束。移植到其他数据库时，应重审 schema、参数类型、约束、排序规则和事务隔离，而非只换连接字符串。
+
+## 事务要保护完整的一组写入
+
+“插入读数并写审计”要么一起成功，要么一起失败。示例先在一个事务里执行两条命令，再提交：
+
+```csharp
+using var transaction = connection.BeginTransaction();
+using var reading = connection.CreateCommand();
+reading.Transaction = transaction;
+reading.CommandText = "INSERT INTO Readings (DeviceId, Value) VALUES ($id, $value)";
+reading.Parameters.AddWithValue("$id", "pump-A");
+reading.Parameters.AddWithValue("$value", 12.5);
+reading.ExecuteNonQuery();
+
+using var audit = connection.CreateCommand();
+audit.Transaction = transaction;
+audit.CommandText = "INSERT INTO Audit (Message) VALUES ($message)";
+audit.Parameters.AddWithValue("$message", "added pump-A");
+audit.ExecuteNonQuery();
+transaction.Commit();
+```
+
+关键不是“代码里出现了 `BeginTransaction`”，而是**事务内每个命令都绑定同一连接和这个事务**，且只在所有步骤成功后提交。示例随后再开一笔事务：先插入 `pump-B`，再故意插入 `Value = -1` 触发 `CHECK` 约束。捕获预期的约束错误后显式 `Rollback()`，再查询确认 `pump-B` 也不存在。不要用 `catch {}` 吞掉所有数据库异常；测试必须先确认预期错误确实发生，再验证回滚结果。
+
+这里的事务仅覆盖 SQLite 中的数据库操作。外部 HTTP 调用、文件写入或另一数据库连接不会因为这次 `Rollback()` 自动撤销；跨系统一致性需要另行设计。
+
+## Reader 的存活时间要短
+
+```csharp
+using var command = connection.CreateCommand();
+command.CommandText = "SELECT DeviceId, Value FROM Readings ORDER BY Id";
+using var reader = command.ExecuteReader();
+while (reader.Read())
+    Console.WriteLine($"{reader.GetString(0)}: {reader.GetDouble(1)}");
+```
+
+`Reader` 逐行读取，也持有数据库资源；在处理完行后及时释放。读取列前要知道 SQL 中列的顺序和是否允许 `NULL`。示例用 `TEXT NOT NULL` 和 `REAL NOT NULL`，因此直接调用 `GetString` / `GetDouble`；若列可空，应先 `IsDBNull`。返回大量行时，还需要稳定排序、分页和容量预算。
+
+## 这份集成测试证明了什么、没证明什么
+
+它真实验证了建表、参数值、约束错误、事务提交/回滚和 Reader 读取；不会证明 SQL Server 的类型映射、锁/隔离、网络超时或连接池行为。`Microsoft.Data.Sqlite` 的异步 ADO.NET 方法会同步执行，因为 SQLite 不提供相同的异步 I/O；这里刻意使用同步 API，不拿 `await` 包装后的形式冒充非阻塞验证。
+
+以后若要测试 SQL Server、PostgreSQL 等具体引擎，应在隔离的测试数据库上增加提供程序专属集成测试，清楚管理迁移、凭据与清理。内存 SQLite 是一堂可复现的基础课，不是所有数据库测试的万能替身。
+
+## 自测与面试追问
+
+1. 为什么两个 `Data Source=:memory:` 连接不能默认互相看见表？
+2. 第一次插入成功、第二次因 `CHECK` 失败，若没有事务会怎样？
+3. 参数能防止把 `deviceId` 当 SQL 执行，能否用参数动态选择列名？
+4. SQLite 示例通过后，为什么还不能断言 SQL Server 的异步查询和隔离行为正确？
+
+参考：[Microsoft Learn：内存数据库](https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/in-memory-databases)、[参数](https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/parameters)、[事务](https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/transactions)、[异步限制](https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/async)、[数据类型](https://learn.microsoft.com/en-us/dotnet/standard/data/sqlite/types)。

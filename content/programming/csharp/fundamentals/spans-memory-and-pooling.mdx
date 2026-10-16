@@ -1,0 +1,131 @@
+---
+id: csharp-spans-memory-pooling
+title: Span、Memory 与 ArrayPool：视图不是所有权
+description: 用同步切片和异步读帧理解零拷贝视图、缓冲区生命周期、池化租借与归还后的禁用规则。
+tags: [CSharp, Span, Memory, ArrayPool, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 29
+prerequisite: [csharp-arrays-strings, csharp-managed-memory-disposal]
+related: [csharp-io-streams-ownership, csharp-io-network-streams]
+---
+
+## 从数组切片的三个动作开始
+
+[数组与字符串](/knowledge/programming/csharp/fundamentals/arrays-and-strings/)已经比较过数组别名、范围切片和 `Span<T>` 视图。进一步追问是：谁拥有底层缓冲区、视图能活多久、异步读写要把什么传给 API？`Span<T>` / `Memory<T>` 表示连续内存的**区间视图**，例如偏移量加长度。对它们做 `Slice` 通常不复制元素；若要在视图生命周期之外保留独立数据，才调用 `ToArray()` 等方法明确复制。
+
+```csharp filename="ViewExample.cs"
+int[] values = [10, 20, 30, 40];
+Span<int> middle = values.AsSpan(1, 2);
+middle[0] = 21;                 // values[1] 也成为 21
+int[] snapshot = middle.ToArray(); // 新数组，独立持有
+middle[0] = 22;                 // snapshot[0] 仍是 21
+```
+
+`ReadOnlySpan<T>` 表示**不能通过这个视图写入**；它不冻结可变数组。其他别名仍能修改数组，因此不要把只读视图直接宣传为不可变快照。字符串可提供 `ReadOnlySpan<char>` 用于同步解析；转换为 `string` 或 `ToArray()` 才产生独立持有的数据。若要跨线程读写同一缓冲，`Span`/`Memory` 也不会自动加锁。
+
+## 同步用 Span，异步保留 Memory
+
+对于只在方法调用期间消费的同步解析，参数优先考虑 `ReadOnlySpan<T>` / `Span<T>`，调用方可以传数组或其他适合的连续区域。`Span<T>` 是 `ref struct`，受到生命周期限制，不能作为普通类字段。异步方法要让缓冲区在一次 `await` 期间继续有效时，使用 `Memory<T>` / `ReadOnlyMemory<T>`；例如 `Stream.ReadExactlyAsync(Memory<byte>)`。这并非“任何 async 方法里都不能出现 Span”：C# 13 起允许在不跨 `await` 的局部范围使用 `ref struct`，但不能把一个 Span 视图带过挂起点。详见官方 [C# 13 更新](https://learn.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-13/)。
+
+关于编译器怎样限制视图逃逸、`scoped` 的含义和有界 `stackalloc`，接着读[ref struct、scoped 与 stackalloc](/knowledge/programming/csharp/fundamentals/ref-struct-scoped-and-stackalloc/)；本篇继续聚焦缓冲租期与池化。
+
+把 `Memory<T>` 交给异步消费者时，调用方必须保证底层缓冲区在返回的任务完成前仍归自己控制；任务尚未完成就归还给池或同时改写，会产生竞态。异步方法内部也不能在任务完成后偷偷继续使用调用方传入的区域。这个“租期”比选哪种类型名称更重要。
+
+## ArrayPool 租到的是至少所需长度
+
+`ArrayPool<T>.Rent(n)` 返回的数组长度**至少**为 `n`，可能更长，旧内容不能当作初始化数据。处理协议帧时，使用 `AsMemory(0, n)` 限定有效区域，绝不能把 `array.Length` 当成实际消息长度。租来的数组属于池：`finally` 中归还到**同一个池**，归还后所有别名和切片都必须停止使用，也不能再归还第二次。若需把结果传到租期外，先复制出自己拥有的数组。`clearArray: true` 可要求池在保留缓冲以复用时清除内容，但不能代替访问控制或安全协议。
+
+下面完整 `Program.cs` 可在 .NET 10 运行，仓库同样提供 `dotnet run --project examples/csharp-spans-memory/SpansMemoryReview.csproj`。前半部分验证共享视图与快照，后半部分用受控测试池验证成功和输入不足两条路径都归还一次；没有依赖运行时是否复用某个具体数组。
+
+```csharp filename="Program.cs"
+using System.Buffers;
+
+CheckViewAndSnapshot();
+
+var pool = new CountingPool();
+using (var source = new MemoryStream([1, 2, 3, 4]))
+{
+    byte[] packet = await ReadPacketAsync(source, 4, pool);
+    Check(packet.SequenceEqual(new byte[] { 1, 2, 3, 4 }), "帧内容应正确");
+    Check(packet.Length == 4 && pool.ReturnCount == 1, "只复制有效区并归还一次");
+}
+
+using (var shortSource = new MemoryStream([9, 8]))
+{
+    try
+    {
+        await ReadPacketAsync(shortSource, 4, pool);
+        throw new Exception("短读应抛异常");
+    }
+    catch (EndOfStreamException) { }
+}
+Check(pool.ReturnCount == 2, "失败路径也应归还");
+Console.WriteLine("视图和租期断言通过");
+
+static void CheckViewAndSnapshot()
+{
+    int[] values = [10, 20, 30];
+    Span<int> view = values.AsSpan(1, 2);
+    view[0] = 21;
+    Check(values[1] == 21, "Span 是原数组视图");
+    int[] snapshot = view.ToArray();
+    view[0] = 22;
+    Check(snapshot[0] == 21, "ToArray 才是独立快照");
+
+    ReadOnlySpan<char> line = "pump-A|72".AsSpan();
+    int separator = line.IndexOf('|');
+    Check(separator > 0 && line[..separator].SequenceEqual("pump-A"), "设备名解析");
+    Check(int.TryParse(line[(separator + 1)..], out int value) && value == 72,
+        "读数解析");
+}
+
+static async Task<byte[]> ReadPacketAsync(Stream source, int length, ArrayPool<byte> pool)
+{
+    byte[] rented = pool.Rent(length);
+    try
+    {
+        Memory<byte> target = rented.AsMemory(0, length);
+        await source.ReadExactlyAsync(target);
+        return target.ToArray(); // 结果必须独立于即将归还的 rented
+    }
+    finally
+    {
+        pool.Return(rented, clearArray: true);
+    }
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+sealed class CountingPool : ArrayPool<byte>
+{
+    public int ReturnCount { get; private set; }
+
+    public override byte[] Rent(int minimumLength) => new byte[minimumLength + 3];
+
+    public override void Return(byte[] array, bool clearArray = false)
+    {
+        ReturnCount++;
+        if (clearArray) Array.Clear(array);
+    }
+}
+```
+
+`CountingPool` 仅用来观察租借协议，并不真的缓存复用；生产代码通常直接使用 `ArrayPool<byte>.Shared`。此处为教学方便固定帧长并用 `ReadExactlyAsync`，输入不足会抛 `EndOfStreamException`；真实网络协议还要验证帧长上限、取消、编码、超时及发布失败的清理，参见[网络 I/O 与消息边界](/knowledge/programming/csharp/io/network-streams-and-framing/)。小缓冲没有测量前不必上池：复杂的租期规则可能比一次普通分配更贵。
+
+## 常见追问
+
+1. `array[1..3]`、`array.AsSpan(1, 2)`、`array.AsSpan(1, 2).ToArray()` 哪些复制元素？
+2. `ReadOnlySpan<byte>` 指向可变数组时，其他代码还能修改它观察到的内容吗？
+3. `Rent(100)` 是否一定得到恰好 100 字节？返回前为什么要限制在实际消息长度？
+4. 异步任务还在读 `Memory<byte>`，调用方能否提前把底层数组归还池？`finally` 应在什么边界执行？
+
+验收标准：能解释视图、快照、租期三者的区别，并能从示例指出成功与短读路径为什么都安全归还。性能收益需用真实负载测量，不把“使用池”本身当作目标。
+
+## 参考
+
+[Microsoft Learn：内存与 Span 类型](https://learn.microsoft.com/en-us/dotnet/standard/memory-and-spans/) · [Memory/Span 使用指南](https://learn.microsoft.com/en-us/dotnet/standard/memory-and-spans/memory-t-usage-guidelines) · [ArrayPool.Rent](https://learn.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1.rent?view=net-10.0) · [ArrayPool.Return](https://learn.microsoft.com/en-us/dotnet/api/system.buffers.arraypool-1.return?view=net-10.0)

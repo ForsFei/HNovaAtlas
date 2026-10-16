@@ -1,0 +1,86 @@
+---
+id: csharp-tuples-deconstruction
+title: 元组与解构：临时组合值的正确边界
+description: 用多返回值解释 ValueTuple、元素名称、位置相等、解构及何时改用 record。
+tags: [CSharp, 元组, ValueTuple, 解构, 面试]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 37
+prerequisite: [csharp-types-nullability, csharp-parameters-overloads]
+related: [csharp-value-equality, csharp-classes-interfaces]
+---
+
+## 多个返回值，不必马上定义新类型
+
+方法需要一起返回两个关系紧密的值时，可用 `(T1, T2)`。现代 C# 的这种语法通常对应 `System.ValueTuple`，是值类型；与旧的引用类型 `System.Tuple` 不是一回事。给元素命名，调用处比 `Item1`、`Item2` 更容易读懂。
+
+```csharp
+var bounds = Range([4, 9, 2]);
+Console.WriteLine(bounds.min); // 2
+
+static (int min, int max) Range(ReadOnlySpan<int> values)
+{
+    if (values.IsEmpty) throw new ArgumentException("至少需要一个值");
+    int min = values[0], max = values[0];
+    foreach (int value in values)
+    {
+        min = Math.Min(min, value);
+        max = Math.Max(max, value);
+    }
+    return (min, max);
+}
+
+```
+
+元组适合描述局部计算结果。下面继续看名称和复制的边界。
+
+## 名称帮助阅读，值按位置工作
+
+元组元素名称不参与底层 `ValueTuple` 类型身份，也不参与元组相等比较。`(left: 1, right: 2)` 与 `(x: 1, y: 2)` 值相等；把元素顺序颠倒，语义就变了。名称可能作为编译器元数据附在公开签名上，别因此把它当成强约束：调用代码仍能按位置访问、赋值或解构。
+
+解构可让调用方一次接收多个值；不需要的部分可用 `_` 丢弃。对持久化实体或稳定公开契约，仅靠位置表达字段意义通常太脆弱，应考虑有命名属性的 `record`/类。
+
+## 复制不是深拷贝
+
+`ValueTuple` 本身按值复制，但其元素若是引用类型，复制的是引用。例如元组里装了数组，两个元组仍可能看到同一个数组的修改。元组的字段也是可写的，`var point = (x: 1, y: 2); point.x = 3;` 合法；不要把“值类型”误解成“不可变”。
+
+下面整段可放进 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+var result = Range([4, 9, 2]);
+var (smallest, largest) = result;
+Console.WriteLine($"{smallest}, {largest}"); // 2, 9
+
+var first = (left: 1, right: 2);
+var second = (x: 1, y: 2);
+Console.WriteLine(first == second); // True：比较位置上的值
+
+var array = new[] { 1 };
+var original = (items: array, count: 1);
+var copy = original;
+copy.items[0] = 7;
+Console.WriteLine(original.items[0]); // 7：引用元素仍指向同一数组
+
+static (int min, int max) Range(ReadOnlySpan<int> values)
+{
+    if (values.IsEmpty) throw new ArgumentException("至少需要一个值");
+    int min = values[0], max = values[0];
+    foreach (int value in values)
+    {
+        min = Math.Min(min, value);
+        max = Math.Max(max, value);
+    }
+    return (min, max);
+}
+```
+
+## 自测与追问
+
+1. `(name: "A", score: 80)` 与 `(student: "A", grade: 80)` 的值相等吗？元素名称影响什么？
+2. 复制含 `List<T>` 的元组后，改动列表与改动元组字段分别会影响谁？
+3. 一个对外公开、长期演进的订单结果，什么时候应从元组升级成有名类型？
+
+可运行验证还在 `examples/csharp-foundations-part2`。若结果含业务不变量，继续读[构造函数与不变量](/knowledge/programming/csharp/object-oriented/constructors-and-invariants/)和[值语义与相等性](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/)。
+
+参考：[Microsoft Learn：元组类型](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/value-tuples)。

@@ -1,0 +1,73 @@
+---
+id: csharp-lock-shared-state
+title: 共享状态与 lock：保护不变量，而非只保护一行
+description: 用计数器与转账示例解释竞态、临界区、Interlocked、锁顺序和异步锁边界。
+tags: [CSharp, 多线程, lock, 竞态条件, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-threads-threadpool-tasks]
+related: [csharp-concurrent-collections, csharp-cancellation-throttling]
+---
+
+## 竞态不是“偶尔结果错”这么简单
+
+`count++` 通常包含读取、加一、写回三个步骤；两个执行者交错时可能丢失一次更新。单次读写看起来很短，并不意味着整个业务操作原子。锁的范围要覆盖**共同维护的不变量**。如果账户余额和流水号必须一起更新，只锁其中一个赋值仍可能让其他线程看到不一致状态。
+
+下面完整示例可放进控制台 `Program.cs`，最终结果稳定为 20,000：
+
+```csharp filename="Program.cs"
+var counter = new Counter();
+Task first = Task.Run(() => AddMany(counter));
+Task second = Task.Run(() => AddMany(counter));
+await Task.WhenAll(first, second);
+Console.WriteLine(counter.Value); // 20000
+
+static void AddMany(Counter counter)
+{
+    for (int i = 0; i < 10_000; i++) counter.Increment();
+}
+
+public sealed class Counter
+{
+    private readonly object _gate = new();
+    private int _value;
+
+    public void Increment()
+    {
+        lock (_gate) { _value++; }
+    }
+
+    public int Value
+    {
+        get { lock (_gate) { return _value; } }
+    }
+}
+```
+
+`_gate` 是私有、专用的锁对象；不要锁 `this`、公开对象或字符串，以免别的代码也能拿同一把锁。读和写均遵守同一同步协议。现代 .NET/C# 还提供专门的 `System.Threading.Lock` 类型；上例用 `object` 以便读者先理解传统 `lock` 语义。
+
+## 一个字段与多个字段的区别
+
+若只是单个整数计数，可用 `Interlocked.Increment(ref count)` 做原子加一；若要读取单个计数也应选相应的同步读法。但 `Interlocked` 不会自动让“余额减少、流水号增加、检查余额”三件事合为一个原子业务操作。需要共同成立的条件必须由同一临界区保护，或者改用不可变数据与单一所有者模型。
+
+锁并非越大越安全：临界区太长会阻塞其他执行者；内部调用外部代码、网络或数据库可能造成难以控制的等待。多把锁的获取顺序不一致可能死锁，例如线程 A 先锁账户 1 再锁账户 2，线程 B 反向获取。定义全局一致的锁顺序，或用更高层事务/消息处理模型。
+
+## `lock` 不是异步锁
+
+`lock` 内不能写 `await`。异步等待时线程可能让出，`Monitor` 锁的线程归属与异步继续执行不匹配；编译器也直接禁止。若需要在异步操作周围限制并发，可使用 `SemaphoreSlim.WaitAsync`，并在成功进入后用 `try/finally` 保证释放。但信号量的“最多 N 个操作同时进行”与锁的“同一不变量受保护”也不是完全同义；选择时先说清资源。
+
+`volatile` 主要约束某些读写的可见性与排序，不会把 `count++` 变成原子操作。不能用 `volatile` 替代锁或 `Interlocked`。如果没有共享可变状态，比如每个任务写自己的局部结果，最好从设计上减少同步需求。
+
+## 面试自测与练习
+
+1. 去掉 `Increment` 中的锁但保留 `Value` 的锁，结果为何仍可能小于 20,000？
+2. 把两个整数 `count` 与 `lastValue` 放在同一对象，要求读到的组合永远对应一次更新。你会锁哪里？
+3. `lock`、`Interlocked` 和 `SemaphoreSlim` 各保护什么？能否在 `lock` 块中 `await Task.Delay(1)`？
+
+验收标准：能写出被保护的不变量、所有读写入口和锁顺序，而不是只说“并发时加锁”。
+
+## 参考
+
+[Microsoft Learn：lock 语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock) · [Interlocked 类](https://learn.microsoft.com/en-us/dotnet/api/system.threading.interlocked)

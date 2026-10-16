@@ -1,0 +1,137 @@
+---
+id: python-oop-basics
+title: 面向对象入门
+description: 理解类与对象，学会定义属性和方法，写出第一个自己的类。
+tags: [Python, 类, 对象, 面向对象]
+difficulty: beginner
+status: draft
+updated: "2026-10-13"
+order: 30
+prerequisite: [python-files]
+related: [python-stdlib-essentials]
+---
+
+## 从字典到类
+
+用字典描述一个学生你已经会了：
+
+```python filename="dict-student.py"
+ming = {"name": "小明", "score": 92}
+
+def describe(student):
+    print(f"{student['name']} 的分数是 {student['score']}")
+```
+
+问题是：数据和操作数据的函数是分离的，学生多了以后，谁也说不准某个字典里该有哪些键。**类**（class）把数据和函数打包成一种新类型：数据叫**属性**，函数叫**方法**。
+
+## 定义第一个类
+
+```python filename="class-basic.py"
+class Student:
+    def __init__(self, name, score):
+        self.name = name
+        self.score = score
+
+    def describe(self):
+        print(f"{self.name} 的分数是 {self.score}")
+
+ming = Student("小明", 92)     # 创建对象（实例化）
+hong = Student("小红", 85)
+ming.describe()               # 小明 的分数是 92
+hong.describe()               # 小红 的分数是 85
+```
+
+逐个拆解：
+
+- `class Student:` 定义一个类，名字按惯例用大驼峰（每个单词首字母大写）
+- `__init__` 是**初始化方法**：创建对象时自动执行，负责装好初始属性
+- `self` 指代"当前这个对象自己"。`ming.describe()` 执行时，`self` 就是 `ming`
+- `self.name = name` 把参数存成对象的属性，之后用 `ming.name` 随时取用
+
+<Callout type="info" title="self 不是关键字，是约定">
+
+方法第一个参数写 self 是全社区约定，你也可以改名叫别的（别这么做）。理解它的关键：`ming.describe()` 实际等价于 `describe(ming)`——对象自己被当作第一个参数传了进去。
+
+</Callout>
+
+## 属性与方法
+
+属性是对象记住的数据，方法是对象会做的事：
+
+```python filename="methods.py"
+class BankAccount:
+    def __init__(self, owner, balance=0):
+        self.owner = owner
+        self.balance = balance
+
+    def deposit(self, amount):
+        self.balance += amount
+
+    def withdraw(self, amount):
+        if amount > self.balance:
+            print("余额不足")
+            return
+        self.balance -= amount
+
+account = BankAccount("小明", 100)
+account.deposit(50)
+account.withdraw(200)    # 余额不足
+account.withdraw(80)
+print(account.balance)   # 70
+```
+
+方法可以直接使用和修改对象的属性，`balance` 的规则（不能透支）就写在类里——外部想违规都不行，这就是封装的好处。
+
+## 为什么要用类
+
+不用类也能写出能跑的程序。类的价值在于**管理复杂度**：
+
+1. **数据和行为在一起**：找学生相关的逻辑，只需要看 Student 类
+2. **约束更可靠**：属性叫什么、合法范围是什么，写一次全类通用
+3. **方便扩展**：一个类可以创建任意多个对象，互相独立
+
+写小程序时不必强求用类；当发现"同一组数据和围绕它的函数"反复出现时，就是引入类的好时机。
+
+## 继承：站在已有类的肩上
+
+类可以从另一个类**继承**，自动获得它的属性和方法，再补充自己的：
+
+```python filename="inherit.py"
+class Animal:
+    def __init__(self, name):
+        self.name = name
+
+    def speak(self):
+        print(f"{self.name}在叫")
+
+class Dog(Animal):                  # Dog 继承 Animal
+    def speak(self):                # 覆盖父类方法
+        print(f"{self.name}：汪汪")
+
+class Cat(Animal):
+    def fetch(self):                # 子类新增方法
+        print(f"{self.name}不去捡球，它睡觉")
+
+pets = [Dog("旺财"), Cat("咪咪")]
+for pet in pets:
+    pet.speak()
+# 旺财：汪汪
+# 咪咪在叫
+```
+
+`Dog(Animal)` 表示 Dog 是一种 Animal；没有重写的方法直接沿用父类。这是面向对象"代码复用"的核心手段，初学阶段理解概念即可，不必急着设计继承体系。
+
+<FlashCard front="__init__ 和 self 分别是什么？" back="__init__ 是创建对象时自动执行的初始化方法，负责设置初始属性；self 代表当前对象本身，通过 self.xxx 定义的变量是这个对象自己的属性。" />
+
+## 动手试一试
+
+1. 定义 `Rectangle` 类（宽、高两个属性），加 `area()` 和 `perimeter()` 两个方法。
+2. 给 BankAccount 加 `deposit` 金额必须为正数的校验（提示：raise ValueError）。
+3. 定义 `Vehicle` 类和继承它的 `Bike`、`Car`，各自重写 `describe()` 方法。
+
+<Quiz
+  question="ming = Student('小明', 92) 时，__init__ 里的 self 指什么？"
+  options={["Student 类本身", "刚创建的 ming 对象", "name 参数", "没有意义，可以不写"]}
+  answer={1}
+  explanation="实例化时，self 自动指向正在被创建的那个对象——这里就是 ming。之后 ming.name、ming.score 都存在它身上。"
+/>

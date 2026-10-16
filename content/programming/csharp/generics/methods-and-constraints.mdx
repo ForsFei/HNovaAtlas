@@ -1,0 +1,76 @@
+---
+id: csharp-generic-methods-constraints
+title: 泛型方法与约束：让能力写进类型契约
+description: 从类型推断、where 约束和比较函数理解泛型，辨析 class、struct、notnull、new() 与泛型数学。
+tags: [CSharp, 泛型, 约束, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-collections-generics, csharp-parameters-overloads]
+related: [csharp-generic-variance, csharp-generic-api-design, csharp-static-abstract-generic-math]
+---
+
+## 为什么方法也需要 `<T>`
+
+若同一操作对 `int`、`string`、自定义类型都成立，不必复制三份重载或把参数退化为 `object`。泛型方法把“两个参数与返回值必须是同一种类型”写进签名。调用时编译器通常可从**实参**推断 `T`，例如 `Swap(ref left, ref right)`；不能只凭返回目标类型或 `where` 约束猜出未出现在参数中的 `T`。
+
+```csharp filename="Program.cs"
+int left = 3, right = 8;
+Swap(ref left, ref right);
+Console.WriteLine($"{left}, {right}"); // 8, 3
+
+string best = Greater("alpha", "beta");
+int largest = Greater(7, 12);
+Console.WriteLine($"{best}, {largest}"); // beta, 12
+
+static void Swap<T>(ref T first, ref T second)
+    => (first, second) = (second, first);
+
+static T Greater<T>(T first, T second) where T : IComparable<T>
+    => first.CompareTo(second) >= 0 ? first : second;
+```
+
+`Swap<T>` 无需知道类型成员，只保存和交换值。`Greater<T>` 必须调用 `CompareTo`，所以声明 `where T : IComparable<T>`；这不是“运行时才检查”的注释，而是调用方和方法体都受编译器检查的契约。若用具体设备读数比较，须明确按数值、时间还是设备 ID 排序，不要为了套用泛型随意给业务对象一个全局自然顺序；常可传入 `IComparer<T>` 表达不同规则。
+
+## 常见约束怎样选
+
+| 约束 | 它保证什么 | 常见误区 |
+| --- | --- | --- |
+| `where T : class` | 引用类型 | 不代表对象不可变 |
+| `where T : struct` | 非可空值类型 | 不等于“始终在栈上”；也不能再加 `new()` |
+| `where T : notnull` | 非可空类型意图 | 可空分析上下文中违例通常是警告，不是万能运行时验证 |
+| `where T : IComparable<T>` | 可调用该接口成员 | 只在算法确实需要比较时加 |
+| `where T : new()` | 可调用公开无参构造函数 | 不能表示构造参数或业务不变量；组合时放最后 |
+
+`where T : BaseClass` 允许使用基类契约；多个接口约束可以叠加。约束应只表达实现确实需要的能力，过强会拒绝本可支持的类型。`new()` 常被滥用为“通用工厂”，但它要求无参构造且无法传必需参数；需要复杂创建逻辑时传入 `Func<T>` 或具体工厂接口更清楚。
+
+## 数值泛型的边界
+
+无约束 `T` 不能直接写 `left + right`，因为并非所有类型都有加法。现代 .NET 的泛型数学接口让这种能力可以声明出来：
+
+```csharp filename="Program.cs"
+using System.Numerics;
+
+Console.WriteLine(Add(2, 3));         // 5
+Console.WriteLine(Add(1.5m, 2.5m));   // 4.0
+
+static T Add<T>(T left, T right) where T : INumber<T>
+    => left + right;
+```
+
+此例要求支持泛型数学的目标框架（如本仓库示例使用的 .NET 10）；在老项目中不能只改 C# 语法就假定其运行库已有 `INumber<T>`。针对业务金额还要明确溢出、舍入及货币单位，类型约束不会替你定义业务规则。
+
+进一步看[静态抽象接口成员与泛型数学](/knowledge/programming/csharp/generics/static-abstract-members-and-generic-math/)：自己定义最小加法能力，并验证整数和小数平均值的不同语义。
+
+## 面试自测与练习
+
+1. `Greater(new object(), new object())` 为什么不能编译？改用 `object` 强转能真正保证比较能力吗？
+2. 写 `Create<T>() where T : new()`；为什么它不能创建只有 `Reading(string id)` 构造函数的类型？
+3. 给 `Greater` 改成接受 `IComparer<T>`，让同一设备读数既能按时间也能按数值比较。
+
+验收标准：能从方法体实际用到的操作倒推约束，并清楚解释类型推断与运行时验证的边界。
+
+## 参考
+
+[Microsoft Learn：泛型方法](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/generics/generic-methods) · [类型参数约束](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/generics/constraints-on-type-parameters) · [泛型数学](https://learn.microsoft.com/en-us/dotnet/standard/generics/math)

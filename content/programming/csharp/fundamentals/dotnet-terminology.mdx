@@ -1,0 +1,70 @@
+---
+id: csharp-dotnet-terminology
+title: .NET 术语与运行过程：C#、CLR、SDK 到程序集
+description: 分清语言、平台、运行时、开发工具和框架，理解 C# 程序从源码到执行的大致路径。
+tags: [CSharp, .NET, CLR]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 5
+prerequisite: [csharp-learning-path]
+related: [csharp-first-program, csharp-chapter-map]
+---
+
+## 先把几层东西分开
+
+面试里常问“.NET 和 C# 有什么关系”。C# 是编程语言；.NET 是包含运行时、基础类库、开发工具等的开发平台。你用 C# 写代码，但也可以使用其他受支持的语言开发 .NET 应用。ASP.NET Core 是构建 Web 应用的框架，WPF 是 Windows 桌面 UI 技术，它们都不是 C# 语言本身。
+
+| 名称 | 主要职责 | 不要混同为 |
+| --- | --- | --- |
+| C# | 源码语法、类型系统和语言规则 | .NET 运行时 |
+| .NET SDK | 创建、还原、编译、测试、发布项目的工具集合，包含 CLI 等 | 只有运行程序所需的 Runtime |
+| .NET Runtime | 运行编译好的 .NET 应用所需的运行时与库 | 编译器或 IDE |
+| CLR / CoreCLR | 托管执行、类型加载、JIT、异常与垃圾回收等运行时机制 | 整个 .NET 平台 |
+| BCL | `System.*` 等基础类库，提供字符串、集合、文件、网络等 API | 某个 UI 框架 |
+| 程序集 | 编译产生的部署与版本管理单元，通常为 `.dll` 或 `.exe` | 源码文件或 NuGet 包 |
+| NuGet 包 | 发布和获取依赖的一种分发单位，可包含程序集及其他资源 | 单个程序集的同义词 |
+
+“装了 SDK 就能运行吗？”通常能，因为 SDK 包含运行时；但部署机器可以只装合适的 Runtime。具体部署还可能选择自包含发布，因此不能凭一句“必须装 .NET”概括所有发布模式。
+
+## 源码怎样跑起来
+
+一个简化但有用的路径是：`Program.cs` 等源码经 C# 编译器成为含中间语言（IL）和元数据的程序集；运行时加载程序集，通常由 JIT 将要执行的方法编译成机器指令，再执行。垃圾回收器（GC）管理托管对象的内存回收，但不意味着文件句柄和网络连接可以不关闭。现代 .NET 还支持预先编译等其他部署方式，所以“每段 C# 代码都一定在运行时 JIT”不是无条件正确。
+
+```text
+C# 源文件 + 项目配置
+    ↓ 编译
+程序集（IL + 元数据）
+    ↓ 运行时加载；通常 JIT 编译需要的方法
+机器指令执行 + 基础类库服务
+```
+
+`dotnet build` 构建，`dotnet run` 构建后运行，`dotnet test` 运行测试项目，`dotnet publish` 准备部署输出。它们是 .NET CLI 命令，不是 C# 关键字。IDE 可以调用这些工具，但不用 IDE 也能构建。
+
+## .NET Framework、.NET Core、现代 .NET
+
+.NET Framework 是较早的 Windows 平台实现，许多传统 WPF/WinForms 项目仍使用它；.NET Core 开启了跨平台的新一代实现。.NET Core 3.1 之后的主线版本命名为 .NET 5、.NET 6……，没有推出“.NET Core 4”；这不代表旧 .NET Framework 项目会被自动升级。ASP.NET Core 等产品仍保留名称中的 Core。
+
+遇到老项目，先看目标框架（Target Framework Moniker，TFM），不要只看机器上安装了哪个 SDK。例如 `net48` 指向 .NET Framework 4.8，`net10.0` 指向 .NET 10；同为 C# 源码，能用的 API、运行环境和部署条件可能不同。.NET Standard 描述跨不同 .NET 实现共享的一组 API 契约，主要在兼容旧版与多目标库时需要理解，不是另一个运行时。
+
+## 在本机核对，而不是猜版本
+
+```text
+dotnet --info
+dotnet --list-sdks
+dotnet --list-runtimes
+```
+
+第一个看当前环境详情，第二个列 SDK，第三个列运行时。再打开项目的 `.csproj` 查看 `<TargetFramework>`。仅凭 `dotnet --version` 看到的 SDK 版本，不能推断每个项目都以该版本为目标；解决方案里可以有不同 TFM 的项目。版本支持政策会变化，请查[官方 .NET 发布与支持页面](https://learn.microsoft.com/en-us/dotnet/core/releases-and-support/)，不要背一张过期表。
+
+## 面试追问与练习
+
+**问：C#、CLR、.NET 是同一层吗？** 答：不是。C# 定义语言规则，CLR 是运行时执行机制的重要部分，.NET 还包含库、SDK、框架等。用一段 `Console.WriteLine` 程序指出它在每层借用了什么。
+
+**问：.NET Core 与 .NET Framework 什么关系？** 答：两条平台历史线；现代 .NET 是 .NET Core 后续主线，不能把“版本号更大”当成旧项目自动兼容的证明。迁移要核对 API、第三方库与目标平台。
+
+练习：创建控制台项目后，写下 `.csproj` 的 TFM、本机 SDK 与 Runtime 列表、构建输出中的程序集名称；再用自己的话画出源码到执行的路径。验收标准是能解释每一步，而不是记住缩写。
+
+## 参考
+
+[Microsoft Learn：.NET 术语表](https://learn.microsoft.com/dotnet/standard/glossary) · [.NET SDK](https://learn.microsoft.com/en-us/dotnet/core/sdk/) · [.NET 5 命名与迁移背景](https://learn.microsoft.com/en-us/dotnet/core/whats-new/dotnet-5) · [.NET Framework 概览](https://learn.microsoft.com/en-us/dotnet/framework/get-started/overview)

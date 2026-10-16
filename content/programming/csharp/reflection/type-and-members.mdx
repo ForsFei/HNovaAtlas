@@ -1,0 +1,68 @@
+---
+id: csharp-reflection-type-members
+title: Type、程序集与成员：如何读取运行时结构
+description: 区分 typeof、GetType 与 Assembly，练习查找属性、调用方法和处理反射结果为空的情况。
+tags: [CSharp, Type, Assembly, BindingFlags, 反射, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-attributes-metadata, csharp-classes-interfaces]
+related: [csharp-reflection-factory-boundaries, csharp-generic-api-design]
+---
+
+## `Type` 是反射的入口
+
+静态代码已知道类型时用 `typeof(Reading)`；手上只有对象且想知道它的实际运行时类型时用 `obj.GetType()`。`Type` 可指向其所属 `Assembly`，再查询类型与成员。反射能在运行时检查结构，但把编译期的拼写与类型检查换成了运行时结果检查。
+
+下面示例分别取得类型、程序集、属性和方法，并显式处理“找不到”或返回值不合预期：
+
+```csharp filename="Program.cs"
+using System.Reflection;
+
+object item = new Reading("pump-A", 72.5);
+Type declared = typeof(Reading);
+Type actual = item.GetType();
+Console.WriteLine(declared == actual); // True
+Console.WriteLine(declared.Assembly.GetName().Name); // 当前项目程序集名
+
+PropertyInfo property = declared.GetProperty(
+    nameof(Reading.Value), BindingFlags.Public | BindingFlags.Instance)
+    ?? throw new MissingMemberException(declared.Name, nameof(Reading.Value));
+Console.WriteLine(property.GetValue(item)); // 72.5
+
+MethodInfo method = declared.GetMethod(
+    nameof(Reading.IsAbove), [typeof(double)])
+    ?? throw new MissingMethodException(declared.Name, nameof(Reading.IsAbove));
+object? result = method.Invoke(item, [70.0]);
+Console.WriteLine(result is bool matched && matched); // True
+
+public sealed record Reading(string DeviceId, double Value)
+{
+    public bool IsAbove(double threshold) => Value > threshold;
+}
+```
+
+`PropertyInfo`、`MethodInfo` 都是成员描述对象，不是数据本身；`GetValue` / `Invoke` 才真正访问对象。`Invoke` 的返回类型是 `object?`，因而示例在使用结果前检查类型。反射调用的方法内部若抛异常，外层通常见到 `TargetInvocationException`，原异常在 `InnerException`；不要吞掉根因。
+
+## `BindingFlags` 与重载要写明
+
+`GetProperty` 用 `Public | Instance` 限定公开实例属性；若找静态成员要换成 `Static`。加 `NonPublic` 能看见非公开成员，但不代表应该绕开对象的不变量。反射名称是字符串，`nameof` 能降低重命名造成的错误；方法重载时还要给出参数类型，不能把同名方法当成唯一目标。
+
+程序集是部署与元数据边界。`typeof(Reading).Assembly.GetTypes()` 可列举**这个程序集**中的类型，不会自动发现整个机器或所有已加载程序集；扫描多个程序集需要自己决定来源、加载、版本和失败策略。依赖缺失等情况下 `GetTypes()` 可能抛 `ReflectionTypeLoadException`，不能把插件发现写成“永远返回完整数组”。
+
+## 反射不是默认访问方式
+
+已知对象是 `Reading` 时，`item is Reading reading` 后直接读 `reading.Value`、调用 `reading.IsAbove(70)` 更清晰，编译器也能检查类型。反射适合框架、工具或确实要在运行时发现结构的边界；若每条设备读数都重复查属性名和调用方法，先问能否改成接口或泛型。需要反射时，通常在启动或初始化阶段解析元数据，再缓存受控的访问策略，而非在热路径重复搜索成员。
+
+## 面试自测与练习
+
+1. `typeof(Base)` 与一个 `Base` 变量指向的派生对象 `GetType()`，结果一定相同吗？
+2. `GetMethod("Parse")` 遇到多个重载可能有什么问题？如何选定参数签名？
+3. `Assembly.GetTypes()` 能否保证枚举整个进程所有类型？如果部分类型无法加载，你会如何报告失败？
+
+验收标准：能明确类型来源、成员筛选条件，以及每一步失败或返回 `null` 时的处理方式。
+
+## 参考
+
+[Microsoft Learn：查看类型信息](https://learn.microsoft.com/en-us/dotnet/fundamentals/reflection/viewing-type-information) · [Assembly.GetTypes](https://learn.microsoft.com/en-us/dotnet/api/system.reflection.assembly.gettypes) · [Type.GetMembers](https://learn.microsoft.com/en-us/dotnet/api/system.type.getmembers)

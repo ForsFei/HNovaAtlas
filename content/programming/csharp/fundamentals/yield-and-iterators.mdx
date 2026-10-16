@@ -1,0 +1,93 @@
+---
+id: csharp-yield-iterators
+title: yield 与迭代器：逐项生成、延迟执行和资源边界
+description: 从 foreach 的执行顺序出发，理解 yield return、yield break、重复枚举及提前退出时的资源释放。
+tags: [CSharp, yield, 迭代器, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 60
+prerequisite: [csharp-control-flow-methods]
+related: [csharp-collections-generics, csharp-linq, csharp-async-streams-cancellation]
+---
+
+## 先预测输出
+
+`yield` 不是一次性创建整个列表。包含 `yield return` 的方法是迭代器：它提供一个可枚举序列，枚举器每次请求下一项时，方法才运行到下一个 `yield return`，暂停并保留局部状态。把下面代码放入控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+var evens = EvenUpTo(4);
+Console.WriteLine("已取得序列");
+
+foreach (int number in evens)
+    Console.WriteLine($"收到 {number}");
+
+static IEnumerable<int> EvenUpTo(int max)
+{
+    Console.WriteLine("开始枚举");
+    for (int number = 0; number <= max; number += 2)
+    {
+        Console.WriteLine($"准备 {number}");
+        yield return number;
+    }
+}
+```
+
+第一行输出是「已取得序列」，不是「开始枚举」。随后依次输出「开始枚举」「准备 0」「收到 0」……直至 4。`yield return` 是“交出这一项，等待下一次请求”，不是普通方法的 `return`。走到方法末尾时枚举结束；也可以用 `yield break` 明确提前结束。
+
+## `yield break` 与过滤
+
+```csharp filename="Program.cs"
+Console.WriteLine(string.Join(", ", UntilNegative([2, 4, -1, 8]))); // 2, 4
+
+static IEnumerable<int> UntilNegative(IEnumerable<int> source)
+{
+    foreach (int value in source)
+    {
+        if (value < 0) yield break;
+        yield return value;
+    }
+}
+```
+
+这个方法与 `Where(value => value >= 0)` 不同：`yield break` 遇到第一个负数就结束，后面的 8 不会出现。设计 API 时要明确它是“过滤所有负数”还是“读到哨兵值为止”。
+
+## 延迟执行的代价
+
+同一个 `IEnumerable<T>` 再枚举一次，通常会重新运行迭代器主体；不要假设结果已经缓存。若数据源会变化，或迭代器含数据库查询、日志和网络访问，重复枚举可能得到不同结果并重复成本。需要固定快照时可调用 `ToArray()` 或 `ToList()`，但这会立即枚举并占用保存结果的内存。
+
+异常也可能在**枚举时**才抛出，而不是取得序列时。比如上例若在 `EvenUpTo` 主体中验证 `max`，验证要等到 `foreach` 才执行。若 API 要求调用时立即报错，可以用外层普通方法先验证参数，再返回内部迭代器。
+
+## 提前停止时会释放什么
+
+迭代器中的 `using` 可以包住打开的资源；`foreach` 提前 `break` 时会释放枚举器，从而执行迭代器的清理逻辑。资源并不是在每次 `yield return` 后就关闭。若调用者自己手动获取枚举器，应负责释放它。
+
+```csharp filename="Program.cs"
+foreach (string line in Lines())
+{
+    Console.WriteLine(line);
+    break;
+}
+
+static IEnumerable<string> Lines()
+{
+    using var reader = new StringReader("first\nsecond");
+    string? line;
+    while ((line = reader.ReadLine()) is not null)
+        yield return line;
+}
+```
+
+这里 `StringReader` 只是免文件依赖的演示；读取真实文件还需处理路径、编码、异常和资源所有权。`yield` 不等于异步：普通 `IEnumerable<T>` 的枚举仍同步执行；涉及异步等待时可继续读[异步流与取消](/knowledge/programming/csharp/concurrency/async-streams-and-cancellation/)，比较 `IAsyncEnumerable<T>` 与 `await foreach` 的枚举生命周期。
+
+## 面试自测与练习
+
+1. `var values = EvenUpTo(4)` 这一行会打印什么？若遍历两次，打印次数如何变化？
+2. 为什么 `yield break` 与 `return` 不可直接互换？上面 `UntilNegative` 是否跳过 8？
+3. 把 `Lines()` 改为只返回前两行；再解释为何调用方 `break` 也能释放资源。
+
+验收标准：能区分创建序列、取得枚举器和请求下一项三个时刻，并指出一次性物化与流式处理各自的成本。
+
+## 参考
+
+[Microsoft Learn：yield 语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/yield) · [迭代器](https://learn.microsoft.com/en-us/dotnet/csharp/iterators)

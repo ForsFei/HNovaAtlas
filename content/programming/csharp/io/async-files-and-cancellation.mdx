@@ -1,0 +1,60 @@
+---
+id: csharp-io-async-files
+title: 异步文件 I/O 与取消：完成、失败和半成品
+description: 用 CopyToAsync 和 CancellationToken 处理文件复制，区分异步等待、资源释放与原子发布。
+tags: [CSharp, IO, async, CancellationToken, FileStream, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-io-streams-ownership, csharp-async-await]
+related: [csharp-io-complete-file-publication, csharp-io-network-streams, csharp-cancellation-throttling]
+---
+
+## 异步解决等待，不替你定义数据正确性
+
+读写文件可能等待设备或操作系统完成。`ReadAsync` / `WriteAsync` / `CopyToAsync` 允许调用方 `await`，不必在等待期间长期占住当前执行线程；它们不是让磁盘变快的承诺。对于已知的小文本文件，`File.ReadAllTextAsync` 很方便；大文件或未知大小应使用流式读取并限制处理量。
+
+下面方法复制到**一个尚不存在的目标文件**，调用方传入取消令牌：
+
+```csharp filename="CopyFileAsync.cs"
+static async Task CopyFileAsync(string sourcePath, string targetPath,
+    CancellationToken cancellationToken)
+{
+    await using FileStream source = new(sourcePath, FileMode.Open, FileAccess.Read,
+        FileShare.Read, bufferSize: 81920, useAsync: true);
+    await using FileStream target = new(targetPath, FileMode.CreateNew, FileAccess.Write,
+        FileShare.None, bufferSize: 81920, useAsync: true);
+
+    await source.CopyToAsync(target, cancellationToken);
+    await target.FlushAsync(cancellationToken);
+}
+```
+
+代码片段应放进调用方的类或顶级程序中，并以 `await CopyFileAsync(source, target, token)` 调用。`CancellationToken` 是协作信号，不是事务回滚：取消可能发生在目标已写入部分字节之后。调用方要决定保留以供续传、删除临时文件，或标记失败；不能把 `OperationCanceledException` 当成成功完成。`FileMode.CreateNew` 在目标已存在时失败，避免悄悄覆盖用户文件。
+
+## 从成功写入到“可用文件”还有一步
+
+如果目标必须始终是完整版本，可先在**同一目标目录**写唯一的临时名，确认内容与校验后再发布成正式文件。实际替换能力和原子性取决于文件系统与使用的 API，跨卷移动、目标已存在、并发读写都需要设计；不要把 `FlushAsync` 解释为通用的原子提交或持久化保证。
+
+异常边界至少区分：源不存在、目标已存在、权限不足、磁盘空间不足、取消和进程中断。调用方在能提供上下文的位置记录原始异常，避免空 `catch`；流在异常路径中也由 `await using` 释放。
+
+## 取消应该向下传递
+
+从 UI、请求或批处理作业收到的令牌，应继续传到 `CopyToAsync` 等实际 I/O API。只在方法入口调用一次 `ThrowIfCancellationRequested()`，随后长时间复制而不再检查，并不等于支持取消。取消后若要重试，还需决定是否复用/重建目标文件以及如何避免两次操作混写。
+
+网络响应、数据库查询与文件写入混在一条管线时，每一步都应有容量、超时和取消约定；更多并发控制见[取消、超时与限流](/knowledge/programming/csharp/concurrency/cancellation-and-throttling/)。
+
+## 面试自测与练习
+
+1. `await CopyToAsync` 是不是保证复制更快？为什么？
+2. 取消时目标文件是否一定为空？`await using` 保证了什么、没保证什么？
+3. 为什么需要临时文件与发布步骤？`FlushAsync` 能否单独实现事务？
+
+验收标准：能说明一条 I/O 管线的取消传播、部分结果处理和资源归属，而不是只把同步方法名加上 `Async`。
+
+## 参考
+
+[继续读：文件完整发布](/knowledge/programming/csharp/io/complete-file-publication/)把本篇的临时文件建议展开成可运行的写入、校验、发布与失败清理流程。
+
+[Microsoft Learn：异步文件 I/O](https://learn.microsoft.com/en-us/dotnet/standard/io/asynchronous-file-i-o) · [Stream.CopyToAsync](https://learn.microsoft.com/en-us/dotnet/api/system.io.stream.copytoasync) · [FileStream](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream)

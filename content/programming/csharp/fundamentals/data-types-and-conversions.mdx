@@ -1,0 +1,103 @@
+---
+id: csharp-data-types-conversions
+title: 数据类型与转换：数字、字符串、装箱和溢出
+description: 从常用类型的选择走到隐式/显式转换、解析、装箱与数值边界，建立可用于面试的判断框架。
+tags: [CSharp, 类型系统, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 25
+prerequisite: [csharp-types-nullability]
+related: [csharp-numeric-parsing-rounding, csharp-parameters-overloads, csharp-chapter-map]
+---
+
+## 先按业务语义选类型
+
+类型不只是占几个字节，还决定可表达的范围、精度和运算行为。`int` 常用于计数，`long` 用于更大整数；`double` 是二进制浮点，适合科学计算和测量值；`decimal` 的十进制表示更适合要求十进制小数精度的金额。`bool` 表示真假，`char` 表示一个 UTF-16 代码单元，`string` 表示文本。不要把 `char` 误认为必定是完整的“一个用户可见字符”：某些 Unicode 字符需要多个代码单元。
+
+| 情况 | 倾向 | 需要追问的边界 |
+| --- | --- | --- |
+| 样本数量 | `int`，超大范围时 `long` | 是否可能溢出？ |
+| 温度测量 | `double` | 能否接受浮点近似？如何比较阈值？ |
+| 金额 | `decimal` | 币种、舍入规则、最小单位是什么？ |
+| 设备状态 | `enum` 或明确的状态类型 | 是否会收到未知值？ |
+| 可能缺失的读数 | `double?` | 缺失与零是否含义不同？ |
+
+这是常见选择，不是绝对规则。例如金融系统也可能使用“最小货币单位的整数”，关键是统一单位和溢出策略。
+
+## 隐式转换、显式转换与文本解析
+
+`int` 到 `long` 可以隐式转换，因为目标范围足以容纳源值；`double` 到 `int` 需要显式转换，因为会丢弃小数部分，极端值还有额外边界。文本到数字不是一次 C# 强制转型，而是解析，外部输入优先用 `TryParse`。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+int count = 42;
+long wide = count;                 // 隐式转换
+double measured = 72.9;
+int truncated = (int)measured;     // 72，不是四舍五入
+
+string raw = "72.5";
+bool valid = double.TryParse(raw, NumberStyles.Float,
+    CultureInfo.InvariantCulture, out double value);
+Console.WriteLine($"{wide}, {truncated}, {valid}, {value:F1}");
+```
+
+本例的 `InvariantCulture` 把点号作为小数分隔符，适合格式明确的协议示例；真实用户输入应明确采用本地文化还是固定格式，不能让不同机器悄悄解释出不同结果。`Convert.ToInt32`、显式转型和 `int.Parse` 的舍入/失败行为不同，不要把它们当作三个同义写法。
+
+## 浮点、`decimal` 与比较
+
+```csharp filename="Program.cs"
+double binary = 0.1 + 0.2;
+Console.WriteLine(binary == 0.3); // 通常为 False
+
+decimal money = 0.1m + 0.2m;
+Console.WriteLine(money == 0.3m); // True
+```
+
+`m` 后缀使字面量成为 `decimal`。`double` 并非“不准确所以不能用”，它是按二进制浮点规则近似表示实数。若测量值需要容差比较，应根据业务量纲与误差模型设计容差，而不是对所有值固定写一个极小常数。`decimal` 也不是无限精度，仍需明确位数和舍入规则。
+
+## 溢出与 `checked`
+
+整数有范围限制。C# 的溢出行为还受上下文和编译选项影响，不能笼统说“一定自动报错”。需要明确拒绝溢出时，在关键计算周围使用 `checked`；在确实需要环绕语义时才考虑 `unchecked`。
+
+```csharp filename="Program.cs"
+int maximum = int.MaxValue;
+try
+{
+    int next = checked(maximum + 1);
+    Console.WriteLine(next);
+}
+catch (OverflowException)
+{
+    Console.WriteLine("整数超出范围");
+}
+```
+
+不要把 `checked` 当成输入验证的全部。来自外部的数值还要考虑格式、范围、业务单位，浮点数据还要考虑 NaN 和无穷大。
+
+## 装箱与拆箱
+
+当值类型需要作为 `object` 或某个接口类型来使用时，可能发生装箱：生成一个装着该值副本的对象。拆箱需要类型匹配，再得到值副本。泛型集合 `List<int>` 能避免旧式非泛型集合里频繁把整数当 `object` 处理的情形。
+
+```csharp filename="Program.cs"
+int original = 7;
+object boxed = original;     // 装箱
+original = 9;
+int restored = (int)boxed;  // 拆箱
+Console.WriteLine($"{original}, {restored}"); // 9, 7
+```
+
+“值类型总在栈上、引用类型总在堆上”不是可靠的面试答案。值类型可以成为对象的字段，也可能被装箱；应先解释值语义与复制，再谈具体分配。装箱是否成为性能问题要靠测量，不要在普通业务代码中为避免一次装箱牺牲可读性。
+
+## 面试追问与练习
+
+**问：`var`、`object`、`dynamic` 有什么不同？** `var` 让编译器推断静态类型，之后类型不变；`object` 是类型系统中的基础引用类型，调用具体成员通常要转换；`dynamic` 把成员绑定等检查推迟到运行时。除与动态 API 交互外，不要用 `dynamic` 代替明确的数据模型。
+
+**问：`decimal` 是否保证业务金额永不出错？** 不保证。还要约定币种、尺度、舍入、溢出和存储格式。选对底层表示只是第一步。
+
+练习：① 分别用 `double` 与 `decimal` 计算十次 0.1 并解释差别；② 写一个读取非负整数的 Try 方法，测试空字符串、负数、超范围值；③ 预测上面装箱示例的输出，再改变 `boxed` 的类型并观察拆箱失败。验收标准是能说出每种转换是否会丢信息、何时会失败。
+
+## 参考
+
+[Microsoft Learn：C# 类型系统](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/) · [类型转换与装箱](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/conversions) · [数值类型](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/integral-numeric-types)

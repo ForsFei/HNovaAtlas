@@ -1,0 +1,86 @@
+---
+id: csharp-generic-api-design
+title: 泛型 API 设计：最小能力、比较规则与运行时类型
+description: 设计真正需要类型参数的接口，理解 IComparer、装箱、封闭泛型静态字段和反射边界。
+tags: [CSharp, 泛型, API设计, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-generic-methods-constraints, csharp-generic-variance]
+related: [csharp-collection-selection, csharp-value-equality]
+---
+
+## 先问“类型关系”是否值得泛型化
+
+当 API 要表达输入和输出保持同一元素类型、容器只能存特定类型、或者比较器必须与元素类型一致时，泛型很有价值。若某个 `T` 只在签名出现一次，且不约束返回值或其他参数，它可能只是增加调用复杂度。不要为一个固定设备对象制造五层 `IRepository<T>` / `IService<T>`；先写清真实调用方需要的能力。
+
+下面是一个单次枚举、由调用者提供比较规则的泛型方法。它没有强迫 `T` 实现全局 `IComparable<T>`，同一类型可以按不同业务维度比较：
+
+```csharp filename="Program.cs"
+Reading[] readings =
+[
+    new("pump-A", 72.5, 1),
+    new("pump-B", 68.0, 3),
+    new("pump-C", 70.0, 2)
+];
+
+Reading hottest = MaxBy(readings,
+    Comparer<Reading>.Create((a, b) => a.Value.CompareTo(b.Value)));
+Reading latest = MaxBy(readings,
+    Comparer<Reading>.Create((a, b) => a.Sequence.CompareTo(b.Sequence)));
+Console.WriteLine($"最高温：{hottest.DeviceId}；最新：{latest.DeviceId}");
+
+static T MaxBy<T>(IEnumerable<T> source, IComparer<T> comparer)
+{
+    using IEnumerator<T> iterator = source.GetEnumerator();
+    if (!iterator.MoveNext()) throw new InvalidOperationException("序列为空");
+    T best = iterator.Current;
+    while (iterator.MoveNext())
+        if (comparer.Compare(iterator.Current, best) > 0)
+            best = iterator.Current;
+    return best;
+}
+
+public record Reading(string DeviceId, double Value, int Sequence);
+```
+
+这里选择 `IEnumerable<T>` 是因为只需要遍历，不要求调用方持有列表；代价是不能保证它可重复枚举或无副作用。方法只枚举一次并明确空序列抛异常。比较器是调用方策略，不把设备读数的“大小”硬编码进实体类型。实际项目里已有 `Enumerable.MaxBy` 等 API 时优先复用；这里是为了展示泛型契约设计。
+
+## 暴露最小能力，也要说清语义
+
+若需要按索引访问，请用 `IReadOnlyList<T>`；若要修改传入集合，才接收 `ICollection<T>` 或更具体类型。返回 `IEnumerable<T>` 不承诺快照、可重复枚举或延迟/即时执行，文档应写清楚。`IReadOnlyList<T>` 也不承诺底层及元素不可变。API 的语义比“接口越抽象越好”重要。
+
+`IEqualityComparer<T>` 决定去重、字典键和集合中的相等规则；`IComparer<T>` 决定排序。两者不能互换。以设备 ID 为例，是否忽略大小写属于领域约定，要在字典/集合/搜索入口保持一致。
+
+## 泛型并未在运行时“消失”
+
+在 .NET 中可通过 `typeof(List<int>)` 等取得封闭泛型类型信息；泛型的运行时行为不同于把所有元素装进 `object`。`List<int>` 保存值类型元素时通常不需要每次加入都装箱，而把 `int` 转成 `object` 会装箱。不要因此宣称泛型代码“永远零分配”：列表增长、闭包、迭代器等仍可能分配。
+
+每个封闭泛型类型有自己的静态字段，下面两行不会共享同一个计数：
+
+```csharp filename="Program.cs"
+Box<int>.Created++;
+Box<string>.Created += 2;
+Console.WriteLine($"{Box<int>.Created}, {Box<string>.Created}"); // 1, 2
+Console.WriteLine(typeof(Box<int>).GetGenericArguments()[0].Name); // Int32
+
+public static class Box<T>
+{
+    public static int Created;
+}
+```
+
+反射能看到类型参数，不代表应该用反射替代正常的泛型调用。运行时可实例化的泛型类型必须满足约束；从配置字符串拼出任意类型并执行不是普通泛型 API 的职责，还涉及安全与可维护性。
+
+## 面试自测与练习
+
+1. `MaxBy` 为什么接收 `IComparer<T>` 而不是要求 `where T : IComparable<T>`？什么情况下后者更合适？
+2. `List<int>` 与 `List<string>` 的静态字段会共享吗？`typeof(List<int>)` 与 `typeof(List<string>)` 是同一个封闭类型吗？
+3. `IEnumerable<T>`、`IReadOnlyList<T>`、`ICollection<T>` 各向调用方承诺什么、又没有承诺什么？
+
+验收标准：能用最小签名表达真实类型关系，并在文档中清楚说明空输入、枚举次数、比较规则和可变性。
+
+## 参考
+
+[Microsoft Learn：泛型类型与方法](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/generics) · [泛型运行时行为](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/generics/generics-in-the-run-time) · [泛型静态成员](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/static-classes-and-static-members)

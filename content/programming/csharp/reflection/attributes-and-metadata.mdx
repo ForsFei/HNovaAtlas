@@ -1,0 +1,72 @@
+---
+id: csharp-attributes-metadata
+title: 特性与元数据：声明规则不等于执行规则
+description: 自定义 Attribute、AttributeUsage、位置参数与命名参数，以及读取特性时的边界。
+tags: [CSharp, 特性, 元数据, 反射, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-classes-interfaces, csharp-delegates-func-action]
+related: [csharp-reflection-type-members, csharp-reflection-factory-boundaries]
+---
+
+## 特性写在声明上，但不会自己运行业务
+
+`[Obsolete]`、`[Serializable]` 这类方括号写法叫特性（attribute），可给程序集、类型、方法、属性等附加声明信息。不同特性的消费者不同：有的由编译器识别，有的由框架或你的代码读取。**自定义特性只提供元数据，不会因为贴在类上就自动执行校验、注册服务或修改方法行为。**
+
+下面把设备规则名称放在类声明上，随后由程序显式读取。完整代码可放进一个 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+using System.Reflection;
+
+Type ruleType = typeof(HighTemperatureRule);
+RuleAttribute? marker = ruleType.GetCustomAttribute<RuleAttribute>();
+Console.WriteLine($"{marker?.Name}: {marker?.Priority}"); // hot: 10
+
+var rule = new HighTemperatureRule();
+Console.WriteLine(rule.IsMatch(72.5)); // True；这是显式调用，不是特性自动调用
+
+[AttributeUsage(AttributeTargets.Class, AllowMultiple = false, Inherited = false)]
+public sealed class RuleAttribute(string name) : Attribute
+{
+    public string Name { get; } = name;
+    public int Priority { get; set; }
+}
+
+[Rule("hot", Priority = 10)]
+public sealed class HighTemperatureRule
+{
+    public bool IsMatch(double value) => value >= 70;
+}
+```
+
+自定义类型继承 `Attribute`，类型名通常以 `Attribute` 结尾，使用时可省略后缀。`"hot"` 传给构造函数，是位置参数；`Priority = 10` 设置公共可写属性，是命名参数。`AttributeUsage` 把应用目标限制在类，禁止重复贴同种特性，并明确不让派生类继承这个标记。`AllowMultiple` 和 `Inherited` 不要只背默认值；在契约上显式写清更易审查。
+
+## 元数据、读取和动作分三层
+
+| 层次 | 本例 | 要回答的问题 |
+| --- | --- | --- |
+| 声明 | `[Rule("hot")]` | 哪个类型被标记？配置值是什么？ |
+| 读取 | `GetCustomAttribute<RuleAttribute>()` | 运行时在什么范围内查找？没找到怎么办？ |
+| 动作 | `IsMatch(72.5)` | 谁创建对象、调用它并处理结果？ |
+
+`GetCustomAttribute` 在通常的执行上下文中会构造并返回特性对象；若只需查看元数据而不希望运行特性构造逻辑，可了解 `CustomAttributeData`。不要把反射出来的标记当作可信的业务校验：输入、权限和版本兼容仍由调用流程负责。
+
+目标也要选对：贴在类上的特性与贴在方法上的特性不是同一个位置。方法级标记需先取得对应 `MethodInfo` 再读取；把类型的 `GetCustomAttributes` 调一遍不会自动收集每个成员的标记。
+
+## 什么时候值得用特性
+
+当多个类型需要稳定的声明式描述，而且有明确消费者（例如测试框架发现测试、序列化框架读取映射、应用启动时注册规则）时，特性可以减少散落的映射代码。若只有两三个固定规则，显式字典或接口注册常更简单、可搜索，也更容易处理重命名。特性值适合描述**静态契约**，不适合承载会随请求变化的运行时状态。
+
+## 面试自测与练习
+
+1. 在 `HighTemperatureRule` 上加 `[Rule("hot")]` 后，不写读取代码，`IsMatch` 会自动调用吗？为什么？
+2. `Priority` 改成只读属性后，示例中的命名参数还能直接赋值吗？如何通过构造函数提供它？
+3. 想允许一个类声明多个规则名、并允许子类继承，`AttributeUsage` 应调整哪两项？这会给读取方带来什么去重问题？
+
+验收标准：能写一个自定义特性，并明确指出「声明、读取、执行」分别由哪段代码完成。
+
+## 参考
+
+[Microsoft Learn：创建自定义特性](https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/reflection-and-attributes/creating-custom-attributes) · [访问自定义特性](https://learn.microsoft.com/en-us/dotnet/fundamentals/reflection/accessing-custom-attributes)

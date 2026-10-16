@@ -1,0 +1,97 @@
+---
+id: csharp-readonly-struct-copies
+title: readonly struct 与防御性复制：只读到底保护了谁
+description: 用 in 参数与可变结构体的反例理解隐藏副本，比较 record struct 默认可变性和浅不可变边界。
+tags: [CSharp, struct, readonly, 值类型, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 45
+prerequisite: [csharp-parameters-overloads, csharp-value-equality]
+related: [csharp-access-const-readonly, csharp-spans-memory-pooling]
+---
+
+## 先把三种“只读”分开
+
+[方法参数与重载](/knowledge/programming/csharp/fundamentals/parameters-and-overloads/)已介绍 `in`：被调方法不能重新赋值该参数。[值语义与相等性](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/)已介绍结构体赋值会复制值。但这两点合起来并不意味着“把可变结构体传给 `in`，它的方法就会原地修改调用方”。只读位置上的可变结构体调用**可能修改自身的非 `readonly` 成员**时，编译器为保持只读约束可创建防御性副本，在副本上调用；这种隐藏复制会改变可观察结果，也可能影响热点代码性能。
+
+| 写法 | 它保证什么 | 不保证什么 |
+| --- | --- | --- |
+| `readonly` 字段 | 字段在构造完成后不能重绑 | 引用字段指向的对象不会变化 |
+| `in T` 参数 | 方法不能重新赋值该参数 | 对可变 `T` 的每次成员访问都零复制 |
+| `readonly struct` | 实例成员不能改变结构体自身状态 | 内含的可变引用对象被深度冻结 |
+| `readonly record struct` | 位置属性通常是 `init`-only，并有记录的值相等性 | 引用类型成员自动深拷贝 |
+
+## 一个会“修改了却没变”的反例
+
+下面完整 `Program.cs` 可在 .NET 10 运行，仓库项目为 `dotnet run --project examples/csharp-readonly-struct/ReadonlyStructReview.csproj`。先猜 `TryIncrement(in counter)` 后 `counter.Value` 是 5 还是 6，再运行确认。`MutableCounter.Increment` 是非只读成员；对 `in` 参数调用时，修改落在副本上。正常的可写局部变量调用则会修改原值。
+
+```csharp filename="Program.cs"
+var counter = new MutableCounter(5);
+Check(TryIncrement(in counter) == 5, "in 参数调用落在防御性副本上");
+Check(counter.Value == 5, "调用方原值不变");
+counter.Increment();
+Check(counter.Value == 6, "可写局部变量可正常修改");
+
+var mutable = new MutableReading("pump-A", 72);
+mutable.Value = 73; // record struct 的位置属性默认可写
+Check(mutable.Value == 73, "普通 record struct 可变");
+
+var first = new FrozenReading("pump-A", 72);
+var second = first with { Value = 73 };
+Check(first.Value == 72 && second.Value == 73, "with 产生新的值");
+
+int[] source = [1];
+var shallow = new ShallowSnapshot(source);
+source[0] = 9;
+Check(shallow.First == 9, "readonly struct 没有冻结引用字段指向的数组");
+Console.WriteLine("结构体只读与复制断言通过");
+
+static int TryIncrement(in MutableCounter value)
+{
+    value.Increment(); // 编译器在副本上调用非 readonly 成员
+    return value.Value;
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+public struct MutableCounter(int value)
+{
+    public int Value = value;
+    public void Increment() => Value++;
+}
+
+public record struct MutableReading(string DeviceId, int Value);
+public readonly record struct FrozenReading(string DeviceId, int Value);
+
+public readonly struct ShallowSnapshot
+{
+    private readonly int[] _source;
+    public ShallowSnapshot(int[] source) => _source = source;
+    public int First => _source[0];
+}
+```
+
+示例的 `ShallowSnapshot` 是故意留下的**反例**：字段引用不能改指向，不代表外部保留的数组别名不能写。若业务真的要求快照，应在入口复制数据，并避免在出口暴露内部可变数组；或者使用自身不可变的成员，并明确谁能持有和修改引用。`ReadOnlySpan<T>` 也只是限制通过该视图写入，不会冻结底层数组，详见[Span、Memory 与 ArrayPool](/knowledge/programming/csharp/fundamentals/spans-memory-and-pooling/)。
+
+## 什么时候选 readonly struct
+
+结构体适合小而独立的值，例如坐标、数量或时间点；赋值本来就应表示复制。若它的实例状态在构造后不该变，`readonly struct` 能把意图交给编译器检查，也避免只读位置访问非只读成员时的一类防御性复制。`readonly record struct` 还能得到记录生成的相等性和 `with` 语法，但普通 `record struct` 的位置属性默认**可写**；不能看到 `record` 就认定它不可变。
+
+如果结构体较大，频繁按值传参可能复制整份值；`in` 或 `ref readonly` 可表达只读按引用，但调用实参是表达式而非合适变量时仍可能出现临时副本。不要仅凭加上 `in` 就宣称零复制，也不要把所有类机械改成结构体。先选清楚语义，再用真实负载和分析工具验证性能。[官方结构体指南](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/structs)也建议以 `readonly` 成员向编译器表达不修改自身的承诺；无法让整个类型只读时，可逐个标注确实只读的成员。
+
+## 高频追问与练习
+
+1. `in MutableCounter` 和 `ref MutableCounter` 对 `Increment()` 的效果为何不同？怎样避免“以为修改了原值”的设计？
+2. `record struct`、`readonly record struct`、`record class` 各是值类型还是引用类型？位置属性默认能否再赋值？
+3. 为何 `ShallowSnapshot` 的 `First` 随外部数组变化？如果构造函数先 `source.ToArray()`，还需要检查什么出口？
+4. `readonly struct` 是否意味着它一定分配在栈上、一定零复制？结合[内存与 GC](/knowledge/programming/csharp/reliability/managed-memory-and-disposal/)解释。
+
+验收标准：能预测示例的五个断言，明确区分“禁止重绑”“结构体自身不变”“引用对象不变”和“避免防御性复制”。
+
+## 参考
+
+[Microsoft Learn：结构类型](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/struct) · [结构体指南](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/structs) · [记录类型](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/records) · [`readonly` 关键字](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/readonly)

@@ -1,6 +1,10 @@
 node_modules/
 .next/
+.next-cache-*/
+.next-trash*/
+.history/
 out/
+out-old/
 *.tsbuildinfo
 .env*
 !.env.example
@@ -8,6 +12,10 @@ next-env.d.ts
 playwright-report/
 test-results/
 src/generated/
+**/bin/
+**/obj/
 task_plan.md
 progress.md
 findings.md
+dev-server.log
+preview-server.log

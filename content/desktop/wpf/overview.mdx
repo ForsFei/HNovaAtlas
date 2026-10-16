@@ -1,0 +1,29 @@
+---
+id: wpf-learning-path
+title: WPF 学习路线：从窗口布局到可测试的桌面应用
+description: 按应用结构、绑定、命令、属性与外观、异步、列表和整合实践逐步学习 WPF。
+tags: [WPF, .NET, XAML, 学习路线]
+difficulty: beginner
+status: published
+updated: "2026-10-16"
+order: 0
+related: [wpf-xaml-layout-basics, wpf-mvvm, wpf-commands-and-validation, wpf-properties-styles-and-templates, wpf-ui-thread-and-async, wpf-collection-views-and-virtualization, wpf-dashboard-integration-and-testing]
+---
+
+## 这条路线解决什么
+
+WPF 是 .NET 上面向 Windows 的桌面 UI 框架。学过 C# 后，新的难点往往不在语法，而在 XAML 如何创建对象、布局如何分配空间、绑定何时通知界面、命令如何控制输入，以及 UI 线程和后台任务如何协作。本站会围绕这些机制逐步建立一个**可解释、可运行**的小型设备读数示例，不把它包装成工业控制成品。[Microsoft Learn：WPF 总览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/overview/)
+
+课程按主题推进，每篇同时包含基本规则、项目边界和自测追问，不分开做三套「基础/进阶/面试」。先读[应用、XAML 与布局](/knowledge/desktop/wpf/fundamentals/xaml-layout-basics/)，再读[MVVM 与数据绑定](/knowledge/desktop/wpf/architecture/mvvm/)的属性、集合和集合项通知，用[命令与输入验证](/knowledge/desktop/wpf/architecture/commands-and-validation/)完成本地参数编辑，再通过[依赖属性与外观](/knowledge/desktop/wpf/architecture/properties-styles-and-templates/)区分值来源和模板职责，接着在[UI 线程与异步](/knowledge/desktop/wpf/architecture/ui-thread-and-async/)处理等待、取消、失败与关闭，用[集合视图与虚拟化](/knowledge/desktop/wpf/architecture/collection-views-and-virtualization/)观察大列表的三层数量，最终在[模拟读数面板](/knowledge/desktop/wpf/architecture/dashboard-integration-and-testing/)整合状态测试与发布边界。
+
+| 阶段 | 应掌握的问题 | 当前状态 |
+| --- | --- | --- |
+| 1. 应用与布局 | `App` 如何启动窗口？`Grid` 的 `Auto/*` 怎样分配空间？ | 已完成 |
+| 2. 绑定与通知 | 属性变更、集合增删和元素自身变化分别由谁通知？ | 已完成 |
+| 3. 命令与输入验证 | 按钮何时可执行？输入错误如何反馈？ | 已完成 |
+| 4. 属性与外观 | 依赖属性、路由事件、资源、样式和模板各做什么？ | 已完成 |
+| 5. UI 线程与异步 | 如何保持窗口响应并正确取消后台操作？ | 已完成 |
+| 6. 列表与性能 | 集合视图、筛选与虚拟化何时有效？ | 已完成 |
+| 7. 整合与测试 | 怎样测试 ViewModel，又不假装单元测试覆盖了真实 WPF？ | 已完成 |
+
+示例以 .NET 10 / Windows 为基线，不要求在网页里模拟桌面窗口。每阶段只引入该阶段真正需要的交互与依赖。七步主线现已交付，真实桌面交互仍须按各篇清单人工验收；后续专题可依实际使用反馈扩充。完整范围和验收记录保存在仓库的 `docs/wpf-curriculum-plan.md`。

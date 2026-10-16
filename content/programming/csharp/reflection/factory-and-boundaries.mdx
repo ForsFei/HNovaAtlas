@@ -1,0 +1,95 @@
+---
+id: csharp-reflection-factory-boundaries
+title: 反射创建与表达式树：扩展点的成本和边界
+description: 用受限规则工厂练习类型发现、接口校验、Activator 创建，并区分反射、表达式树及裁剪风险。
+tags: [CSharp, 反射, Activator, 表达式树, AOT, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-attributes-metadata, csharp-reflection-type-members, csharp-lambda-closures]
+related: [csharp-generic-api-design, csharp-events-lifecycle]
+---
+
+## 一个有边界的规则工厂
+
+设想配置里写 `"hot"`，程序需要选出一个实现 `IReadingRule` 的规则。这里仅扫描**已知的当前程序集**，查找带 `[Rule]` 的公开具体类，再验证接口和无参构造函数。它演示机制，不是可直接接受任意上传 DLL 或类型名的插件宿主。
+
+```csharp filename="Program.cs"
+using System.Reflection;
+
+IReadingRule rule = CreateRule("hot");
+Console.WriteLine(rule.IsMatch(72.5)); // True
+
+static IReadingRule CreateRule(string name)
+{
+    Type[] candidates = typeof(IReadingRule).Assembly.GetTypes()
+        .Where(type => type.IsClass && !type.IsAbstract && type.IsPublic)
+        .Where(type => typeof(IReadingRule).IsAssignableFrom(type))
+        .Where(type => type.GetCustomAttribute<RuleAttribute>()?.Name == name)
+        .ToArray();
+
+    if (candidates.Length != 1)
+        throw new InvalidOperationException($"规则 {name} 的实现数量应为 1，实际为 {candidates.Length}");
+
+    Type selected = candidates[0];
+    if (selected.GetConstructor(Type.EmptyTypes) is null)
+        throw new InvalidOperationException($"{selected.Name} 缺少公共无参构造函数");
+
+    return (IReadingRule)(Activator.CreateInstance(selected)
+        ?? throw new InvalidOperationException($"无法创建 {selected.Name}"));
+}
+
+public interface IReadingRule { bool IsMatch(double value); }
+
+[AttributeUsage(AttributeTargets.Class, Inherited = false)]
+public sealed class RuleAttribute(string name) : Attribute
+{
+    public string Name { get; } = name;
+}
+
+[Rule("hot")]
+public sealed class HighTemperatureRule : IReadingRule
+{
+    public bool IsMatch(double value) => value >= 70;
+}
+```
+
+这里的检查各有目的：接口限制可调用契约，标记限制候选，唯一性避免配置含糊，构造函数检查让错误更接近启动阶段。即便预先检查，构造函数本身仍可能抛异常，反射创建可能包成 `TargetInvocationException`，需要保留原始原因。生产系统还要决定配置合法性、依赖注入、版本与日志策略。若类型集合已知且很小，显式 `Dictionary<string, Func<IReadingRule>>` 更直接，通常也是优先方案。
+
+## 表达式树不是另一种 `GetType()`
+
+反射询问“这个类型有什么成员、能否调用它”；表达式树则把一段表达式表示成可遍历的数据结构。下面两个 Lambda 看起来一样，保存的东西却不同：
+
+```csharp filename="Program.cs"
+using System.Linq.Expressions;
+
+Func<int, bool> callback = value => value > 70;
+Expression<Func<int, bool>> tree = value => value > 70;
+
+Console.WriteLine(callback(72));       // True：直接执行委托
+Console.WriteLine(tree.Body.NodeType); // GreaterThan：检查结构
+Console.WriteLine(tree.Compile()(72)); // True：编译后再执行
+```
+
+LINQ 查询提供程序可能检查树并翻译成别的查询语言，但这取决于提供程序与它支持的表达式，不是所有 C# 方法都能翻译。表达式树与反射可配合使用，却不应混为“动态调用”的同义词。前面的 [Lambda 与闭包](/knowledge/programming/csharp/delegates-events/lambda-and-closures/) 已介绍两种转换目标。
+
+## 性能、发布方式和安全
+
+反射的成员查找、构造与调用会带来运行时检查和错误面；不要靠一句“反射慢”决定架构，应先确定调用频率，必要时测量并缓存元数据或工厂。缓存也不能替代对重复名称、版本变化与构造异常的处理。
+
+裁剪或 Native AOT 发布会改变动态发现的前提：链接器可能看不到只通过字符串或扫描找到的成员。若项目启用这些发布方式，要运行发布分析、处理相关警告并实际测试目标产物。可优先用显式注册或源生成；确需反射时按官方指导最小化保留成员、标注动态访问要求。本文示例只验证普通 .NET 运行，**不声称已通过裁剪或 Native AOT**。
+
+从不可信来源加载程序集不是普通的“读一份配置”；插件代码会在进程里执行。实际插件宿主还需隔离、信任、依赖解析与版本策略。本例固定扫描自己的程序集，避免把任意输入直接当作 `Assembly.LoadFrom` 路径。
+
+## 面试自测与练习
+
+1. 为什么只检查 `[Rule("hot")]` 不够，还要检查接口、唯一性和构造函数？
+2. `Expression<Func<int, bool>>` 与 `Func<int, bool>` 各保存什么？何时可以直接调用？
+3. 一个普通运行正常的反射扫描程序，发布裁剪后为什么仍可能失败？你会怎样验证和收窄范围？
+
+验收标准：能写出清晰的候选筛选与失败分支，并说出何时改用显式注册。
+
+## 参考
+
+[Microsoft Learn：Activator.CreateInstance](https://learn.microsoft.com/en-us/dotnet/api/system.activator.createinstance) · [执行表达式树](https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/expression-trees/expression-trees-execution) · [修复裁剪警告](https://learn.microsoft.com/en-us/dotnet/core/deploying/trimming/fixing-warnings)

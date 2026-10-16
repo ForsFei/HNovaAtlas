@@ -1,0 +1,99 @@
+---
+id: python-files
+title: 文件读写
+description: 学会用 with open 读取和写入文本文件，处理编码与不存在的文件。
+tags: [Python, 文件, open]
+difficulty: beginner
+status: draft
+updated: "2026-10-13"
+order: 20
+prerequisite: [python-errors-exceptions]
+related: [python-oop-basics]
+---
+
+## 为什么程序要碰文件
+
+变量随程序结束而消失。想让数据留下来——记账本、配置、爬下来的网页——就要写进**文件**；下次运行时再读回来。文件读写是"自动化办公"类程序的基础。
+
+## 读写一个文本文件
+
+最常用的写法是 `with open(...)`：
+
+```python filename="write.py"
+with open("note.txt", "w", encoding="utf-8") as f:
+    f.write("第一行内容\n")
+    f.write("第二行内容\n")
+```
+
+```python filename="read.py"
+with open("note.txt", "r", encoding="utf-8") as f:
+    content = f.read()
+print(content)
+```
+
+拆解这行代码：
+
+| 部分 | 含义 |
+|------|------|
+| `"note.txt"` | 文件路径（相对当前工作目录） |
+| `"r"` / `"w"` / `"a"` | 模式：读 / 写（覆盖原有内容）/ 追加 |
+| `encoding="utf-8"` | 文本编码，写中文**务必指定** |
+| `as f` | 文件对象，通过它调用 `read()` / `write()` |
+
+<Callout type="warning" title="两个高频坑">
+
+1. **不加 encoding 写中文**：Windows 默认编码不是 UTF-8，别的设备打开可能乱码。读写文本永远带上 `encoding="utf-8"`。
+2. **"w" 会清空原文件**：模式选错，老数据直接没了。只想在末尾加内容用 `"a"`（追加）。
+
+</Callout>
+
+## 为什么要用 with
+
+`open` 之后必须 `close()`，否则文件可能没有真正写完、也被别的程序占用。而 `with` 会在代码块结束时**自动关闭**，即使中间出错了也会关。今后读写文件一律写 `with open(...)`，不要手动 close。
+
+## 逐行读取大文件
+
+`f.read()` 一次性读进整个文件，小文件没问题；日志之类的大文件要逐行处理：
+
+```python filename="read-lines.py"
+with open("log.txt", "r", encoding="utf-8") as f:
+    for line in f:          # 文件对象可以直接逐行迭代
+        line = line.rstrip("\n")   # 每行末尾带着换行符，去掉
+        print(line)
+```
+
+读取的每一行都带着换行符 `\n`，处理前通常先 `strip()` 或 `rstrip("\n")`——这是新手最常困惑的"为什么输出多了空行"。
+
+## 文件不存在怎么办
+
+打开不存在的文件会抛 `FileNotFoundError`，配合上一节学的异常处理：
+
+```python filename="safe-read.py"
+try:
+    with open("config.txt", "r", encoding="utf-8") as f:
+        print(f.read())
+except FileNotFoundError:
+    print("配置文件不存在，使用默认设置")
+```
+
+## 路径：文件在哪里
+
+- 相对路径：`open("data/notes.txt")`，相对**程序运行时所在的目录**
+- 绝对路径：`open(r"C:\Users\me\notes.txt")`，Windows 反斜杠前加 `r`（原始字符串）或改用正斜杠
+
+程序找不到文件时，先确认"它到底在哪个目录下运行"。下一节会用 `pathlib` 模块把路径处理得更规范。
+
+<FlashCard front="文件模式 r / w / a 的区别？" back="r 只读（文件必须存在）；w 写入并清空原有内容；a 追加，在文件末尾添加新内容、不清空。读写文本时都要带 encoding=「utf-8」。" />
+
+## 动手试一试
+
+1. 写程序把三行留言写入 `messages.txt`，再读出来打印。
+2. 用 `"a"` 模式运行两次第 1 题的程序，观察文件内容如何变化。
+3. 尝试读取一个不存在的文件，用 try/except 给出友好提示。
+
+<Quiz
+  question="对已有内容的文件执行 open('data.txt', 'w') 后，原内容会怎样？"
+  options={["保留，新内容接在后面", "被清空，准备写入新内容", "报错，文件已存在", "自动备份原内容"]}
+  answer={1}
+  explanation="w 模式打开的瞬间就把文件清空了。只想追加内容要用 a 模式；不想误伤文件，写之前可以先确认文件是否存在。"
+/>

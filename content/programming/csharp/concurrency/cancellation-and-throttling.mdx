@@ -1,0 +1,84 @@
+---
+id: csharp-cancellation-throttling
+title: 取消、超时与限流：让并发工作可控地结束
+description: 用 CancellationToken、SemaphoreSlim 和有界并发解释协作取消、令牌传递与资源释放。
+tags: [CSharp, 异步, 取消, SemaphoreSlim, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 40
+prerequisite: [csharp-async-await, csharp-lock-shared-state]
+related: [csharp-task-composition-faults-timeouts, csharp-channel-failure-cancellation, csharp-concurrent-collections, csharp-threads-threadpool-tasks]
+---
+
+## 取消是请求，不是强杀
+
+`CancellationTokenSource` 由调用方管理，请求取消；它的 `Token` 传给下游，工作代码和所调用 API 协作观察。令牌被取消后不能“重置为未取消”；一次业务操作通常拥有自己的取消边界。调用 `Cancel` 后，操作可能还要清理资源或完成无法取消的外部步骤，不能把请求取消等同于“事情绝对没发生”。
+
+超时是取消请求的一种来源。若上游用户取消和本地超时都应生效，可建立链接的 `CancellationTokenSource`，并在完成后释放。下面完整示例可在控制台运行：
+
+```csharp filename="Program.cs"
+using var user = new CancellationTokenSource();
+using var timeout = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+using var linked = CancellationTokenSource.CreateLinkedTokenSource(user.Token, timeout.Token);
+
+try
+{
+    await Task.Delay(TimeSpan.FromSeconds(5), linked.Token);
+    Console.WriteLine("完成");
+}
+catch (OperationCanceledException) when (linked.IsCancellationRequested)
+{
+    Console.WriteLine(timeout.IsCancellationRequested ? "超时" : "用户取消");
+}
+```
+
+这里用 `Task.Delay` 演示可取消等待，实际网络、数据库或文件操作应把同一令牌传给相应异步 API。若两种取消几乎同时发生，仅凭 `IsCancellationRequested` 无法准确断定唯一原因；示例输出是简化的诊断，不是审计记录。
+
+## `SemaphoreSlim` 限制同时在途的操作
+
+对外部服务最多同时发两项请求，可在**进入资源前** `WaitAsync(token)`，进入后用 `try/finally` 确保 `Release()`。等待期间被取消的任务没有取得名额，不能释放它没有取得的信号量。
+
+```csharp filename="Program.cs"
+using var gate = new SemaphoreSlim(2, 2);
+using var source = new CancellationTokenSource();
+
+Task[] jobs = Enumerable.Range(1, 5)
+    .Select(id => ProcessAsync(id, source.Token))
+    .ToArray();
+await Task.WhenAll(jobs);
+
+async Task ProcessAsync(int id, CancellationToken token)
+{
+    await gate.WaitAsync(token); // 成功返回之后才拥有一个名额
+    try
+    {
+        Console.WriteLine($"开始 {id}");
+        await Task.Delay(50, token); // 这里替换成真正的异步 I/O
+    }
+    finally
+    {
+        gate.Release();
+    }
+}
+```
+
+这个例子为 5 项工作都创建了任务，仅限制同时**进入临界资源**的数量。若有几十万项工作，先生成几十万个 Task 仍会占内存；应考虑有界 Channel、分批调度或其他生产者背压机制。信号量不是速率限制器：“最多同时 2 个”不等于“每秒最多 2 个”。服务端配额按时间窗口计算时，需要专门的速率策略。
+
+## 错误、取消和清理分开
+
+`OperationCanceledException` 在对应令牌已请求取消时表示正常的协作结束，但其他异常仍要报告。不要写 `catch (Exception) { return; }` 把网络故障伪装成取消或成功。`Task.WhenAll` 会等待所有传入任务终结；其中一个取消并不会自动替其他任务调用 `Cancel`。要“有一个失败便停止其余任务”，需要由调用方决定并请求共享源取消，同时仍观察所有任务结果与清理。
+
+下游 API 若不接受令牌，调用方取消等待也未必能终止底层操作；应明确这个限制。取消传播不是把每层都包一个短超时，而是由调用边界制定总预算、下游协作遵守。
+
+## 面试自测与练习
+
+1. 如果 `WaitAsync` 在进入前抛出取消异常，是否执行 `Release()`？为什么示例的 `try` 放在等待之后？
+2. 把 `Task.Delay(50, token)` 改成不传令牌，取消请求后在途工作何时结束？
+3. 并发度限制、每秒速率限制、任务总数限制分别约束什么？
+
+验收标准：能说明令牌拥有者、传递路径、超时来源、释放时机和大批量任务的背压方案。
+
+## 参考
+
+[Microsoft Learn：协作式取消](https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads) · [SemaphoreSlim](https://learn.microsoft.com/en-us/dotnet/standard/threading/semaphore-and-semaphoreslim) · [Task.WhenAll](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall)

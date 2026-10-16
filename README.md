@@ -19,6 +19,7 @@ npm run dev
 npm run lint
 npm run typecheck
 npm run test:content
+npm run test:csharp-articles
 npm run build
 npm start
 ```
@@ -34,7 +35,7 @@ npm start
 - 首页领域概览、关于页面、404、桌面与移动导航。
 - 键盘焦点、跳过导航入口、减少动画偏好。
 
-目前包含 8 篇已发布文章和 1 篇开发草稿；首页计数与知识导航来自内容目录。
+已发布文章数量与知识导航由内容目录自动生成；开发草稿不会进入生产站点。`test:csharp-articles` 会单独编译标注为完整 `Program.cs` 的部分 C# 教程代码块，尚不覆盖所有说明性片段。
 
 文章页包含自动 TOC、当前章节提示、语法高亮、代码复制、文件名、行号、行强调、知识顺序 Previous/Next 和关联知识。桌面三栏，手机折叠目录与代码局部滚动。文章标签可点击，`/tag/` 汇总已发布文章的标签与相关内容。
 首页展示真实领域/技术入口、已发布统计和最近五条更新。交互实验室已有 `http://localhost:43110/labs/ethercat-pdo/` 的 PDO 过程数据实验；异步任务与 TCP 实验仍处于筹备状态。实验操作与模拟边界见 [PDO 实验说明](docs/pdo-lab.md)。

@@ -1,0 +1,138 @@
+---
+id: csharp-synchronization-context-configureawait
+title: await 恢复到哪里：SynchronizationContext 与 ConfigureAwait
+description: 用可控上下文区分默认回送、ConfigureAwait(false)、同步完成和 AsyncLocal 传播，并解释常见死锁边界。
+tags: [CSharp, async, ConfigureAwait, SynchronizationContext, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 17
+prerequisite: [csharp-async-await]
+related: [csharp-task-vs-valuetask, csharp-threads-threadpool-tasks, csharp-controlled-concurrency-tests]
+---
+
+## `await` 暂停之后，谁安排继续执行？
+
+[异步入门](/knowledge/programming/csharp/concurrency/async-await/)已经说明：`await` 不等于启动新线程。当被等待的 `Task` **尚未完成**时，异步方法先返回；任务完成后，运行时安排剩余代码（continuation）继续。这里要分清两件事：**在哪个线程执行**和**是否要求回到某种执行上下文**，二者不是同义词。
+
+默认的 `await task` 会尝试使用当前 `SynchronizationContext` 安排 continuation；如果没有自定义同步上下文，还可能使用当前非默认 `TaskScheduler`。UI 框架常用同步上下文表达“回到 UI 线程”的要求。没有这类约束时，continuation 不保证回到原线程，也不保证一定换线程。因此，判断代码能否访问 UI 状态，要看框架的线程亲和规则，不能只看一次日志里的线程 ID。
+
+`await task.ConfigureAwait(false)` 表示**这一次等待不要求回到捕获的同步上下文或调度器**。它不取消任务、不改变任务结果，也不是“开启线程池线程”的指令。若任务在 `await` 时已完成，后续代码通常直接同步继续，甚至仍在原上下文；把它当作“必然离开 UI 线程”的保证会出错。
+
+| 写法 | 未完成时的恢复要求 | 已完成时 |
+| --- | --- | --- |
+| `await task` | 尝试回送捕获的上下文/非默认调度器 | 可直接同步继续 |
+| `await task.ConfigureAwait(false)` | 不要求回送该上下文/调度器 | 同样可直接同步继续 |
+
+## 用受控上下文验证，而不是猜线程号
+
+下面是完整 `Program.cs`，也在 `examples/csharp-async-context` 中。它构造一个只记录 `Post` 并等待我们手动执行回调的上下文；`TaskCompletionSource` 保证前两次等待起初未完成。断言验证默认 `await` 会向该上下文投递，`ConfigureAwait(false)` 不投递；第三次用已完成任务验证后者不强制切换。超时只用于防止示例异常时一直挂起，不作为性能结论。
+
+```csharp filename="Program.cs"
+using System.Collections.Concurrent;
+
+var context = new QueueingContext();
+var capturedGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+Task<bool> captured = StartInContext(context, () => ObserveContextAsync(capturedGate.Task, true, context));
+Check(!captured.IsCompleted, "the first await must be pending");
+capturedGate.SetResult();
+await context.RunNextAsync();
+Check(await captured, "default await resumes through the captured context");
+Check(context.PostCount == 1, "one continuation was posted");
+
+var freeGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+Task<bool> free = StartInContext(context, () => ObserveContextAsync(freeGate.Task, false, context));
+freeGate.SetResult();
+Check(!await free.WaitAsync(TimeSpan.FromSeconds(5)), "ConfigureAwait(false) skips context capture");
+Check(context.PostCount == 1, "no extra continuation was posted");
+
+Task<bool> alreadyDone = StartInContext(context, () => ObserveContextAsync(Task.CompletedTask, false, context));
+Check(await alreadyDone, "an already-completed await may continue inline in the original context");
+
+var trace = new AsyncLocal<string?> { Value = "request-42" };
+var traceGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+Task<string?> flowed = StartInContext(context, () => ReadTraceAsync(traceGate.Task, trace));
+traceGate.SetResult();
+Check(await flowed.WaitAsync(TimeSpan.FromSeconds(5)) == "request-42", "AsyncLocal flows independently");
+Check(context.PostCount == 1, "ExecutionContext flow does not require a context post");
+
+Console.WriteLine("上下文恢复、跳过回送、同步完成与 AsyncLocal 断言全部通过。");
+
+static Task<T> StartInContext<T>(SynchronizationContext context, Func<Task<T>> action)
+{
+    SynchronizationContext? previous = SynchronizationContext.Current;
+    SynchronizationContext.SetSynchronizationContext(context);
+    try { return action(); }
+    finally { SynchronizationContext.SetSynchronizationContext(previous); }
+}
+
+static async Task<bool> ObserveContextAsync(Task gate, bool capture, SynchronizationContext expected)
+{
+    if (capture) await gate;
+    else await gate.ConfigureAwait(false);
+    return ReferenceEquals(SynchronizationContext.Current, expected);
+}
+
+static async Task<string?> ReadTraceAsync(Task gate, AsyncLocal<string?> trace)
+{
+    await gate.ConfigureAwait(false);
+    return trace.Value;
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+sealed class QueueingContext : SynchronizationContext
+{
+    private readonly ConcurrentQueue<(SendOrPostCallback Callback, object? State)> _queue = new();
+    private readonly SemaphoreSlim _posted = new(0);
+    private int _postCount;
+    public int PostCount => Volatile.Read(ref _postCount);
+
+    public override void Post(SendOrPostCallback callback, object? state)
+    {
+        _queue.Enqueue((callback, state));
+        Interlocked.Increment(ref _postCount);
+        _posted.Release();
+    }
+
+    public async Task RunNextAsync()
+    {
+        if (!await _posted.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false))
+            throw new TimeoutException("No continuation was posted.");
+        if (!_queue.TryDequeue(out var work)) throw new InvalidOperationException("Posted work is missing.");
+
+        SynchronizationContext? previous = Current;
+        SetSynchronizationContext(this);
+        try { work.Callback(work.State); }
+        finally { SetSynchronizationContext(previous); }
+    }
+}
+```
+
+这不是 UI 消息循环的实现，也没有证明“continuation 总由某个固定线程运行”；它只控制**是否向同步上下文投递**。`RunContinuationsAsynchronously` 避免 `SetResult` 在本例中内联执行待续代码，确保未完成路径可观察。`StartInContext` 的 `finally` 恢复调用者原有上下文，示例不会把测试上下文泄漏给后续顶级语句。
+
+## `ExecutionContext` 与 `SynchronizationContext` 不同
+
+示例中 `AsyncLocal<string?>` 的值在 `ConfigureAwait(false)` 后仍能读取。它随 `ExecutionContext` 流动；`ConfigureAwait(false)` 控制的是 `await` **是否请求回送捕获的同步上下文/调度器**，不是清空 `AsyncLocal`、身份信息或追踪数据的开关。若某个上下文确实被显式抑制，那是另一个独立机制，不要用 `ConfigureAwait(false)` 推测其状态。
+
+## 同步阻塞为何有时死锁
+
+假设某个单线程上下文正在执行调用方：异步方法等待未完成任务时捕获它；调用方随后用 `.Result` 或 `.Wait()` 占住该线程；任务完成后 continuation 想投递回同一上下文，却一直得不到执行机会。这是一种典型的“同步等异步”死锁条件，**不是**所有 `.Result` 都必然死锁。即便没有这种上下文，阻塞也会白占线程并可能造成吞吐问题。通常让调用链一路 `await`；不要把 `ConfigureAwait(false)` 当作修复所有阻塞死锁的万能补丁，因为下层其他 `await` 仍可能捕获上下文，且已完成任务不会强制离开。
+
+UI/应用入口若要在等待后更新界面，保留默认 `await`，遵守框架的线程亲和要求。通用库内部若无需调用方上下文，可按库的约定在**每个相关等待点**考虑 `ConfigureAwait(false)`，但仍应保持异步调用链。ASP.NET Core 默认不设置自定义 `SynchronizationContext`，所以在其普通请求路径上两种写法通常没有可观察的“返回请求线程”差别；这不排除调用链里其他代码安装自定义上下文或调度器。
+
+## 面试自测与练习
+
+1. 为什么 `ConfigureAwait(false)` 后检查到相同线程号，不能证明它失效？
+2. 已完成任务下，为什么 `ConfigureAwait(false)` 不能保证离开 UI 上下文？
+3. 哪两个条件使“捕获单线程上下文 + `.Result`”有死锁风险？若一直 `await`，哪一个条件被解除？
+4. 把示例中的 `ReadTraceAsync` 改为默认 `await`，预测 `PostCount` 会怎样；注意要手动执行新投递的回调，否则例子会等待到超时。
+
+验收标准：能区分线程、`SynchronizationContext`、`TaskScheduler` 与 `ExecutionContext` 的角色；能运行 `dotnet run --project examples/csharp-async-context/AsyncContextReview.csproj` 并解释四组断言。正文完整代码块也由 `npm run test:csharp-articles` 编译。
+
+## 参考
+
+[.NET Blog：ConfigureAwait FAQ](https://devblogs.microsoft.com/dotnet/configureawait-faq/) · [Microsoft Learn：ExecutionContext 与 SynchronizationContext](https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/executioncontext-synchronizationcontext) · [`Task.ConfigureAwait` API](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.configureawait)

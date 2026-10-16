@@ -1,0 +1,90 @@
+---
+id: csharp-control-flow-methods
+title: 条件、循环与方法：把规则写清楚
+description: 使用 if、switch、foreach 和方法拆解输入验证与阈值判断。
+tags: [CSharp, 控制流, 方法]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-types-nullability]
+related: [csharp-classes-interfaces]
+---
+
+## 从一个判断开始
+
+设备读数有三种状态：低于阈值、达到阈值、输入无效。把规则写成条件分支，通常比把所有东西塞进一个三元表达式更容易维护。`if` 条件必须是 `bool`；C# 不会把数字零自动当成 false。
+
+```csharp filename="Program.cs"
+double reading = 72.5;
+double limit = 70;
+
+if (reading > limit)
+    Console.WriteLine("超限");
+else if (reading == limit)
+    Console.WriteLine("恰好达到阈值");
+else
+    Console.WriteLine("正常");
+```
+
+这里把「达到」与「超出」分开，是业务选择，不是语法规定。真实浮点测量值不宜把 `==` 当作通用近似比较；若来源已经按固定精度取整，可在明确规则后比较。
+
+## 用方法表达一条规则
+
+方法有返回类型、名称、参数列表和方法体。参数让规则不依赖硬编码的全局值，返回值让调用方决定如何显示。下面顶级语句后面的本地函数可以放在同一个 `Program.cs` 中运行。
+
+```csharp filename="Program.cs"
+double[] readings = [68.5, 70.0, 72.5];
+foreach (double value in readings)
+{
+    Console.WriteLine($"{value:F1}: {Classify(value, 70)}");
+}
+
+static string Classify(double value, double limit)
+{
+    if (value > limit) return "超限";
+    if (value == limit) return "达到阈值";
+    return "正常";
+}
+```
+
+`foreach` 逐项读取集合；不修改集合时优先考虑它。`for` 更适合明确需要索引的场景；`while` 更适合「条件满足就继续」但不知道次数的场景。循环必须有可能终止，否则会一直占用程序。
+
+## 输入是不可信的：用 `TryParse`
+
+`Console.ReadLine()` 返回 `string?`；用户可能直接回车、输入文字，也可能结束输入。`double.Parse` 遇到无效文本会抛异常。把「输入不合法」视为预期情况时，`TryParse` 更合适：它返回成功与否，并通过 `out` 给出解析值。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+Console.Write("输入温度，例如 72.5：");
+string? raw = Console.ReadLine();
+bool valid = double.TryParse(raw, NumberStyles.Float,
+    CultureInfo.InvariantCulture, out double temperature);
+
+if (!valid)
+{
+    Console.WriteLine("请输入有效数字，使用英文小数点");
+    return;
+}
+
+Console.WriteLine(temperature > 70 ? "超限" : "未超限");
+```
+
+这里显式指定 `InvariantCulture`，让示例使用英文小数点；实际面向用户的应用应决定是采用用户地区格式，还是明确规定协议格式。`return` 在顶级语句中结束程序；在普通方法中结束该方法。
+
+## `switch` 与作用域
+
+状态值固定且互斥时，`switch` 表达式能集中列出分支，例如 `int severity = value switch { < 60 => 0, < 70 => 1, _ => 2 };`。从上到下匹配，顺序很重要。花括号内声明的局部变量通常只在该块可见；不要让多个方法读写同一个可变全局变量来规避传参。
+
+## 动手练习
+
+1. 写 `Classify(double value, double warning, double danger)`，分别返回「正常」「预警」「危险」，并检查两个阈值的边界。
+2. 用 `while` 反复读取输入，输入 `q` 时退出；无效数字只提示重试，不让程序崩溃。
+3. 把分类逻辑改写为 `switch` 表达式，比较哪一种更符合自己的业务规则。
+
+验收标准：空输入、`abc`、阈值边界、正常值都经过测试；能说清参数和返回值各自的职责。
+
+## 参考
+
+[Microsoft Learn：选择语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/selection-statements) · [迭代语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/iteration-statements) · [方法](https://learn.microsoft.com/en-us/dotnet/csharp/methods)

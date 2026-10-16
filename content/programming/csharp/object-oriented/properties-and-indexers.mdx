@@ -1,0 +1,87 @@
+---
+id: csharp-properties-indexers
+title: 属性与索引器：暴露能力，不暴露无约束状态
+description: 比较字段、自动属性、计算属性、set/init/private set 与索引器，理解验证和对象不变量。
+tags: [CSharp, 属性, 索引器, 封装, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 15
+prerequisite: [csharp-classes-interfaces]
+related: [csharp-constructors-invariants, csharp-access-const-readonly]
+---
+
+## 属性不是“公开字段换一层花括号”
+
+字段是存储位置；属性用 `get`、`set` 或 `init` 访问器控制读取、赋值与计算。从外部看像成员访问，但访问器可执行验证。下面示例可作为完整 `Program.cs`：
+
+```csharp filename="Program.cs"
+var monitor = new Monitor("pump-A", 70) { Label = "主泵" };
+monitor.Add(72.5);
+Console.WriteLine($"{monitor.DeviceId}: {monitor[0]}, {monitor.Count}");
+monitor.ChangeLimit(75);
+Console.WriteLine(monitor.IsAlarm(72.5)); // False
+
+public sealed class Monitor
+{
+    private readonly List<double> _readings = [];
+    private double _limit;
+
+    public string DeviceId { get; }
+    public string? Label { get; init; }
+    public int Count => _readings.Count;
+    public double this[int index] => _readings[index];
+
+    public double Limit
+    {
+        get => _limit;
+        private set
+        {
+            if (!double.IsFinite(value))
+                throw new ArgumentOutOfRangeException(nameof(value));
+            _limit = value;
+        }
+    }
+
+    public Monitor(string deviceId, double limit)
+    {
+        DeviceId = !string.IsNullOrWhiteSpace(deviceId)
+            ? deviceId : throw new ArgumentException("设备 ID 不能为空", nameof(deviceId));
+        Limit = limit;
+    }
+
+    public void ChangeLimit(double value) => Limit = value;
+    public void Add(double value)
+    {
+        if (!double.IsFinite(value))
+            throw new ArgumentOutOfRangeException(nameof(value));
+        _readings.Add(value);
+    }
+    public bool IsAlarm(double value) => value >= Limit;
+}
+```
+
+`DeviceId` 是只能在创建阶段赋值的只读自动属性；`Label` 用 `init` 允许对象初始化器赋值，之后调用方不能再改；`Count` 每次从列表计算；`Limit` 的 setter 对外私有，由构造函数和 `ChangeLimit` 复用验证。`get` 也可能执行代码，所以一个复杂或昂贵的操作更适合明确命名的方法，不应让属性读取产生惊讶的 I/O 或长时间等待。
+
+## `required` 和 `init` 不替代业务校验
+
+`required string DeviceId { get; init; }` 可以要求调用方在受编译器检查的创建路径里提供值，却不能自动禁止空白字符串，也不能保证反序列化或反射输入满足领域规则。`init` 限制赋值时机，不会让引用对象内部深度不可变。跨属性不变量（例如下限小于上限）仍需在构造、工厂或明确操作边界验证；详见[构造函数与不变量](/knowledge/programming/csharp/object-oriented/constructors-and-invariants/)。
+
+属性也不是变量本身，不能把一般属性直接作为 `ref` / `out` 参数传递。把 `public List<T> Items { get; }` 写成只读属性，仍允许调用方通过返回的列表修改内部元素；只读的是**属性引用不能由外部重绑**，不等于集合只读。
+
+## 索引器何时合适
+
+`this[int index]` 让 `monitor[0]` 表示“第 0 条读数”。它像带参数的属性，适合本身就是集合或序列视图的类型。索引器不应掩盖昂贵的远程查询或不明显的副作用。这里没有 `set`，因此外部不能通过 `monitor[0] = ...` 修改；越界行为由底层 `List<T>` 抛异常，真实 API 也可以提供 `TryGet` 来表达可预期的缺失。
+
+## 面试自测与练习
+
+1. `get`-only、`private set` 与 `init` 的外部赋值时机有什么不同？
+2. `Count => _readings.Count` 有额外存储字段吗？若属性读取会发网络请求，设计上有什么问题？
+3. `public List<double> Readings { get; }` 能否防止调用方执行 `Readings.Add(...)`？
+4. `monitor[0]` 是数组访问吗？为什么它可以像数组一样使用方括号？
+
+验收标准：能为状态变化选择验证边界，并说明索引器与普通属性的使用场景。
+
+## 参考
+
+[Microsoft Learn：属性](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/properties) · [使用属性](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/using-properties) · [索引器](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/indexers/)

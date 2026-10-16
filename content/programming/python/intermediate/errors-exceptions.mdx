@@ -1,0 +1,124 @@
+---
+id: python-errors-exceptions
+title: 异常处理
+description: 理解异常是什么，学会用 try / except 优雅地处理出错情况。
+tags: [Python, 异常, try-except]
+difficulty: beginner
+status: draft
+updated: "2026-10-13"
+order: 10
+prerequisite: [python-modules-pip]
+related: [python-files]
+---
+
+## 程序出错是常态
+
+前面我们见过不少报错：除以零、访问不存在的列表下标、打开不存在的文件。这类运行中的错误叫**异常**（exception）。默认情况下，异常一出现程序立刻终止——但对用户友好的程序应该能"接住"错误，给出提示后继续运行。
+
+## 认识几种常见异常
+
+| 异常 | 触发场景 | 例子 |
+|------|----------|------|
+| `ZeroDivisionError` | 除以零 | `10 / 0` |
+| `ValueError` | 值的类型对但内容不合法 | `int("abc")` |
+| `TypeError` | 类型用错 | `"1" + 1` |
+| `IndexError` | 下标越界 | `[1, 2][5]` |
+| `KeyError` | 字典键不存在 | `{"a": 1}["b"]` |
+| `FileNotFoundError` | 文件不存在 | `open("no.txt")` |
+| `NameError` | 名字未定义 | `print(nmae)`（拼错的变量） |
+
+```python filename="errors.py"
+print(10 / 0)
+# ZeroDivisionError: division by zero
+```
+
+读报错信息的顺序：先看**最后一行**的异常名和说明，再往上看是**哪一行**触发的。
+
+## try / except：接住异常
+
+把可能出错的代码放进 `try`，出错的应对写进 `except`：
+
+```python filename="try-basic.py"
+try:
+    number = int(input("请输入一个整数："))
+    print(f"你输入的是 {number}")
+except ValueError:
+    print("这不是一个合法的整数")
+```
+
+流程：`try` 里的代码正常运行就跳过 `except`；一旦抛出 `ValueError`，立刻跳到对应的 `except` 块，程序不会崩溃。
+
+<Callout type="warning" title="不要写裸 except">
+
+只写 `except:`（不指定异常类型）会把所有错误都吞掉，包括你拼写错误造成的 `NameError`——这会让真正的 bug 被藏起来。永远写明要接住的异常类型。
+
+</Callout>
+
+## 多个 except 与异常对象
+
+```python filename="multi-except.py"
+try:
+    a = int(input("分子："))
+    b = int(input("分母："))
+    print(a / b)
+except ValueError:
+    print("请输入数字")
+except ZeroDivisionError:
+    print("分母不能为零")
+except Exception as e:
+    print(f"其他错误：{e}")
+```
+
+- 多个 `except` 从上到下匹配，只执行第一个命中的
+- `except Exception as e` 把异常对象存进变量 `e`，可以打印细节
+- `Exception` 是大多数异常的父类，放在最后兜底
+
+## else 与 finally
+
+```python filename="else-finally.py"
+try:
+    value = int(input("数字："))
+except ValueError:
+    print("输入不合法")
+else:
+    print(f"成功拿到 {value}")   # 只在没出错时执行
+finally:
+    print("无论如何我都会运行")   # 无论如何都执行
+```
+
+`finally` 特别适合放"必须做的收尾"——比如关闭文件、断开连接，出错也不耽误。
+
+## 主动抛出异常：raise
+
+发现程序自己处理不了的情况，可以主动喊停：
+
+```python filename="raise.py"
+def set_age(age):
+    if age < 0:
+        raise ValueError("年龄不能为负数")
+    print(f"年龄已设为 {age}")
+
+set_age(20)     # 正常
+set_age(-5)     # ValueError: 年龄不能为负数
+```
+
+<Callout type="tip" title="什么时候该处理，什么时候该抛出">
+
+底层的函数发现问题就抛出（raise）；知道如何向用户解释的层面再捕获（try）。不要在每一层都 try——接住了却什么都不做（空 except）是最糟糕的写法。
+
+</Callout>
+
+## 动手试一试
+
+1. 写一个"安全除法"函数 `safe_divide(a, b)`：b 为 0 时返回 None 并打印提示，否则返回结果。
+2. 循环读取用户输入，直到输入的内容能转成整数为止（用 try/except + while）。
+3. 故意制造一个 `KeyError`，读一遍完整报错信息，练习按"最后一行 → 行号"的顺序定位。
+
+<Quiz
+  question="try 块里发生了 ZeroDivisionError，except 里只写了 except ValueError，会怎样？"
+  options={["自动忽略，继续运行", "执行 except ValueError 块", "异常未被接住，程序崩溃并打印错误", "程序卡住不动"]}
+  answer={2}
+  explanation="except 只接住指定类型的异常。ZeroDivisionError 不是 ValueError，不会被接住，程序按默认方式崩溃。想兜底可以再加 except Exception as e。"
+/>
+
+<FlashCard front="try / except / else / finally 各自什么时候执行？" back="try 总是先执行；except 在对应类型的异常发生时执行；else 在 try 完全没出错时执行；finally 无论如何都会执行（出错与否）。" />

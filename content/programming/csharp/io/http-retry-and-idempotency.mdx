@@ -1,0 +1,154 @@
+---
+id: csharp-io-http-retry-idempotency
+title: HTTP 重试与幂等：何时能再发一次请求
+description: 用可控 HttpMessageHandler 验证有限 GET 重试、失败分类、响应释放与取消，辨认 POST 重复副作用风险。
+tags: [CSharp, HttpClient, HTTP, 重试, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-14"
+order: 47
+prerequisite: [csharp-io-testable-http-download, csharp-cancellation-throttling]
+related: [csharp-io-network-streams, csharp-io-complete-file-publication, csharp-io-http-retry-after-budget]
+---
+
+## 重试不是“遇到异常再调用一次”
+
+在[可测试 HTTP 下载](/knowledge/programming/csharp/io/testable-http-download/)中，我们验证了单次请求的状态码、正文上限与取消。再往前一步，调用方常想在服务暂时不可用时重试。但客户端没收到成功响应，并不能证明服务器**没有执行**请求：响应可能在回程丢失。若请求创建订单、扣款或追加记录，盲目再发一次可能重复副作用。
+
+HTTP 规范把 GET 等方法定义为“安全”（意图上只读取），把安全方法以及 PUT、DELETE 定义为幂等：相同请求重复多次，对服务器的**预期效果**应与一次相同。幂等不等于每次响应完全一样，更不等于真实服务一定正确实现了协议。POST 通常不具备这个保证；只有应用自己建立稳定的幂等键、去重存储或其他明确协议，才可讨论安全重试。不要从方法名独自推断业务实现。
+
+本篇只示范一个很窄的教学策略：**仅 GET，在收到 503 时，最多发送 `maxAttempts` 次**。400 视为调用错误，不重试；最后仍是 503 时返回失败。网络异常、超时、429、502、504、`Retry-After` 与生产退避都没有被这个小方法覆盖。范围刻意收窄，避免让一段短代码冒充通用弹性策略。
+
+完成本篇后，可接着读[Retry-After 与预算](/knowledge/programming/csharp/io/http-retry-after-and-budget/)：那里用可控时间验证等待提示、剩余预算门槛和取消，不把即时重试当生产退避。
+
+## 确定性示例：按序返回状态码
+
+示例注入 `HttpMessageHandler`，不访问 `example.invalid`，也不靠真实时间或 `Task.Delay` 验证次数。在仓库根目录运行 `dotnet run --project examples/csharp-http-retry/HttpRetryReview.csproj`。
+
+```csharp filename="Program.cs"
+using System.Net;
+
+Uri address = new("https://example.invalid/readings");
+
+using (var handler = new SequenceHandler(HttpStatusCode.ServiceUnavailable, HttpStatusCode.OK))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    string body = await GetWithRetryAsync(client, address, 3, CancellationToken.None);
+    Check(body == "ok" && handler.Calls == 2 && handler.DisposedContents == 2,
+        "a temporary 503 is retried and both responses are released");
+}
+
+using (var handler = new SequenceHandler(HttpStatusCode.BadRequest, HttpStatusCode.OK))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    await ExpectAsync<HttpRequestException>(() => GetWithRetryAsync(
+        client, address, 3, CancellationToken.None));
+    Check(handler.Calls == 1 && handler.DisposedContents == 1,
+        "a 400 is not treated as transient");
+}
+
+using (var handler = new SequenceHandler(HttpStatusCode.ServiceUnavailable))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    await ExpectAsync<HttpRequestException>(() => GetWithRetryAsync(
+        client, address, 3, CancellationToken.None));
+    Check(handler.Calls == 3 && handler.DisposedContents == 3,
+        "maxAttempts includes the initial request and stops after three sends");
+}
+
+using (var handler = new SequenceHandler(HttpStatusCode.OK))
+using (var client = new HttpClient(handler, disposeHandler: false))
+using (var stop = new CancellationTokenSource())
+{
+    stop.Cancel();
+    await ExpectAsync<OperationCanceledException>(() => GetWithRetryAsync(
+        client, address, 3, stop.Token));
+    Check(handler.Calls == 0, "cancellation prevents the next send");
+}
+
+Console.WriteLine("HTTP 有限重试、失败分类、取消与资源释放断言全部通过。");
+
+static async Task<string> GetWithRetryAsync(HttpClient client, Uri address,
+    int maxAttempts, CancellationToken cancellationToken)
+{
+    ArgumentOutOfRangeException.ThrowIfLessThan(maxAttempts, 1);
+    for (int attempt = 1; attempt <= maxAttempts; attempt++)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        using var request = new HttpRequestMessage(HttpMethod.Get, address);
+        using HttpResponseMessage response = await client.SendAsync(request,
+            HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+        if (response.StatusCode == HttpStatusCode.ServiceUnavailable && attempt < maxAttempts)
+            continue;
+        response.EnsureSuccessStatusCode();
+        return await response.Content.ReadAsStringAsync(cancellationToken);
+    }
+    throw new InvalidOperationException("Unreachable retry state.");
+}
+
+static async Task ExpectAsync<T>(Func<Task> action) where T : Exception
+{
+    try { await action(); }
+    catch (T) { return; }
+    throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+sealed class SequenceHandler(params HttpStatusCode[] statuses) : HttpMessageHandler
+{
+    public int Calls { get; private set; }
+    public int DisposedContents { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (request.Method != HttpMethod.Get) throw new InvalidOperationException("GET only");
+        HttpStatusCode status = statuses[Math.Min(Calls, statuses.Length - 1)];
+        Calls++;
+        return Task.FromResult(new HttpResponseMessage(status)
+        {
+            Content = new TrackedContent(() => DisposedContents++)
+        });
+    }
+}
+
+sealed class TrackedContent(Action onDispose) : StringContent("ok")
+{
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) onDispose();
+        base.Dispose(disposing);
+    }
+}
+```
+
+每次尝试新建 `HttpRequestMessage`，避免重用一次性消息对象；`using` 让 503 后继续下一次之前释放该次响应。`maxAttempts` 包含第一次请求，而不是“额外重试次数”。请求发出前检查取消，并把令牌传入 `SendAsync` 和正文读取。教学处理器记录 `DisposedContents` 只是验证资源边界；真实服务还需关注连接池、调用方管理的 `HttpClient` 生命周期与响应体处理。
+
+示例只读取固定的短文本。`ReadAsStringAsync` 并不提供未知大小正文的内存上限；对于真实下载，仍要沿用[流式限额和失败处理](/knowledge/programming/csharp/io/testable-http-download/)中的边界。GET 也不意味着下载后写文件是幂等的；本地目标文件如何清理和发布由另一套[文件完整发布协议](/knowledge/programming/csharp/io/complete-file-publication/)负责。
+
+## 生产策略要多回答四个问题
+
+1. **能否重复？** 按具体服务契约判断请求是否幂等。超时/断线后，服务端可能已执行。对写请求，优先明确幂等键与服务端去重期限、原请求结果查询方式；仅在客户端生成新键再试，反而可能制造第二次操作。
+2. **何种失败重试？** 本例只认 503，不把所有 4xx/5xx 或异常视为暂时故障。`429`、`Retry-After` 和其他状态需按 API 合约处理；认证失败、参数错误通常需要修正请求，而非放大流量。
+3. **何时停止？** 除尝试次数，还需要总时间预算、单次超时、可取消的退避等待，以及观测指标。即时连发可能加重过载；生产通常采用受限退避与抖动，并尊重服务端的等待提示。
+4. **结果归谁？** 每次失败响应要释放，最终失败要上报；不能将最后一次非成功状态伪装为成功。即使请求成功，正文读取和落盘也可能失败，要单独处理半成品。
+
+.NET 的 HTTP resilience handler 可提供重试、超时等策略，但其标准配置默认可能对所有 HTTP 方法启用重试。使用它时仍应按 API 契约配置方法与结果筛选；添加一个包不会自动让 POST 具备幂等性。本例手写循环是为了教学观察，不建议在每个业务方法里复制一套未经统一治理的生产重试框架。
+
+## 自测
+
+1. 若状态依次是 503、503、200，`maxAttempts=2` 时会发几次？最终结果是什么？
+2. 把第一项请求换成“创建订单”的 POST，服务器处理成功但响应丢失时，客户端为何无法仅凭超时决定能否重试？
+3. 503 携带 `Retry-After` 时，本例有什么缺陷？如果调用方同时设置总截止时间，应如何决定是否继续等待？
+4. 为什么 `using HttpResponseMessage` 不等于“已把正文安全写入文件”？
+
+验收标准：先说出请求是否可重复、失败是否暂时、次数和时间预算以及最终结果责任，再决定是否加重试。
+
+## 参考
+
+[RFC 9110：幂等方法](https://www.rfc-editor.org/rfc/rfc9110.html#section-9.2.2) · [503 Service Unavailable](https://www.rfc-editor.org/rfc/rfc9110.html#section-15.6.4) · [Microsoft Learn：HTTP resilience](https://learn.microsoft.com/en-us/dotnet/core/resilience/http-resilience)

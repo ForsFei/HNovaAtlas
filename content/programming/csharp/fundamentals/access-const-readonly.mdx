@@ -1,0 +1,92 @@
+---
+id: csharp-access-const-readonly
+title: 访问修饰符、const 与 readonly
+description: 理解类型和成员的可见范围、编译期常量与运行时只读字段，并辨析常见面试陷阱。
+tags: [CSharp, 关键字, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 50
+prerequisite: [csharp-parameters-overloads]
+related: [csharp-classes-interfaces, csharp-chapter-map]
+---
+
+## 访问级别是在保护设计边界
+
+访问修饰符决定哪些代码能使用类型或成员，不是“为了面试记六个单词”。公开的 API 一旦被别的项目依赖，就更难随意修改。把实现细节保持 `private`，把同程序集协作限定为 `internal`，只公开调用方真正需要的能力，有助于保持不变量。
+
+| 修饰符 | 能访问的典型范围 | 常见用途 |
+| --- | --- | --- |
+| `public` | 只要包含类型可见，其他程序集也可访问 | 明确的对外 API |
+| `internal` | 同一程序集 | 同一项目内部协作 |
+| `private` | 当前类型内部 | 字段和实现细节 |
+| `protected` | 当前类及派生类 | 受控的继承扩展点 |
+| `protected internal` | 同程序集，或其他程序集中的派生类 | 需要两种入口之一 |
+| `private protected` | 同程序集中的派生类 | 更窄的继承扩展点 |
+
+这张表描述常见类成员情形；顶层类型、嵌套类型、接口成员和结构体成员的合法修饰符并不完全相同。顶层 `class` 未写访问修饰符时默认 `internal`；类成员未写时通常默认 `private`。新版本 C# 还有文件范围的 `file` 修饰符，用于把顶层类型限制在单个源文件。不要把 `protected internal` 理解为“两者都必须满足”；需要同时满足同程序集和派生关系时是 `private protected`。
+
+## 用构造函数守住状态
+
+```csharp filename="Program.cs"
+var monitor = new Monitor("pump-A", 70);
+Console.WriteLine(monitor.IsAlarm(72));
+
+public sealed class Monitor
+{
+    private readonly string _deviceId;
+    public double Limit { get; private set; }
+
+    public Monitor(string deviceId, double limit)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+            throw new ArgumentException("设备 ID 不能为空", nameof(deviceId));
+        if (!double.IsFinite(limit))
+            throw new ArgumentOutOfRangeException(nameof(limit));
+        _deviceId = deviceId;
+        Limit = limit;
+    }
+
+    public bool IsAlarm(double value) => value >= Limit;
+    public override string ToString() => _deviceId;
+}
+```
+
+调用方能读 `Limit`，却不能绕过验证直接修改它。`private set` 是一个访问控制决定；如果业务确实需要修改阈值，应提供验证后的方法，而不是把 setter 改为 `public`。`readonly` 字段 `_deviceId` 可在声明或构造函数中赋值，此后不能重新赋值。
+
+## `const` 与 `readonly` 不是同一种“不能改”
+
+`const` 表示编译期常量，声明时必须用可作为常量的表达式初始化，常见于 `int`、`string` 等值；它隐含静态语义。`readonly` 字段可以在声明或构造函数中赋值，值到运行时才确定；`static readonly` 可以用于全类型共享但运行时确定的值。公开库中的 `const` 值可能被使用方编译进自己的程序集，因此改变库常量后，未重新编译的使用方可能仍持有旧值；这也是对可能变化的公开值考虑 `static readonly` 的原因之一。
+
+```csharp filename="Program.cs"
+Console.WriteLine(Settings.DefaultLimit);      // 70
+Console.WriteLine(Settings.CreatedAt <= DateTimeOffset.UtcNow);
+
+public static class Settings
+{
+    public const int DefaultLimit = 70;
+    public static readonly DateTimeOffset CreatedAt = DateTimeOffset.UtcNow;
+}
+```
+
+`readonly` 限制的是字段的重新赋值，不保证它引用的对象内容不可变。`readonly List<int> values = []` 不能改成指向另一个列表，但仍可 `values.Add(1)`。若需要不变集合，应设计不可变 API、使用合适的只读/不可变类型，并注意只读视图与不可变快照不同。`init` 属性又是另一种“只允许初始化阶段赋值”的语法，不要与 `readonly` 字段当作同一个东西。
+
+## 高频面试追问
+
+**问：`public` 成员放在 `internal` 类里，外部项目能直接调用吗？** 通常不能，因为包含类型先要可见；成员的可见性不能突破包含类型的边界。
+
+**问：`protected internal` 和 `private protected` 谁更宽？** 前者是同程序集或外部派生类，后者要求同程序集中的派生类；前者更宽。不要只背中文翻译，画两个程序集和两个类来验证。
+
+**问：`readonly` 可以保证线程安全吗？** 不可以。字段不被重绑定，不等于其引用对象不可变，更不等于多线程访问被同步。
+
+## 动手练习与验收
+
+1. 给 `Monitor` 增加 `ChangeLimit`，要求拒绝 NaN、无穷大和业务规定范围外的阈值；不要公开 setter。
+2. 尝试在普通方法中给 `_deviceId` 再赋值，观察编译器错误；再创建一个 `readonly List<int>` 并调用 `Add`，解释为何能编译。
+3. 用两个控制台/类库项目验证 `internal` 的跨程序集边界，而不是只在同一个文件里猜测。
+
+验收标准：能解释访问范围、`const` 与 `readonly` 的赋值时机，并指出“只读字段”不等于“深度不可变对象”。下一步可继续[对象建模](/knowledge/programming/csharp/object-oriented/classes-and-interfaces/)。
+
+## 参考
+
+[Microsoft Learn：访问修饰符](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/access-modifiers) · [字段](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/fields) · [const](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/const)

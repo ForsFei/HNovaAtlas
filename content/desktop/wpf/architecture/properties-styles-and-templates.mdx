@@ -1,0 +1,124 @@
+---
+id: wpf-properties-styles-and-templates
+title: WPF 依赖属性、路由事件与样式模板：值和外观从哪里来
+description: 用可运行对照程序区分本地值与样式、附加属性、冒泡事件，以及 Style、ControlTemplate 和 DataTemplate 的职责。
+tags: [WPF, XAML, 依赖属性, 路由事件, 样式, 模板, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-16"
+order: 30
+prerequisite: [wpf-commands-and-validation]
+related: [wpf-learning-path, wpf-mvvm, wpf-ui-thread-and-async]
+---
+
+## 从现象入手：为什么样式没有“生效”
+
+在[命令与输入验证](/knowledge/desktop/wpf/architecture/commands-and-validation/)中，我们用绑定和命令控制数据与动作。本篇聚焦另一组常见疑惑：一个按钮同时有样式和 `Background` 属性时究竟显示谁的颜色？`Grid.Row` 写在子元素上为何由父布局使用？换 `ControlTemplate` 与改 `Style` 是否一回事？
+
+运行 `dotnet run --project examples/wpf-properties-and-templates/WpfPropertiesAndTemplates.csproj`，窗口并排展示“仅样式”“本地背景覆盖”“更换控件模板”三个按钮，另有自定义状态徽标和使用数据模板的读数列表。点击任意按钮，父容器显示收到的 `Click`。示例是**对照实验**，不是一套可直接用于生产的主题。
+
+## 依赖属性不是普通字段，也不是 ViewModel 通知
+
+WPF 控件的许多属性是依赖属性。有效值可能来自默认元数据、继承、样式 setter、触发器、本地设置、绑定、动画或强制值；属性系统按优先级决定最终结果。[Microsoft Learn：依赖属性概览](https://learn.microsoft.com/dotnet/desktop/wpf/advanced/dependency-properties-overview)说明了属性系统提供的绑定、样式等能力。
+
+本例用一个刻意简单的 `StatusBadge` 演示注册：标识符是静态只读字段，CLR 包装器调用 `GetValue`/`SetValue`。模板里的 `TemplateBinding StatusText` 读取它。默认值“待机”来自元数据，XAML 中 `StatusText="运行中"` 是该实例的本地值。
+
+```csharp filename="StatusBadge.cs"
+public sealed class StatusBadge : Control
+{
+    public static readonly DependencyProperty StatusTextProperty =
+        DependencyProperty.Register(
+            nameof(StatusText), typeof(string), typeof(StatusBadge),
+            new PropertyMetadata("待机"));
+
+    public string StatusText
+    {
+        get => (string)GetValue(StatusTextProperty);
+        set => SetValue(StatusTextProperty, value);
+    }
+}
+```
+
+不必把所有 ViewModel 属性也改写成依赖属性。前篇 ViewModel 的普通 CLR 属性配合 `INotifyPropertyChanged` 已能作为**绑定源**通知视图；这里的依赖属性主要是 WPF 控件/元素参与属性系统的属性。自定义可复用控件需要绑定、模板或样式能力时才考虑注册合适的依赖属性，而不是为了“更高级”一律注册。
+
+## 值优先级：本地值为何盖过样式
+
+三个按钮复用一个 `Style`。第一个只拿到样式 setter 的浅蓝背景；第二个又在自身写 `Background="#FFD6B6"`，因此显示本地设置的颜色。即便两个值都在 XAML 中，来源层级也不同。对于这个无动画、无强制值的例子，**本地值高于样式 setter**；绑定或资源表达式若设置在本地位置，也以本地值参与优先级。[完整优先级表](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/properties/dependency-property-value-precedence)还包括动画、模板触发器等层次，不应把“本地值总是最高”当成无条件规则。
+
+```xml filename="MainWindow.xaml"
+<Style x:Key="ActionStyle" TargetType="Button">
+    <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+    <Setter Property="Padding" Value="12,8" />
+</Style>
+
+<Button Content="仅样式" Style="{StaticResource ActionStyle}" />
+<Button Content="本地背景覆盖" Style="{StaticResource ActionStyle}"
+        Background="#FFD6B6" />
+```
+
+`AccentBrush` 是窗口资源，`StaticResource` 按资源查找规则引用它；这里不需要动态切换资源。测试使用 `DependencyPropertyHelper.GetValueSource` 确认背景先来自 `Style`、设本地值后变为 `Local`，再调用 `ClearValue` 后恢复样式值。`ClearValue` 只清除这一次本地来源，并不保证结果一定回到元数据默认值。
+
+## 附加属性：子元素携带给容器的信息
+
+`Grid.Row="2"` 写在子元素上，却是 `Grid` 定义并在布局时读取的附加属性。它不表示子元素自身拥有一个普通的 `Row` CLR 属性，也不意味着任意父容器都会理解它。示例用 `Grid.SetRow(button, 1)` / `Grid.GetRow(button)` 断言这个值确实存于子对象的属性系统中。[官方附加属性概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/properties/attached-properties-overview)说明了这种跨类型设置机制。
+
+```xml filename="MainWindow.xaml"
+<TextBlock Grid.Row="3" Text="数据模板：同一列表项的呈现" />
+<ListBox Grid.Row="4" ItemTemplate="{StaticResource ReadingTemplate}" />
+```
+
+自定义附加属性也可以通过 `RegisterAttached` 及静态 `Get...`/`Set...` 访问器定义，但只有当多个其他类型确实要携带同一上下文信息时才值得抽象。本节先掌握使用和读取，不为一个窗口新增无用的附加属性。
+
+## 路由事件：监听者未必是事件源
+
+三个按钮的共同父容器注册一次 `ButtonBase.ClickEvent` 处理器。用户点子按钮时，`Click` 作为冒泡路由事件向父级传播；处理器中的 `sender` 是注册监听的父 `StackPanel`，`e.Source` 是发出 Click 的按钮。按钮内部模板可能有更深的视觉元素，不能简单地把处理器参数 `sender` 当成“被点的按钮”。[官方路由事件概览](https://learn.microsoft.com/dotnet/desktop/wpf/events/routed-events-overview)区分冒泡、隧道和直接路由。
+
+```csharp filename="MainWindow.xaml.cs"
+Actions.AddHandler(ButtonBase.ClickEvent, new RoutedEventHandler(Actions_Click));
+
+private void Actions_Click(object sender, RoutedEventArgs e)
+{
+    if (e.Source is Button button)
+        RouteText.Text = $"父容器收到来自“{button.Content}”的冒泡 Click。";
+}
+```
+
+这里的 code-behind 只观察 UI 路由，不承担参数编辑业务。不是每个 .NET 事件都能沿树传播；`Handled` 还可能影响后续普通处理器，因此调试时要先确认事件类型和实际路线。前篇的 `ICommand` 解决“动作可否执行、执行什么”，路由事件解决“UI 事件沿哪些元素传播”，两者不能互相替代。
+
+## Style、ControlTemplate、DataTemplate 的边界
+
+| 机制 | 本例用途 | 容易混淆的点 |
+| --- | --- | --- |
+| `Style` | 给多个按钮复用背景、边框、内边距 | setter 设置属性，不等于重写控件视觉树 |
+| `ControlTemplate` | 将第三个按钮的结构换成圆角边框 + 内容呈现器；也定义状态徽标外观 | 是控件的视觉结构，替换模板意味着要负责保留需要的状态、焦点和可访问性反馈 |
+| `DataTemplate` | 把每个 `ReadingSnapshot` 显示为“设备 + 温度”一行 | 描述数据项如何显示，不是 `ListBox` 自己的控件模板 |
+
+本例的 `CompactButtonTemplate` 使用 `TemplateBinding` 接收按钮的背景与内边距，并用 `ContentPresenter` 显示内容；否则重写模板后可能出现“按钮文字没了”。它只补了禁用态透明度，并未完整处理键盘焦点、悬停、按下、主题与高对比度，所以不能当生产模板照搬。官方[样式与模板概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/controls/styles-templates-overview)明确指出，更换 `ControlTemplate` 是替换整个视觉树，而 `DataTemplate` 呈现数据。
+
+```xml filename="MainWindow.xaml"
+<ControlTemplate x:Key="CompactButtonTemplate" TargetType="Button">
+    <Border Background="{TemplateBinding Background}"
+            Padding="{TemplateBinding Padding}" CornerRadius="9">
+        <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+    </Border>
+</ControlTemplate>
+
+<DataTemplate x:Key="ReadingTemplate">
+    <StackPanel Orientation="Horizontal">
+        <TextBlock Text="{Binding Device}" />
+        <TextBlock Text="{Binding Temperature}" />
+    </StackPanel>
+</DataTemplate>
+```
+
+上段只保留两种模板的关键差异；完整 XAML 包括边框、禁用态、网格列和状态徽标，在 `examples/wpf-properties-and-templates/MainWindow.xaml`。`DataTemplate` 内的绑定源是当前 `ReadingSnapshot`，不是窗口或按钮。
+
+## 验证和面试自测
+
+运行 `dotnet run --project examples/wpf-properties-and-templates-checks/PropertySystemChecks.csproj`，可确定性验证自定义依赖属性默认/本地值、背景来源的 `Style → Local → Style` 变化、`Grid.Row` 的读写和 `Click` 向父容器冒泡。它不加载窗口 XAML，也不证明三种模板最终像素、焦点和不同系统主题表现；这些仍需打开 WPF 窗口观察。
+
+1. 样式里给按钮设置背景，同时按钮实例也写了 `Background`，通常谁生效？动画存在时答案仍相同吗？
+2. `Grid.Row` 为什么放在子元素上？把该元素移到 `StackPanel` 后这个值还有布局意义吗？
+3. 父容器处理子按钮的 `Click` 时，`sender` 与 `e.Source` 各指向谁？
+4. 只想复用背景和内边距，为什么不必更换 `ControlTemplate`？要更换时最容易遗漏哪些状态？
+5. 列表每行的数据显示方式应先看 `DataTemplate`，还是先改 `ListBox` 的 `ControlTemplate`？

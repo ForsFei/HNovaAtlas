@@ -1,0 +1,77 @@
+---
+id: csharp-arrays-strings
+title: 数组与字符串：固定长度、不可变文本和比较规则
+description: 以复制、切片和设备 ID 比较为例，理解数组、交错数组、string 与 StringBuilder 的边界。
+tags: [CSharp, 数组, 字符串, StringBuilder, 面试]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 27
+prerequisite: [csharp-types-nullability]
+related: [csharp-unicode-text-elements-normalization, csharp-collections-generics, csharp-collection-selection, csharp-spans-memory-pooling]
+---
+
+## 数组长度固定，元素可以变
+
+数组是引用类型；创建后维数和每维长度固定，但元素通常可以修改。`Length` 是总元素数，单维数组合法索引为 `0` 到 `Length - 1`。下面整段可放进一个 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+int[] readings = [68, 72, 85];
+int[] alias = readings;
+alias[0] = 69;
+Console.WriteLine(readings[0]); // 69：两个变量指向同一数组
+
+int[] copied = readings[1..];
+copied[0] = 99;
+Console.WriteLine(readings[1]); // 72：数组范围切片生成新数组
+
+Span<int> view = readings.AsSpan(1);
+view[0] = 73;
+Console.WriteLine(readings[1]); // 73：Span 是原数组区间的视图
+```
+
+要区分**复制数组引用**、**复制元素到新数组**和**创建视图**。`Span<T>` 不拥有这里的数组数据，适合局部高效处理；它有受限的生命周期，不能像普通数组一样随意保存在堆对象字段里。对外暴露可变数组会让调用方改掉内部状态；需要更稳定的 API 时可返回快照，或只暴露只读接口并明确底层是否仍会变化。
+
+## 矩形数组和交错数组不是一回事
+
+`int[,] grid = new int[2, 3]` 是二维矩形数组，每行同宽，用 `grid[0, 1]` 访问；`int[][] rows = [[1], [2, 3]]` 是“数组的数组”，各行可不同长，用 `rows[1][0]` 访问。后者的内层数组本身是引用，也可能为 `null`；不能把两者的 `Length`、行数与索引写法混用。
+
+数组与 `List<T>` 的关键区别之一是容量：需求是随时增删且不要求固定长度时，通常先考虑 `List<T>`；集合选型可继续读[集合与泛型](/knowledge/programming/csharp/collections/collections-and-generics/)和[集合选型](/knowledge/programming/csharp/collections/collection-selection-and-equality/)。
+
+引用类型数组还有一个历史兼容陷阱：`string[]` 可以赋给 `object[]`，但底层仍是字符串数组，往里面写整数会在运行时抛 `ArrayTypeMismatchException`。这种协变并不等于写入安全；泛型集合的变型规则另见[协变与逆变](/knowledge/programming/csharp/generics/variance/)。
+
+## `string` 是不可变的引用类型
+
+字符串拼接、替换、大小写转换都返回新字符串，不会原地改写旧对象。设备标识符的相等规则要按业务选：机器标识通常更适合明确的 `StringComparison.Ordinal` 或 `OrdinalIgnoreCase`，面向用户显示/排序才考虑区域性规则。不要在持久化键或协议字段上默默依赖当前系统文化。
+
+```csharp filename="Program.cs"
+using System.Text;
+
+string device = "pump-A";
+string normalized = device.ToUpperInvariant();
+Console.WriteLine(device); // pump-A，原值没变
+Console.WriteLine(string.Equals("pump-A", "PUMP-A",
+    StringComparison.OrdinalIgnoreCase)); // True
+
+var builder = new StringBuilder();
+foreach (string part in new[] { "pump", "-", "A" })
+    builder.Append(part);
+Console.WriteLine(builder.ToString()); // pump-A
+```
+
+少量固定片段用插值或 `+` 足够清楚；在循环中累加大量片段且产生很多中间字符串时，再考虑 `StringBuilder`，但仍应测量真实瓶颈。`string.Length` 统计 UTF-16 代码单元，不一定等于用户眼中的字符数；截取多语言文本时不能简单假设一个可见字符只占一个 `char`。
+
+进一步看[Unicode 文本边界](/knowledge/programming/csharp/fundamentals/unicode-text-elements-and-normalization/)：用代理对、组合音调和规范等价文本实际区分 `char`、`Rune` 与文本元素。
+
+## 面试自测与练习
+
+1. `int[] second = first;` 后修改 `second[0]`，`first` 会怎样？改成 `first[1..]` 呢？
+2. `int[,]` 与 `int[][]` 的长度、索引和可变行长有什么区别？
+3. 为什么按设备 ID 去重时应该先确定大小写比较规则，而不是只调用默认 `ToLower()`？
+4. `string` 是引用类型，为什么很多修改操作又像“值没有被共享修改”？
+
+验收标准：能预测三种数组复制/视图的输出，给文本比较选择明确的 `StringComparison`。
+
+## 参考
+
+[Microsoft Learn：数组](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/arrays) · [字符串](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/strings/) · [比较字符串](https://learn.microsoft.com/en-us/dotnet/csharp/how-to/compare-strings)

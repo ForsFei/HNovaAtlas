@@ -1,0 +1,89 @@
+---
+id: wpf-dashboard-integration-and-testing
+title: WPF 小型整合：模拟读数面板、状态测试与发布边界
+description: 将布局、绑定、命令、异步取消和集合视图组合成可运行的模拟设备面板，并区分 ViewModel 断言、桌面验收与发布检查。
+tags: [WPF, MVVM, 集成测试, 桌面发布, CancellationToken, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-16"
+order: 60
+prerequisite: [wpf-commands-and-validation, wpf-ui-thread-and-async, wpf-collection-views-and-virtualization]
+related: [wpf-learning-path, wpf-mvvm, wpf-properties-styles-and-templates]
+---
+
+## 把前六步接起来，但只做一个小系统
+
+这一步的可运行程序是**本地模拟设备读数面板**，不是设备驱动、工业控制系统或遥测服务。它每次生成 24 条确定性读数，等待两秒以模拟外部读取；可观察读取中状态、取消、故障、阈值编辑和列表筛选。运行：
+
+```powershell
+dotnet run --project examples/wpf-reading-dashboard/WpfReadingDashboard.csproj
+```
+
+窗口上方是状态与操作，中间是本地报警阈值，下方是读数列表。`Grid` 的最后一行使用 `*` 给列表有界视口；`ListBox` 绑定集合视图并保持 UI 虚拟化配置。24 条数据不足以证明虚拟化带来可测收益；它只是延续前篇正确的列表结构。[列表与性能](/knowledge/desktop/wpf/architecture/collection-views-and-virtualization/)中另有大列表对照。
+
+| 层 | 本例职责 | 明确不做 |
+| --- | --- | --- |
+| `SimulatedReadingFeed` | 可取消地等待并返回一批模拟快照；可注入一次故障 | 不接串口、PLC、数据库或网络 |
+| `DashboardViewModel` | 管理读取状态、旧批次保留、阈值验证、报警计算、筛选条件 | 不持有 `Window`、`Dispatcher` 或 `ListBox` |
+| `MainWindow` | XAML 绑定、`ICollectionView` 适配、按钮异步事件、关闭等待 | 不自行推导报警规则，不在工作线程改控件 |
+
+`DashboardViewModel` 所在的 `wpf-dashboard-core` 是普通 `net10.0` 类库。命令状态、属性通知和异步状态都能脱离窗口测试。窗口才调用 `CollectionViewSource.GetDefaultView(Readings)`，把 `Filter` 连到 `Matches`；当设备条件、仅报警开关或阈值改变时刷新视图。默认视图是共享的，生产窗口若有两张列表需不同筛选，应为它们建立独立 `CollectionViewSource`，不能直接共用同一默认视图条件。[Microsoft Learn：默认集合视图](https://learn.microsoft.com/en-us/dotnet/api/system.windows.data.collectionviewsource.getdefaultview)
+
+## 读数更新必须有明确的失败语义
+
+`LoadAsync` 在运行中再次调用会返回当前任务，不启动第二次读取；成功后才用完整新批次替换 `Readings`。取消或故障保留上一批，不展示半批新数据。`Cancel()` 只提出取消请求，是否能结束取决于数据源能否观察令牌；本例的 `Task.Delay(..., token)` 能响应取消。关闭窗口时先阻止本次关闭、请求取消并等待当前任务，之后才真正关闭。若换成真实 I/O，必须给底层调用设计超时、重试和关闭策略，不能假设所有驱动都合作。[Microsoft Learn：WPF 线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+```csharp filename="DashboardViewModel.cs"
+IReadOnlyList<ReadingSnapshot> batch = await _feed.ReadAsync(simulateFailure, cancellation.Token);
+if (_closed || cancellation.IsCancellationRequested) return;
+
+Readings.Clear();
+foreach (ReadingSnapshot snapshot in batch)
+    Readings.Add(new DeviceReading(snapshot, Threshold));
+```
+
+示例通过普通 `await` 从 WPF 按钮事件进入 ViewModel，窗口运行时后续集合更新回到调用方的 UI 上下文；模拟数据源内部不访问 UI，并使用 `ConfigureAwait(false)`。在没有 WPF 同步上下文的控制台测试里，续体可能在其他线程执行，但测试没有绑定 WPF 控件。**这不证明桌面窗口的线程亲和正确**；实际窗口仍需用调试器或 `Dispatcher.CheckAccess()` 检查关键边界，也要在读取期间尝试输入和缩放，确认界面响应。[官方线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+## 阈值是本地规则，不是设备写入
+
+阈值编辑继承[命令与输入验证](/knowledge/desktop/wpf/architecture/commands-and-validation/)的规则：输入必须是 0–100 的整数；无效或与当前值相同，应用按钮不可执行；撤销只恢复未提交文本。应用成功后，现有每个 `DeviceReading` 重新计算 `IsAlert`，通知行内视觉状态，同时刷新“仅显示报警”的集合视图。没有任何数据发往设备，因此界面明确写着“本地阈值”。
+
+这里的 `ObservableCollection<T>` 只负责批次增删通知，`DeviceReading` 的 `INotifyPropertyChanged` 负责单行报警状态变化，`DashboardViewModel` 的属性通知负责总数、报警数与命令状态。把它们统称“绑定会自动更新”会掩盖三种不同通知职责。
+
+## 三层验证，各有能证明的事
+
+先运行确定性状态断言：
+
+```powershell
+dotnet run --project examples/wpf-reading-dashboard-checks/WpfReadingDashboardChecks.csproj
+dotnet build examples/wpf-reading-dashboard/WpfReadingDashboard.csproj
+```
+
+检查程序用可控 `TaskCompletionSource` 数据源主动完成或失败，不依赖实际等两秒。它覆盖初始/完成状态、重复启动、阈值无效值和取消编辑、报警重算、筛选、取消、错误、关闭后不再接受读取。它不是模拟点击窗口，也不验证 XAML 绑定路径、模板颜色、焦点、键盘可用性或窗口关闭动画。WPF 项目编译可发现 XAML/类型错误，隐藏启动烟测只能证明窗口没有立刻崩溃。
+
+在 Windows 桌面还应逐一人工验收：
+
+1. 点“读取一批”，等待中尝试输入筛选文本和调整窗口；完成后出现 24 行，状态和报警数一致。
+2. 读取中点“取消”，确认保留上一批；再运行“模拟读取失败”，确认错误反馈且旧数据仍在。
+3. 输入 `abc`、`101`、`80`：前两者不能应用，后者更新报警数和仅报警列表；撤销编辑不改变已应用值。
+4. 读取中关闭窗口，确认没有关闭后的弹窗、跨线程异常或迟到更新；用键盘检查按钮、输入框与列表的焦点路径。
+5. 改变系统缩放、窗口大小和主题，检查文本截断、对比度和滚动；若面向无障碍交付，还需专门检查屏幕阅读器名称。
+
+## 发布之前别跳过的边界
+
+开发机能运行不等于另一台机器能运行。框架依赖发布体积较小，但目标 Windows 机器需要相应 .NET Desktop Runtime；自包含发布携带运行时，体积更大，并应按目标架构（如 `win-x64`）分别构建。`dotnet publish` 的产物是一个**文件夹**，不自动等于安装包、签名、自动更新或回滚。[Microsoft Learn：.NET 发布概览](https://learn.microsoft.com/en-us/dotnet/articles/core/deploying/index)
+
+```powershell
+dotnet publish examples/wpf-reading-dashboard/WpfReadingDashboard.csproj -c Release -r win-x64 --self-contained false
+dotnet publish examples/wpf-reading-dashboard/WpfReadingDashboard.csproj -c Release -r win-x64 --self-contained true
+```
+
+具体检查项和手动验收记录见仓库的 `docs/wpf-dashboard-release-checklist.md`。本示例没有签名、更新机制、持久化日志、权限审计、真实设备安全联锁或安装程序；尤其不能把“本地阈值”界面直接改名后用于真实设备控制。只有确认真实协议、故障模式、权限和安全策略后，才应讨论接入硬件。
+
+## 面试自测
+
+1. 为什么受控 `TaskCompletionSource` 比每次真实等待两秒更适合状态测试？它仍不能证明什么？
+2. 取消与故障时为何保留上一批，而成功时一次替换整批？若要处理流式数据，状态模型应怎样改变？
+3. 阈值改变后，为什么需要分别通知行属性、总计属性并刷新“仅报警”视图？
+4. 控制台断言通过、WPF 编译通过、隐藏启动通过，是否足以宣称窗口关闭没有竞态或界面持续响应？
+5. 框架依赖与自包含发布各有什么部署责任？为什么 `publish` 文件夹不能等同于有签名和回滚的正式交付？

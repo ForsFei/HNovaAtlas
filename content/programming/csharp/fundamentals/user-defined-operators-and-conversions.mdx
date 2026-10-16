@@ -1,0 +1,104 @@
+---
+id: csharp-user-defined-operators-conversions
+title: 自定义运算符与转换：让值类型守住契约
+description: 以非负字节数讲清 +、相等运算符、Equals/GetHashCode、显式转换和 checked 溢出。
+tags: [CSharp, 运算符, 值类型, 相等性, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 41
+prerequisite: [csharp-operators-evaluation, csharp-value-equality]
+related: [csharp-data-types-conversions, csharp-collection-selection]
+---
+
+## 先有业务语义，再决定是否重载
+
+内置 `int + int` 很清楚，但业务类型的符号不一定清楚。对“非负字节数”，两个数相加仍是字节数，所以 `+` 有自然含义；对两个“绝对时间点”使用 `+` 就可能令人困惑。运算符重载不是为了把所有方法压成符号，而是让一个已经明确的值运算更易读。
+
+本例的 `ByteCount` 只存 `long Value`，约定它不能为负。`default(ByteCount)` 绕过自定义构造函数，因此我们特意让默认的零也合法。若零不可能是有效业务状态，仅靠结构体构造函数便无法禁止 `default`，应调整类型设计，而不是假装构造函数覆盖了所有创建路径。
+
+## 一个完整的值类型例子
+
+在仓库根目录运行 `dotnet run --project examples/csharp-operator-contracts/OperatorContractsReview.csproj`。本例不依赖数据库或本机文化设置，直接检查正向行为与两个失败边界。
+
+```csharp filename="Program.cs"
+ByteCount first = (ByteCount)1024L;
+ByteCount second = (ByteCount)512L;
+ByteCount total = first + second;
+ByteCount sameTotal = (ByteCount)1536L;
+
+Check(total.Value == 1536 && (long)total == 1536L, "addition preserves the unit");
+Check(total == sameTotal && !(total != sameTotal) && total.Equals(sameTotal),
+    "operators and typed equality agree");
+Check(total.GetHashCode() == sameTotal.GetHashCode(), "equal values have equal hashes");
+Check(new HashSet<ByteCount> { total, sameTotal }.Count == 1,
+    "HashSet uses the same equality contract");
+Check(default(ByteCount) == (ByteCount)0L, "default value is valid zero");
+
+Expect<ArgumentOutOfRangeException>(() => { _ = (ByteCount)(-1L); });
+Expect<OverflowException>(() => { _ = (ByteCount)long.MaxValue + (ByteCount)1L; });
+Console.WriteLine("运算符、转换、不变量与相等性断言全部通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+static void Expect<T>(Action action) where T : Exception
+{
+    try { action(); }
+    catch (T) { return; }
+    throw new InvalidOperationException($"Expected {typeof(T).Name}.");
+}
+
+public readonly struct ByteCount : IEquatable<ByteCount>
+{
+    public long Value { get; }
+
+    public ByteCount(long value)
+    {
+        if (value < 0) throw new ArgumentOutOfRangeException(nameof(value));
+        Value = value;
+    }
+
+    public static ByteCount operator +(ByteCount left, ByteCount right)
+        => new(checked(left.Value + right.Value));
+
+    public static bool operator ==(ByteCount left, ByteCount right) => left.Equals(right);
+    public static bool operator !=(ByteCount left, ByteCount right) => !left.Equals(right);
+
+    public static explicit operator ByteCount(long value) => new(value);
+    public static explicit operator long(ByteCount value) => value.Value;
+
+    public bool Equals(ByteCount other) => Value == other.Value;
+    public override bool Equals(object? obj) => obj is ByteCount other && Equals(other);
+    public override int GetHashCode() => Value.GetHashCode();
+}
+```
+
+`+` 在方法体内部使用 `checked`：即使调用处没有写 `checked(...)`，`long` 溢出也抛 `OverflowException`，不会绕回负数再交给构造函数碰运气。注意 `checked` 处理的是整数溢出，不替你判断业务配额、单位或时间窗口。若某项运算可能正常失败且调用方不希望用异常表达，也可以提供命名的 `TryAdd`；并非每种业务动作都该用 `+`。
+
+## 为什么 `==`、`Equals`、哈希必须一致
+
+C# 要求用户自定义 `==` 与 `!=` 成对声明，但编译器不会自动替普通结构体写出与之吻合的 `Equals` 和 `GetHashCode`。本例让两种运算符都委托给 `Equals(ByteCount)`，再让 `Equals(object?)` 与 `GetHashCode` 以同一个 `Value` 为依据。这样 `a == b`、`a.Equals(b)` 和 `HashSet<ByteCount>` 对“相同字节数”给出一致判断；若相等的两个值返回不同哈希，哈希集合可能把它们当成不同键。
+
+`GetHashCode` 相同**不代表**两个值必定相等，哈希允许碰撞；也不要把哈希码持久化成跨进程标识。`readonly struct` 与只读属性让参与相等的状态保持稳定，避免对象作为集合键后又修改它。若只想要按成员相等且无需自定义不变量或转换，[`record struct` 的生成行为](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/)可能更省代码，但仍要看成员自身的相等规则。
+
+## 显式转换是给调用者的一次提醒
+
+`long` 可以是负数，而 `ByteCount` 不行，因此 `long → ByteCount` 可能抛异常，不适合作隐式转换。显式写 `(ByteCount)value` 让调用者看见边界；真正处理外部输入时，还应先解析与验证，不要拿强制转换代替 `TryParse` 或业务校验。反向转成 `long` 不丢信息，本例仍选显式写法以凸显单位；这属于 API 设计选择，不是语言强制要求。
+
+用户自定义隐式转换可能参与赋值与重载解析，过多转换会让一个表达式突然匹配不期望的重载。一个实用准则是：隐式转换应无损、无异常且含义明显；若可能失败、丢信息或跨语义域，选显式转换或命名方法。内置数值转换的基础见[数据类型与转换](/knowledge/programming/csharp/fundamentals/data-types-and-conversions/)。
+
+## 自测
+
+1. 删除 `checked` 后，`long.MaxValue` 加 1 可能怎样影响不变量？在项目的默认检查设置下运行验证，不要只猜。
+2. 把 `GetHashCode` 改为总返回 0，会不会直接破坏相等性正确性？对性能又有什么影响？
+3. 如果 `ByteCount` 需要支持减法，结果可能为负时，你会让运算符抛异常、返回有符号差值，还是提供 `TrySubtract`？先明确业务含义。
+4. 为什么 `default(ByteCount)` 是合法零？如果“不存在”和“零字节”是两种状态，该怎么表达？
+
+验收标准：能说明 `+` 的封闭性、失败边界、`==`/`Equals`/哈希的一致性，以及显式转换为何比隐式转换更适合可能失败的输入。
+
+## 参考
+
+[Microsoft Learn：运算符重载](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/operator-overloading) · [用户自定义转换](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/user-defined-conversion-operators) · [GetHashCode](https://learn.microsoft.com/en-us/dotnet/api/system.object.gethashcode?view=net-10.0)

@@ -1,0 +1,113 @@
+---
+id: python-functions
+title: 函数
+description: 学会把代码打包成函数，理解参数、返回值和作用域。
+tags: [Python, 函数, def]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 80
+prerequisite: [python-loops]
+related: [python-modules-pip, python-dicts-sets]
+---
+
+## 为什么要有函数
+
+同一段逻辑要出现在多个地方，复制粘贴是最差的选择：改一处就要记得改所有处。**函数**把一段代码打包、起名字，之后随时调用。你已经用过的 `print()`、`len()`、`input()` 都是函数。
+
+## 定义与调用
+
+```python filename="def-basic.py"
+def greet():
+    print("你好！")
+    print("欢迎学习 Python")
+
+greet()    # 调用：执行函数体
+greet()    # 可以调用任意多次
+```
+
+`def` 后面是函数名和括号，冒号加缩进的规则和 if、for 完全一致。**定义不会执行**，调用才执行。
+
+## 参数：让函数更灵活
+
+```python filename="params.py"
+def greet(name):
+    print(f"你好，{name}！")
+
+greet("小明")    # 你好，小明！
+greet("小红")    # 你好，小红！
+```
+
+`name` 是**参数**——调用时传入的值会赋给它。多个参数用逗号隔开，还可以给默认值：
+
+```python filename="default.py"
+def greet(name, greeting="你好"):
+    print(f"{greeting}，{name}！")
+
+greet("小明")                  # 你好，小明！
+greet("小明", "早上好")        # 早上好，小明！
+greet(name="小红", greeting="晚安")   # 按名字传参，更清楚
+```
+
+## 返回值：函数的"产出"
+
+`return` 把结果交还给调用者：
+
+```python filename="return.py"
+def add(a, b):
+    return a + b
+
+result = add(3, 5)     # 函数返回 8，存进 result
+print(result)          # 8
+print(add(10, 20))     # 30，也可以直接用
+```
+
+`return` 之后函数立即结束。没有写 return 的函数返回 `None`。区分清楚两件事：
+
+```python filename="return-vs-print.py"
+def add_print(a, b):
+    print(a + b)       # 只是显示，交不出去
+
+def add_return(a, b):
+    return a + b       # 真正把结果交出来
+
+x = add_print(1, 2)    # 屏幕打印 3，但 x 是 None
+y = add_return(1, 2)   # 屏幕什么都不显示，y 是 3
+print(y + 10)          # 13，y 能继续参与运算
+```
+
+<Callout type="warning" title="print 不等于 return">
+
+初学者最常见的困惑。print 只是把东西显示在屏幕上，函数本身没有产出；return 才是把结果交给调用者。需要"拿到结果继续算"的函数，必须用 return。
+
+</Callout>
+
+## 作用域：变量的可见范围
+
+函数内部创建的变量**只在函数内部存在**：
+
+```python filename="scope.py"
+def calc():
+    inner = 100
+    print(inner)      # 函数内部可以用
+
+calc()
+# print(inner)        # 报错 NameError，外部看不到 inner
+```
+
+反过来，函数内部**可以读取**外部的变量，但不建议依赖这一点——函数应该通过参数拿到所需的一切，这样的函数才能被放心地搬来搬去。
+
+## 动手试一试
+
+1. 写函数 `celsius_to_fahrenheit(c)`，把摄氏温度转成华氏温度（公式 `c * 9 / 5 + 32`）。
+2. 写函数 `is_even(n)`，返回 True 或 False。
+3. 写函数 `count_vowels(text)`，统计字符串里元音字母（aeiou）的个数，并在几个句子上测试它。
+
+<Quiz
+  question="def f(x): return x * 2 之后，执行 print(f(f(3))) 输出什么？"
+  options={["6", "9", "12", "报错"]}
+  answer={2}
+  explanation="从里往外算：f(3) 返回 6，再执行 f(6) 返回 12。函数的返回值可以直接作为下一次调用的参数。"
+/>
+
+<FlashCard front="函数没有写 return，调用它会得到什么？" back="得到 None。所以不带 return 的函数只能用于「做事情」（如打印），不能用于「算结果」。" />

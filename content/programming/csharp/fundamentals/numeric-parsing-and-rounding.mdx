@@ -1,0 +1,96 @@
+---
+id: csharp-numeric-parsing-rounding
+title: 数值解析与舍入：CultureInfo、NumberStyles 和 decimal
+description: 用固定格式协议与逗号小数点反例，分清解析成功、业务有效、十进制精度及中点舍入规则。
+tags: [CSharp, 数值, 区域性, decimal, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 27
+prerequisite: [csharp-data-types-conversions]
+related: [csharp-json-contracts, csharp-unit-tests-boundaries]
+---
+
+## “解析成功”不等于“解释正确”
+
+[类型选择与转换](/knowledge/programming/csharp/fundamentals/data-types-and-conversions/)已经区分 `double` 的二进制浮点近似与 `decimal` 的十进制表示。真实接口还有下一层问题：**同一段数字文本由谁定义语法？** `"1,234"` 在某种格式中可表示一千二百三十四，在另一种格式中可表示一点二三四。若省略格式提供者，`Parse`/`TryParse` 会参考当前文化；服务器迁移或用户语言变化后，同一输入可能出现不同含义。
+
+把协议、用户界面和业务规则分开设计：
+
+| 边界 | 先决定什么 | 例子 |
+| --- | --- | --- |
+| 机器协议或文件 | 固定小数点、允许的符号/空白/分组、最大长度与小数位数 | `"12.50"`，使用 `InvariantCulture` |
+| 人工录入 | 用户所选地区格式、提示和错误反馈 | 某地区用逗号作小数点 |
+| 领域规则 | 数值范围、币种、计量单位、舍入时机 | 解析到 `-2.50` 仍可能不允许负金额 |
+
+`TryParse` 适合把**预期的不合法输入**返回为失败；它不会替你定义“温度应在何范围”或“金额能否为负”。`NumberStyles` 控制允许哪些文本形态，`CultureInfo`/`NumberFormatInfo` 决定分隔符等符号。常见的 `NumberStyles.Number` 相对宽松，包括前后空白、正负号、小数点和千分位；对机器协议不应仅因方便就照用。
+
+## 固定输入格式与明确舍入的实验
+
+下面完整 `Program.cs` 不修改进程的当前文化。它克隆不变文化的数字格式，只在教学副本上把逗号设为小数点、点号设为分组符，因此在不同电脑上仍有相同结果。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+var commaDecimal = (NumberFormatInfo)CultureInfo.InvariantCulture.NumberFormat.Clone();
+commaDecimal.NumberDecimalSeparator = ",";
+commaDecimal.NumberGroupSeparator = ".";
+
+Check(decimal.TryParse("1,234", NumberStyles.Number,
+    CultureInfo.InvariantCulture, out decimal grouped) && grouped == 1234m,
+    "comma as group separator");
+Check(decimal.TryParse("1,234", NumberStyles.Number,
+    commaDecimal, out decimal fractional) && fractional == 1.234m,
+    "comma as decimal separator");
+
+const NumberStyles protocol = NumberStyles.AllowLeadingSign | NumberStyles.AllowDecimalPoint;
+Check(decimal.TryParse("12.50", protocol,
+    CultureInfo.InvariantCulture, out decimal amount) && amount == 12.50m,
+    "fixed protocol decimal point");
+Check(!decimal.TryParse("1,234", protocol, CultureInfo.InvariantCulture, out _),
+    "protocol rejects grouping");
+Check(!decimal.TryParse(" 12.50", protocol, CultureInfo.InvariantCulture, out _),
+    "protocol rejects whitespace");
+Check(decimal.TryParse("-2.50", protocol,
+    CultureInfo.InvariantCulture, out decimal negative) && negative < 0,
+    "syntactically valid but business-invalid amount");
+
+Check(0.1m + 0.2m == 0.3m, "decimal arithmetic for these values");
+Check(Math.Round(1.005m, 2) == 1.00m, "default midpoint ToEven");
+Check(Math.Round(1.005m, 2, MidpointRounding.AwayFromZero) == 1.01m,
+    "explicit midpoint AwayFromZero");
+Check(Math.Round(-1.005m, 2, MidpointRounding.AwayFromZero) == -1.01m,
+    "negative midpoint moves away from zero");
+Check(Math.Round(1.005m, 2, MidpointRounding.AwayFromZero)
+    .ToString("F2", CultureInfo.InvariantCulture) == "1.01", "fixed output format");
+
+Console.WriteLine("区域性、解析与舍入契约断言全部通过");
+
+static void Check(bool condition, string name)
+{
+    if (!condition) throw new Exception($"断言失败：{name}");
+}
+```
+
+同一 `"1,234"` 两次都解析**成功**，结果却相差一千倍。这就是为什么“单元测试里解析没抛异常”不足以证明协议正确。示例中的机器协议只允许前导符号与小数点，拒绝分组符和空白；实际协议若要求**恰好两位小数**、固定总长度或只允许 ASCII 数字，还要在 `TryParse` 外补明确的文本形状校验。`NumberStyles` 不是完整的协议语法验证器。
+
+`-2.50` 符合上述数字语法，但可能违反“不允许负金额”的业务规则；格式错误与业务错误应分别报告。若接受极长或极高精度输入，还要规定长度与范围：`decimal` 有限精度，解析有效数字位过多时可能舍入，并不是任意长度小数的无损容器。
+
+## `decimal` 也必须有舍入政策
+
+`0.1m + 0.2m == 0.3m` 在示例中成立，但这不意味着任何金额计算都无需考虑精度和舍入。`Math.Round(decimal, 2)` 的默认中点规则是 `ToEven`：`1.005m` 到两位是 `1.00m`；若业务要求中点远离零，必须显式写 `MidpointRounding.AwayFromZero`，结果是 `1.01m`，负值相应变为 `-1.01m`。**规则本身必须来自业务/法规/协议约定**，不能因为某种模式“看起来像四舍五入”就擅自选择。
+
+格式化 `ToString("F2", CultureInfo.InvariantCulture)` 决定输出的文本样式，并不代替领域中的舍入与存储规则。还要明确何时舍入：每条明细先舍入再求和，与先求和后舍入，结果可能不同。跨系统传输时固定格式提供者、精度和单位；用户界面可另外使用用户文化显示，不要把展示文本不加约定地写回机器协议。
+
+## 面试自测与练习
+
+1. 为什么两个 `TryParse("1,234", ...)` 都返回 `true`，却不能说“解析规则一样”？
+2. 将 `protocol` 改为 `NumberStyles.Number`，哪些原本拒绝的输入会被接受？这是否符合你的协议？
+3. 为 `"12.50"` 格式补“恰好两位小数”的验证，并测试 `"12.5"`、`"12.500"`、`"-2.50"`；说明语法与业务校验各在哪层。
+4. 比较 `Math.Round(1.005m, 2)` 与显式 `AwayFromZero`。为何不能把对 `double` 的中点例子直接推断到 `decimal`？
+
+验收标准：能写出带 `NumberStyles` 和提供者的 `TryParse`，用边界用例证明协议解释一致，并说明舍入模式、位数和时机由谁规定。仓库断言可用 `dotnet run --project examples/csharp-numeric-contracts/NumericContractsReview.csproj` 运行；正文完整代码块由 `npm run test:csharp-articles` 编译。
+
+## 参考
+
+[Microsoft Learn：解析数字字符串](https://learn.microsoft.com/en-us/dotnet/standard/base-types/parsing-numeric) · [`NumberStyles`](https://learn.microsoft.com/en-us/dotnet/api/system.globalization.numberstyles) · [`Decimal.TryParse`](https://learn.microsoft.com/en-us/dotnet/api/system.decimal.tryparse) · [`Math.Round`](https://learn.microsoft.com/en-us/dotnet/api/system.math.round)

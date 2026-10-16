@@ -1,0 +1,149 @@
+---
+id: csharp-controlled-concurrency-tests
+title: 并发测试：用受控交错稳定复现“检查后再写”
+description: 借助 TaskCompletionSource 固定两次库存检查的先后，用断言揭露双卖并验证 lock 修复；解释超时和压力测试的边界。
+tags: [CSharp, 多线程, 并发测试, TaskCompletionSource, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 27
+prerequisite: [csharp-lock-shared-state, csharp-visibility-atomicity]
+related: [csharp-cancellation-throttling, csharp-async-await]
+---
+
+## “运行一百遍没出错”不是并发测试策略
+
+假设库存只有 1 个，代码先读取库存、判断大于零，接着等待某个操作，最后扣减。两个请求可能都读到 `1` 并都返回“预订成功”。最后库存甚至可能仍是 `0`：两个请求各自拿旧值计算，再把同一个 `0` 写回。只断言 `remaining >= 0` 会漏掉“双卖”。
+
+压力运行能发现某些竞态，却无法保证操作系统每次都安排到危险交错。`Thread.Sleep(20)` 也不是同步协议：慢机器、CI 与调试器都会改变时序。本篇让测试**主动控制**两个调用停在哪里，使错误每次都按同一种顺序重现。
+
+## 测试同步点与业务同步不是一回事
+
+测试用三个 `TaskCompletionSource<bool>` 信号：
+
+1. `firstChecked`、`secondChecked` 告诉测试：“两个调用都已经读到库存并通过检查”。
+2. 两个调用都停在 `await release.Task`。
+3. 测试确认两次检查都完成后，才释放 `release`，让它们各自用旧快照写回。
+
+```csharp
+int observed = remaining;
+if (observed <= 0) return false;
+checkedSignal.TrySetResult(true);
+await release.Task;
+remaining = observed - 1; // 两次都可能写 0
+return true;
+```
+
+这段故意有错，只用于解释测试。这里控制的是**逻辑交错**，不声称两个 CPU 线程必然同时运行；异步方法在第一次未完成的 `await` 前会继续执行，因此测试能明确把两个调用推进到相同位置。`RunContinuationsAsynchronously` 让解除信号后的 continuation 不直接挤在设置信号的调用栈里，使测试的执行边界更清楚。
+
+测试断言应同时检查“接受了几次”和“库存是多少”。错误版本的结果是两个调用都返回 `true`，但库存为 `0`；该值看起来合理，业务承诺却已经被破坏。
+
+## 修复：在同一临界区完成判定和扣减
+
+```csharp
+public bool TryReserve()
+{
+    lock (_gate)
+    {
+        if (_remaining == 0) return false;
+        _remaining--;
+        return true;
+    }
+}
+```
+
+所有读写都要遵守这个库存对象的同步协议。`.NET 10` 示例使用私有 `System.Threading.Lock`；既有的[共享状态与 lock](/knowledge/programming/csharp/concurrency/lock-and-shared-state/)篇也演示了专用 `object` 锁。不要把 `await` 放进 `lock` 块；若后续还要异步支付或调用外部服务，先把“占位”与外部动作的失败补偿规则设计清楚，不能只把锁延长到远程调用结束。
+
+修复版让多个调用尝试预订，断言恰好一次成功且库存为 `0`。该断言验证了这一批执行；更根本的正确性来自“检查与扣减被同一把锁包围”的代码协议。若把检查移出锁，即便某次测试仍通过，也应在代码审查时指出问题。
+
+## 完整可运行例子
+
+以下整段可放入 .NET 10 控制台项目的 `Program.cs`，仓库也提供带同样断言的 `examples/csharp-concurrency-tests`：
+
+```csharp filename="Program.cs"
+using System.Threading;
+
+var timeout = TimeSpan.FromSeconds(5);
+int remaining = 1;
+var firstChecked = NewSignal();
+var secondChecked = NewSignal();
+var release = NewSignal();
+
+async Task<bool> FlawedReserve(TaskCompletionSource<bool> checkedSignal)
+{
+    int observed = remaining;
+    if (observed <= 0) return false;
+    checkedSignal.TrySetResult(true);
+    await release.Task;
+    remaining = observed - 1;
+    return true;
+}
+
+Task<bool> first = FlawedReserve(firstChecked);
+Task<bool> second = FlawedReserve(secondChecked);
+try
+{
+    await Task.WhenAll(firstChecked.Task, secondChecked.Task).WaitAsync(timeout);
+}
+finally
+{
+    release.TrySetResult(true);
+}
+
+bool[] flawed = await Task.WhenAll(first, second).WaitAsync(timeout);
+Require(flawed.All(x => x) && remaining == 0, "一个库存被接受两次");
+
+var safe = new Inventory(1);
+Task<bool>[] attempts = Enumerable.Range(0, 20)
+    .Select(_ => Task.Run(safe.TryReserve)).ToArray();
+bool[] accepted = await Task.WhenAll(attempts).WaitAsync(timeout);
+Require(accepted.Count(x => x) == 1 && safe.Remaining == 0, "修复后只有一次成功");
+
+Console.WriteLine("受控交错重现双卖；修复后仅一次预订成功。");
+
+static TaskCompletionSource<bool> NewSignal() =>
+    new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public sealed class Inventory(int initial)
+{
+    private readonly Lock _gate = new();
+    private int _remaining = initial >= 0 ? initial : throw new ArgumentOutOfRangeException(nameof(initial));
+
+    public bool TryReserve()
+    {
+        lock (_gate)
+        {
+            if (_remaining == 0) return false;
+            _remaining--;
+            return true;
+        }
+    }
+
+    public int Remaining
+    {
+        get { lock (_gate) return _remaining; }
+    }
+}
+```
+
+运行仓库项目：`dotnet run --project examples/csharp-concurrency-tests/ConcurrencyTestReview.csproj`。正文完整代码块也由 `npm run test:csharp-articles` 单独编译；说明性片段仍需放回对应上下文。
+
+## 超时、清理和失败信号
+
+`WaitAsync(timeout)` 限制**等待测试结果**的时间，超时会使等待失败，但不会自动停止原始任务。上例用 `finally` 释放闸门，避免测试因等待失败而把已启动的调用永久卡住。真实测试还应保存并观察工作任务、协作取消可取消的操作、释放资源，避免一个测试污染后续测试。
+
+不要把预期的竞态当作“测试框架应该标红”：这个教学项目断言**错误确实被重现**，再断言修复后满足不变量，所以项目本身应成功退出。实际回归测试只保留修复版的业务断言；错误版可留在教程中当反例。
+
+## 自测与面试追问
+
+1. 两个请求都返回成功，最终库存却是 `0`，为什么仍算错误？
+2. 为什么放一个固定 `Thread.Sleep` 不等于强制两个调用都通过库存检查？
+3. `WaitAsync` 超时后，等待中的原任务会自动取消吗？本例为什么在 `finally` 放开闸门？
+4. 若扣减后远程支付失败，`lock` 能自动撤销外部动作吗？你会定义什么补偿流程？
+
+参考：[Microsoft Learn：TaskCompletionSource.TrySetResult](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.taskcompletionsource-1.trysetresult)、[Task.WaitAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.waitasync)、[`lock` 语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/lock)。

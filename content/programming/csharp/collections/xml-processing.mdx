@@ -1,0 +1,75 @@
+---
+id: csharp-xml-processing
+title: XML：元素、属性、命名空间与安全读取
+description: 用 LINQ to XML 解析小型设备配置，理解 XmlReader 的流式处理、DTD 与输入限制。
+tags: [CSharp, XML, XmlReader, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 40
+prerequisite: [csharp-exceptions-disposal, csharp-linq]
+related: [csharp-json-contracts, csharp-database-access]
+---
+
+## 先看结构，再选 API
+
+XML 有元素、属性、层级和命名空间，不是“多了尖括号的 JSON”。小型、需要随机访问的文档适合 `XDocument` / LINQ to XML；大文件或只需顺序读取时可用 `XmlReader`，避免把整棵树长时间保存在内存中。两者可以组合：先按安全设置创建 `XmlReader`，再让 `XDocument.Load` 读取小文档。
+
+以下代码完整可运行，特意在读取不可信 XML 时禁止 DTD、关闭外部解析器，并限制文档字符数。设备值仍需业务验证：
+
+```csharp filename="Program.cs"
+using System.Globalization;
+using System.Xml;
+using System.Xml.Linq;
+
+string xml = """
+<devices xmlns="urn:hnova:readings">
+  <reading id="pump-A">72.5</reading>
+  <reading id="pump-B">68.0</reading>
+</devices>
+""";
+
+var settings = new XmlReaderSettings
+{
+    DtdProcessing = DtdProcessing.Prohibit,
+    XmlResolver = null,
+    MaxCharactersInDocument = 100_000
+};
+
+using var input = new StringReader(xml);
+using var reader = XmlReader.Create(input, settings);
+XDocument document = XDocument.Load(reader);
+XNamespace ns = "urn:hnova:readings";
+
+foreach (XElement element in document.Root?.Elements(ns + "reading") ?? [])
+{
+    string? id = (string?)element.Attribute("id");
+    bool valid = !string.IsNullOrWhiteSpace(id)
+        && double.TryParse(element.Value, NumberStyles.Float,
+            CultureInfo.InvariantCulture, out double value)
+        && double.IsFinite(value);
+
+    if (!valid) throw new InvalidDataException("设备读数无效");
+    Console.WriteLine($"{id}: {element.Value}");
+}
+```
+
+`xmlns` 声明默认命名空间，因此子元素需要用 `ns + "reading"` 查找；只写字符串 `"reading"` 往往找不到。`id` 是属性，数值文本是元素内容。实际协议需决定空文档、重复设备 ID、额外元素和未知命名空间如何处理，不要静默把“没有找到数据”当作成功。
+
+## 为什么要关心 DTD 与资源
+
+DTD/外部实体如果被不受控地解析，可能带来外部资源访问或实体扩展风险。面对未知来源时显式禁止 DTD，并限制大小和处理时间；还应结合应用的上传大小与业务层限制。`XmlReader` 和 `StringReader` 都由示例的 `using` 释放。这里 `XDocument` 最终仍会把小文档构成对象树，设置了 `XmlReader` 不代表内存消耗为常数。
+
+真正的大 XML 文件可用 `XmlReader.Read()` 前向遍历，并在遇到目标节点时处理，不建立完整树。若需要验证规范结构，可用 XSD，但它是单独的契约设计问题；不要为了读取两条简单数据就强制引入复杂模式体系。
+
+## 面试自测与练习
+
+1. 删除示例的 `xmlns` 后，`ns + "reading"` 还能找到元素吗？怎样同时支持有/无命名空间，是否应该允许？
+2. 把 `<reading id="pump-A">abc</reading>` 放进去，哪一层拒绝：XML 语法、数值解析还是业务规则？
+3. 如果输入是几个 GB 的日志 XML，为什么仅把 `XDocument.Load` 的参数换成 `FileStream` 还不算流式处理？
+
+验收标准：能选择树式或流式 API，区分结构验证与业务验证，并明确不可信 XML 的解析边界。
+
+## 参考
+
+[Microsoft Learn：LINQ to XML](https://learn.microsoft.com/en-us/dotnet/standard/linq/linq-xml-overview) · [XmlReaderSettings.DtdProcessing](https://learn.microsoft.com/en-us/dotnet/fundamentals/runtime-libraries/system-xml-xmlreadersettings-dtdprocessing)

@@ -1,0 +1,125 @@
+---
+id: python-strings
+title: 字符串与格式化
+description: 掌握字符串的拼接、常用方法和 f-string 格式化输出。
+tags: [Python, 字符串, f-string]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 20
+prerequisite: [python-variables-types]
+related: [python-operators]
+---
+
+## 字符串是什么
+
+字符串就是一串文字，用单引号或双引号包起来（两者完全等价）：
+
+```python filename="string-basics.py"
+greeting = "你好"
+name = '小明'
+message = "It's fine"    # 内容里有单引号时，用双引号更省事
+```
+
+如果内容同时包含两种引号，或者想写得明确，可以用三引号：
+
+```python filename="triple.py"
+essay = """这是第一行
+这是第二行"""             # 三引号可以包含换行
+```
+
+## 拼接与重复
+
+字符串用 `+` 拼接，用 `*` 重复：
+
+```python filename="concat.py"
+first = "你好，"
+second = "世界"
+print(first + second)     # 你好，世界
+print("-" * 20)           # --------------------
+```
+
+拼接的两边必须都是字符串，`"年龄：" + 18` 会报错，要写成 `"年龄：" + str(18)`。
+
+## f-string：最推荐的格式化方式
+
+把变量值嵌进一句话里，最现代的写法是 **f-string**：在引号前加 `f`，变量放进 `{}`：
+
+```python filename="fstring.py"
+name = "小明"
+age = 12
+print(f"我叫{name}，今年{age}岁")
+# 输出：我叫小明，今年12岁
+```
+
+`{}` 里还可以直接放表达式：
+
+```python filename="fstring-expr.py"
+price = 3.5
+count = 4
+print(f"总价：{price * count} 元")    # 总价：14.0 元
+```
+
+控制小数位数，在 `{}` 里加格式说明：
+
+```python filename="fstring-format.py"
+pi = 3.14159
+print(f"π 约等于 {pi:.2f}")    # π 约等于 3.14
+```
+
+<Callout type="tip" title="记住一个原则">
+
+只要是"把变量织进一段话"，就用 f-string。它比拼接 `+` 更清晰，也不用操心类型转换——`{}` 里是什么都能显示。
+
+</Callout>
+
+## 字符串的常用操作
+
+字符串自带很多现成的方法（method），用点号调用：
+
+```python filename="string-methods.py"
+s = "  Hello Python  "
+print(s.strip())        # 去掉两端的空白 -> "Hello Python"
+print(s.strip().lower())   # 转小写 -> "hello python"
+print(s.strip().upper())   # 转大写 -> "HELLO PYTHON"
+print(s.strip().replace("o", "0"))   # 替换 -> "Hell0 Pyth0n"
+
+file = "report.pdf"
+print(file.endswith(".pdf"))   # True，判断后缀
+print(file.split("."))         # ['report', 'pdf']，按分隔符拆开
+```
+
+## 长度与下标
+
+用 `len()` 得到字符串长度，用 `[下标]` 取单个字符。注意下标从 **0** 开始：
+
+```python filename="index.py"
+word = "Python"
+print(len(word))    # 6
+print(word[0])      # P
+print(word[5])      # n
+print(word[-1])     # n，负数从末尾往前数
+```
+
+还可以用切片取出一段：`word[0:3]` 得到 `"Pyt"`（含头不含尾）。
+
+<Accordion title="为什么下标从 0 开始？">
+
+这是计算机领域的普遍约定：下标表示"相对起点的偏移量"。第一个元素偏移 0，第二个偏移 1。几乎所有主流语言都如此，习惯之后你会发现这种计数方式在很多场合反而更方便。
+
+</Accordion>
+
+## 动手试一试
+
+1. 用 f-string 打印一句自我介绍，包含至少两个变量。
+2. 把 `" i love python "` 清理空白并转成大写。
+3. 取 `"Python"` 的中间两个字符（提示：先算长度，再用切片）。
+
+<Quiz
+  question="f「共{2 + 3}件」的输出是什么？"
+  options={["共{2 + 3}件", "共5件", "共2 + 3件", "报错"]}
+  answer={1}
+  explanation="f-string 的 {} 里可以是任意表达式，Python 会先求值再嵌入字符串，所以输出「共5件」。"
+/>
+
+<FlashCard front="怎么用 f-string 保留两位小数？" back="在变量后加 :.2f，例如 f「{pi:.2f}」会把 3.14159 显示为 3.14。f 表示定点小数格式。" />

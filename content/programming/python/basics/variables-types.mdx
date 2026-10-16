@@ -1,0 +1,112 @@
+---
+id: python-variables-types
+title: 变量与数据类型
+description: 学会创建变量，认识数字、字符串和布尔值三种基本类型。
+tags: [Python, 变量, 数据类型]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 10
+prerequisite: [python-first-program]
+related: [python-strings, python-operators]
+---
+
+## 变量：给数据起名字
+
+程序总要记住一些东西：一个价格、一个名字、计算到一半的结果。**变量**就是给这些数据起的名字。用一个等号把值"放进"变量：
+
+```python filename="variables.py"
+name = "小明"
+age = 12
+price = 3.5
+```
+
+读法：把 `"小明"` 存进变量 `name`。等号在这里是"赋值"，不是数学里的相等。赋值之后，任何地方写 `name` 就等于在使用 `"小明"`。
+
+变量可以随时被重新赋值，新值会覆盖旧值：
+
+```python filename="reassign.py"
+count = 1
+print(count)   # 输出 1
+count = 2
+print(count)   # 输出 2
+count = count + 1
+print(count)   # 输出 3
+```
+
+<Callout type="info" title="不用声明类型">
+
+很多语言要求先声明"这个变量是整数"再使用，Python 不需要。你赋什么值，它就是什么类型——这让入门轻松很多。
+
+</Callout>
+
+## 三种基本类型
+
+| 类型 | 名称 | 例子 | 用途 |
+|------|------|------|------|
+| `int` | 整数 | `42`、`-7`、`0` | 计数、数量 |
+| `float` | 浮点数（小数） | `3.14`、`-0.5` | 价格、测量值 |
+| `str` | 字符串（文字） | `"hello"`、`'你好'` | 名字、消息 |
+
+还有一个特殊的 `bool`（布尔）类型，只有 `True` 和 `False` 两个值，后面讲条件判断时会大量用到。
+
+用 `type()` 可以查看任何值的类型：
+
+```python filename="types.py"
+print(type(42))        # <class 'int'>
+print(type(3.14))      # <class 'float'>
+print(type("hello"))   # <class 'str'>
+print(type(True))      # <class 'bool'>
+```
+
+<Callout type="warning" title="42 和 '42' 不是一回事">
+
+`42` 是整数，能参与算术；`"42"` 是字符串，只是两个字符。初学者常在从键盘读取的输入上栽跟头——下一节会讲如何转换。
+
+</Callout>
+
+## 类型转换
+
+类型之间可以互相转换：
+
+```python filename="convert.py"
+number = int("42")        # 字符串 -> 整数
+pi = float("3.14")        # 字符串 -> 小数
+text = str(100)           # 整数 -> 字符串
+print(number + 8)         # 50
+print(text + " 分")       # 100 分
+```
+
+注意 `int("3.14")` 会报错——字符串必须是合法的整数格式才能转成 int。
+
+## 变量命名的规矩
+
+好的名字让代码自己会说话。Python 变量命名规则：
+
+- 只能用字母、数字和下划线，且不能以数字开头
+- 区分大小写：`Age` 和 `age` 是两个变量
+- 不能用 Python 的保留字（如 `if`、`for`、`print` 等）
+
+社区惯例是**蛇形命名**（snake_case）：多个单词用下划线连接。
+
+```python filename="naming.py"
+student_name = "小明"    # 好：清楚
+total_price = 19.9       # 好：清楚
+a = 19.9                 # 差：a 是什么？
+x1y2 = 3                 # 差：看不懂
+```
+
+<FlashCard front="int、float、str 分别是什么？" back="int 是整数（如 42），float 是小数（如 3.14），str 是字符串（如「hello」）。用 type() 可以查看值的类型，用 int() / float() / str() 可以转换类型。" />
+
+## 动手试一试
+
+1. 创建变量记录你的名字、年龄和身高，用一行 `print` 打印出来。
+2. 计算：一年有 365 天，你出生至今大约多少天？（用变量保存出生年份）
+3. 在交互模式里输入 `type("3.14")` 和 `type(3.14)`，体会引号带来的差别。
+
+<Quiz
+  question="price = 「19.9」 之后，执行 price + 1 会怎样？"
+  options={["输出 20.9", "报错：字符串不能和整数相加", "输出 「19.91」", "输出 19.9"]}
+  answer={1}
+  explanation="引号里的 「19.9」 是字符串，字符串只能和字符串相加（拼接）。想参与算术要先转换：float(price) + 1。"
+/>

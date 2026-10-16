@@ -1,0 +1,96 @@
+---
+id: wpf-xaml-layout-basics
+title: WPF 应用、XAML 与布局：先让窗口正确伸缩
+description: 从 App.xaml 启动、XAML/code-behind 分工到 Grid 的 Auto 与星号尺寸，构建可编译的最小窗口。
+tags: [WPF, XAML, Grid, 布局, 面试]
+difficulty: beginner
+status: published
+updated: "2026-10-15"
+order: 10
+prerequisite: [wpf-learning-path]
+related: [wpf-mvvm]
+---
+
+## 一个 WPF 应用从哪里开始
+
+WPF 在 .NET 上提供 Windows 桌面窗口、控件、布局、绑定和绘制机制；它不是跨平台网页框架。XAML 主要声明对象树和属性，C# code-behind 承担与窗口直接相关的行为。把代码写在 code-behind **并非语法错误**；当状态和业务规则逐渐复杂时，再用 ViewModel 分离可测试逻辑。本步只有静态读数，不提前引入绑定或 MVVM 框架。参见 [WPF 总览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/overview/)。
+
+仓库示例 `examples/wpf-layout-basics` 使用 `net10.0-windows` 和 `<UseWPF>true</UseWPF>`。`App.xaml` 通过 `StartupUri` 指定首次显示的 `MainWindow.xaml`；窗口的 `x:Class` 与同名 C# `partial` 类连接，构造函数中的 `InitializeComponent()` 加载编译后的 XAML。文件名或命名空间改动后若两端不一致，构建就会报错。最小入口如下：
+
+```xml filename="App.xaml"
+<Application x:Class="WpfLayoutBasics.App"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             StartupUri="MainWindow.xaml">
+</Application>
+```
+
+在仓库根目录执行 `dotnet build examples/wpf-layout-basics/WpfLayoutBasics.csproj` 可先验证 XAML 和 C# 能一起编译；Windows 桌面环境中再用 `dotnet run --project examples/wpf-layout-basics/WpfLayoutBasics.csproj` 打开窗口，亲自拖动边框观察布局。**构建成功只验证语法与项目连接，不证明在所有 DPI、字体或窗口尺寸下都好看。**
+
+## Grid 的 `Auto`、`*` 与测量/排列
+
+WPF 布局会先测量子元素需要多少空间，再由父容器安排最终区域；不要把窗口看成一张只能靠绝对坐标摆放控件的画布。下面窗口外层 `Grid` 有三行：上、下两行 `Auto` 尽量容纳内容；中间 `*` 接收余下高度。中间又分成固定内容宽度的侧栏与填充剩余宽度的主体。这些尺寸是 WPF 的设备无关单位，不等同于显示器的物理像素。[布局系统](https://learn.microsoft.com/dotnet/desktop/wpf/advanced/layout)解释了测量、排列与 DPI 的关系。
+
+```xml filename="MainWindow.xaml"
+<Window x:Class="WpfLayoutBasics.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="HNova WPF 布局入门" Width="760" Height="480"
+        MinWidth="520" MinHeight="320" UseLayoutRounding="True">
+    <Grid Margin="20">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <StackPanel Margin="0,0,0,16">
+            <TextBlock Text="设备读数面板" FontSize="24" FontWeight="SemiBold" />
+            <TextBlock Text="拖动窗口边缘，观察中间区域如何分配剩余空间。"
+                       Foreground="DimGray" />
+        </StackPanel>
+
+        <Border Grid.Row="1" BorderBrush="LightGray" BorderThickness="1">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border Background="AliceBlue" Padding="16" Width="170">
+                    <StackPanel>
+                        <TextBlock Text="设备" FontWeight="SemiBold" />
+                        <TextBlock Text="泵 A" Margin="0,12,0,0" />
+                        <TextBlock Text="泵 B" Margin="0,8,0,0" />
+                    </StackPanel>
+                </Border>
+
+                <StackPanel Grid.Column="1" Margin="20">
+                    <TextBlock Text="当前读数" FontWeight="SemiBold" />
+                    <TextBlock Text="72.5 °C" FontSize="32" Margin="0,12,0,0" />
+                    <TextBlock Text="本步只演示布局；动态数据绑定在下一步实现。"
+                               TextWrapping="Wrap" Margin="0,12,0,0" />
+                </StackPanel>
+            </Grid>
+        </Border>
+
+        <TextBlock Grid.Row="2" Text="状态：静态演示" Margin="0,16,0,0"
+                   Foreground="DimGray" />
+    </Grid>
+</Window>
+```
+
+`Grid.Row="1"` 和 `Grid.Column="1"` 是附加属性，表示子元素放入哪一格；不写时默认为第 0 行/列。外层 `StackPanel` 只负责把标题与说明顺序堆叠。它适合少量自然高度的内容，但不应把所有页面都塞进一个纵向 `StackPanel`：对需要可用高度的滚动列表，未受约束的高度会造成滚动或虚拟化行为偏离预期。后续列表篇再专门验证这一点。[官方 DataGrid 尺寸说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/controls/sizing-options-in-the-datagrid-control)也指出应给大量数据的控件有限高度，例如放进 `Grid`。
+
+这里侧栏的 `Width="170"` 是有意保留的固定宽度；`Auto` 列根据侧栏自身需求计宽，`*` 列再承接剩余空间。`MinWidth`/`MinHeight` 防止窗口缩到内容无法合理展示，但它不是“在任何内容和 DPI 下绝不裁切”的证明。将来加入长设备名、本地化文字、系统大字体时仍要实际检查。`UseLayoutRounding` 可以减少落在半物理像素边缘的模糊，不会替代良好的布局约束。
+
+## 动手检查
+
+1. 把窗口宽度从默认值缩到允许的最小值，再放大：哪一列主要变化？标题和底部状态占用的行高如何决定？
+2. 把中间 `RowDefinition` 的 `Height="*"` 改成 `Auto`，观察窗口拉高后主体是否还填满余下空间。
+3. 把侧栏 `Width="170"` 暂时移除，解释 `Auto` 列为什么可能变窄。
+4. 把长列表直接放进纵向 `StackPanel` 是否总能得到期望的滚动？先说明测量约束，再到后续列表篇验证。
+
+下一步从静态 `72.5 °C` 走向真正数据：`DataContext`、绑定方向与属性变化通知。[MVVM 与数据绑定](/knowledge/desktop/wpf/architecture/mvvm/)现有可运行示例，分别验证属性、集合和集合项的变化。
+
+参考：[Microsoft Learn：WPF 总览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/overview/)、[布局系统](https://learn.microsoft.com/dotnet/desktop/wpf/advanced/layout)、[Grid 示例](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/controls/how-to-create-a-grid-element)。
