@@ -1,0 +1,77 @@
+---
+id: csharp-types-nullability
+title: 类型、变量与空值安全
+description: 分清值类型与引用类型，正确使用 var、可空类型、空值运算符和编译器警告。
+tags: [CSharp, 类型系统, "null"]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-first-program]
+related: [csharp-control-flow-methods, csharp-nullable-contracts-flow]
+---
+
+## 为什么先学类型
+
+类型描述一个值能表示什么、能做什么。上一章的温度适合 `double`，超限状态适合 `bool`，设备名适合 `string`。C# 在编译时检查大多数类型错误；但「设备名尚未录入」这样的缺失值，需要你明确设计，不能随意假装它一定存在。
+
+## 值类型与引用类型
+
+`int`、`double`、`bool`、`decimal` 是常见值类型；`string`、数组和你定义的 `class` 通常是引用类型。赋值给另一个变量时，值类型复制值；引用类型复制的是对同一个对象的引用。`string` 虽是引用类型，但不可变：拼接会得到新字符串，不会修改旧字符串。
+
+```csharp filename="Program.cs"
+int first = 10;
+int second = first;
+second = 20;
+Console.WriteLine(first); // 10
+
+int[] left = [10];
+int[] right = left;
+right[0] = 20;
+Console.WriteLine(left[0]); // 20
+```
+
+不要把「引用类型」简化成「一定放在堆上」或「值类型一定放在栈上」；实际存储取决于上下文与运行时优化。初学时先掌握赋值和共享修改的可观察行为。
+
+## `var` 仍是静态类型
+
+`var count = 3;` 的类型在编译时推断为 `int`，之后不能赋给它字符串。它不是 JavaScript 那种可随时换类型的变量。右侧能清楚表明类型时可用 `var`，但公开 API、参数和返回值要写出类型。`var value = null;` 无法推断出唯一类型，因此不能编译。
+
+## 两种 `T?` 不要混淆
+
+在启用 Nullable 的现代项目中，`int?` 是可以存整数或 `null` 的可空值类型；`string?` 是「这个引用可能为 null」的标注与编译器分析。后者不会在运行时生成一个新的 `string` 类型，也无法保证外部数据永远守约。检查 `.csproj` 是否有 `<Nullable>enable</Nullable>`；若项目没开启，也可在练习文件顶部写 `#nullable enable`。
+
+```csharp filename="Program.cs"
+#nullable enable
+int? lastTemperature = null;
+int shown = lastTemperature ?? -1;
+Console.WriteLine(shown); // -1，表示暂无读数
+
+string? device = Console.ReadLine();
+if (string.IsNullOrWhiteSpace(device))
+{
+    Console.WriteLine("设备名不能为空");
+}
+else
+{
+    Console.WriteLine(device.ToUpperInvariant());
+}
+```
+
+`??` 在左侧为 null 时提供后备值；`?.` 在左侧为 null 时跳过成员访问并得到 null。`device!.Length` 中的 `!` 只压制编译器警告，不会检查运行值；如果判断错了，仍可能抛 `NullReferenceException`。优先使用显式检查，而不是到处加 `!`。
+
+## 数字类型与转换
+
+`int` 适合整数计数，`double` 适合允许浮点近似的测量值，`decimal` 常用于需要十进制精度的金额。把 `double` 赋给 `int` 需要显式转换，且可能丢掉小数；读取用户输入时不要直接强制转换字符串，而应使用下一章的 `TryParse`。如果一个字段的「缺失」和数值零含义不同，选 `int?` 等可空类型，不要随意用零代替。
+
+## 动手练习
+
+1. 把第一段代码中的数组改为 `string`，分别重新赋值，观察原变量是否变化。
+2. 使用 `double?` 表示缺失的温度；缺失时打印「暂无读数」，有值时打印一位小数。分别测试 null、0 和 72.5。
+3. 故意去掉 `device` 的空值检查，看看编译器是否警告；然后用判断消除警告，而不是加 `!`。
+
+验收标准：能解释 `int?` 和 `string?` 的差异，并指出 `??` 和 `!` 分别做了什么。
+
+## 参考
+
+[Microsoft Learn：C# 类型系统](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/) · [空值安全](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/null-safety/) · [可空引用类型](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/null-safety/nullable-reference-types)

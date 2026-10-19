@@ -1,0 +1,90 @@
+---
+id: csharp-immutable-collections-snapshots
+title: 不可变集合与快照：只读视图仍可能在变化
+description: 并排验证 IReadOnlyList 视图、数组副本、ImmutableArray 更新与可变元素的浅复制边界。
+tags: [CSharp, 集合, 不可变, 快照, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 16
+prerequisite: [csharp-collection-selection, csharp-value-equality]
+related: [csharp-readonly-struct-copies, csharp-collection-complexity, csharp-managed-memory-disposal]
+---
+
+## “不能通过这个引用修改”不等于“数据不会变化”
+
+`IReadOnlyList<T>` 只限制调用者**经这个接口**使用的操作。若其他代码持有原始 `List<T>` 并继续修改，调用者读到的内容仍会变。`List<T>.AsReadOnly()` 包装的是同一份列表，不是冻结副本。需要某一时刻的容器内容，可复制成数组，或转成 `ImmutableArray<T>`；后者还用不可变 API 表达“后续更新返回新集合”这一意图。
+
+下方完整 `Program.cs` 可直接运行：`dotnet run --project examples/csharp-immutable-snapshots/ImmutableSnapshotsReview.csproj`。先预测每个断言读到什么，再运行验证。
+
+```csharp filename="Program.cs"
+using System.Collections.Immutable;
+
+List<int> source = [1, 2];
+IReadOnlyList<int> view = source.AsReadOnly();
+int[] arrayCopy = source.ToArray();
+ImmutableArray<int> immutable = source.ToImmutableArray();
+
+source.Add(3);
+Check(view.Count == 3, "read-only view sees source changes");
+Check(arrayCopy.Length == 2 && immutable.Length == 2,
+    "copies retain their container contents");
+
+ImmutableArray<int> expanded = immutable.Add(4);
+Check(immutable.SequenceEqual([1, 2]), "old immutable value is unchanged");
+Check(expanded.SequenceEqual([1, 2, 4]), "Add returns a new value");
+Check(default(ImmutableArray<int>).IsDefault, "default is uninitialized");
+Check(!ImmutableArray<int>.Empty.IsDefault && ImmutableArray<int>.Empty.IsEmpty,
+    "Empty is an initialized empty collection");
+
+var reading = new MutableReading(72);
+ImmutableArray<MutableReading> shallow = ImmutableArray.Create(reading);
+ImmutableArray<ReadingSnapshot> stable = [new(reading.Value)];
+reading.Value = 99;
+Check(shallow[0].Value == 99, "immutable container does not freeze its element");
+Check(stable[0].Value == 72, "copying into immutable values forms a stable snapshot");
+Console.WriteLine("只读视图、容器快照与不可变元素断言全部通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public sealed class MutableReading(int value)
+{
+    public int Value { get; set; } = value;
+}
+
+public readonly record struct ReadingSnapshot(int Value);
+```
+
+## 三种承诺，逐层加深
+
+| 形式 | 源列表追加后 | 调用者能否改容器 | 还需留意 |
+| --- | --- | --- | --- |
+| `source.AsReadOnly()` 作为 `IReadOnlyList<T>` | 看得到新元素 | 不能通过该视图增删 | 源持有者仍可修改 |
+| `source.ToArray()` | 数组长度保持复制时的值 | 数组元素仍可赋值 | 元素引用仅浅复制 |
+| `source.ToImmutableArray()` | 旧值保持不变 | `Add` 返回新值 | 元素对象仍可能可变 |
+
+`ImmutableArray<T>.Add` 不修改原值；示例中的 `expanded` 与 `immutable` 可以同时存在。反过来，别把 `ImmutableArray<T>` 当成“零成本可增长数组”：逐次 `Add` 需要创建新内容，数组式实现的追加是 O(n)。大量元素的初始构造通常先用 `List<T>` 或 Builder，确定边界后一次转换；具体选择要按数据量和操作模式评估，而非只看类型名。
+
+`ImmutableArray<T>` 是结构体，`default(ImmutableArray<T>)` 表示未初始化，不等同于 `ImmutableArray<T>.Empty`。公开 API 若允许默认值流入，应明确是拒绝它、把它规范化为空，还是保留“尚未加载”的第三种状态；不能在未约定时直接把两者混为同一个空集合。
+
+## 容器不可变，不保证元素不可变
+
+`shallow` 保留的是 `MutableReading` 的引用。改变对象的 `Value` 后，数组中的同一对象当然读到 `99`；不可变的是**集合槽位**，不是它所指对象的内部状态。`stable` 则把读数复制成只含值的 `readonly record struct`，因此保留 `72`。这也是浅复制和业务快照的差别：若元素含可变列表、字典或其他对象，还要沿需要稳定的字段继续复制，或让领域模型本身保持不变。
+
+不可变集合可以降低共享读路径的修改风险，但并不自动解决多个线程**同时更新“当前快照”引用**时的竞争。若并发写者都从旧值生成新集合再发布，仍须采用适当同步或原子更新协议；只读类型不是并发算法。
+
+## 面试自测与练习
+
+1. 如果方法返回 `IReadOnlyList<int>`，调用方能否断言下一次读取 `Count` 一定不变？还需要什么所有权约定？
+2. `ToArray()` 与 `ToImmutableArray()` 都先复制了本例的整数，为什么前者仍可让拿到数组的代码改写元素？
+3. 为什么 `ImmutableArray<MutableReading>` 不会让 `MutableReading.Value` 冻结？若要给外部发布稳定快照，应该复制哪些数据？
+4. 一个热路径需要追加十万项，再向多个读者发布。逐项对 `ImmutableArray<T>` 调用 `Add` 合适吗？可以怎样分开构造期与发布期？
+
+验收标准：能分别说明只读访问、独立容器、不可变容器、不可变元素及并发发布五个边界，而非把它们统称“只读”。
+
+## 参考
+
+[Microsoft Learn：`ImmutableArray<T>`](https://learn.microsoft.com/en-us/dotnet/api/system.collections.immutable.immutablearray-1?view=net-10.0) · [`ToImmutableArray` API](https://learn.microsoft.com/en-us/dotnet/api/system.collections.immutable.immutablearray.toimmutablearray?view=net-10.0)

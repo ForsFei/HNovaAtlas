@@ -1,0 +1,120 @@
+---
+id: wpf-ui-thread-and-async
+title: WPF UI 线程与异步：等待、取消、关闭和错误归属
+description: 用可控模拟读取理解 Dispatcher 亲和、async 事件边界、取消令牌、关闭等待与后台异常处理。
+tags: [WPF, async-await, Dispatcher, CancellationToken, UI线程, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-16"
+order: 40
+prerequisite: [wpf-commands-and-validation, wpf-properties-styles-and-templates]
+related: [wpf-learning-path, wpf-mvvm, wpf-collection-views-and-virtualization]
+---
+
+## 窗口为什么会“卡住”
+
+WPF 控件通常由创建它们的 UI 线程拥有，输入、布局和绘制依赖这个线程的 `Dispatcher` 处理消息。如果在按钮事件里同步睡眠三秒，消息就无法及时处理，窗口看似无响应。`await` 一个真正尚未完成的任务可以把控制权还给 UI 消息循环；但把耗时 CPU 循环包在 `async` 方法里、仍在第一次 `await` 前执行，不会自动变成后台工作。[Microsoft Learn：WPF 线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)解释了 Dispatcher 亲和与保持队列任务短小的原因。
+
+本篇用 `Task.Delay` **模拟等待外部读取**，没有设备连接、网络请求或真实遥测。运行 `dotnet run --project examples/wpf-async-readings/WpfAsyncReadings.csproj`：开始读取后尝试点击“响应测试 +1”，再试取消、模拟失败、读取中关闭窗口。按钮不应因模拟等待而冻结；读数、取消和失败应有不同状态。
+
+## 三处代码，各有线程责任
+
+示例刻意分成三个边界：
+
+| 位置 | 做什么 | 不做什么 |
+| --- | --- | --- |
+| `SimulatedReadingSource` | 等待三秒，尊重取消令牌，返回数值或抛模拟故障 | 不触碰任何 WPF 控件 |
+| `ReadingSession` | 管理一次运行、状态、取消、失败和关闭；提供可等待的 `Task` | 不持有 `Window`、`Dispatcher` 或控件引用 |
+| `MainWindow` | 接收按钮事件并 `await` 会话；关闭前等待会话结束 | 不在后台线程直接改 UI，也不在事件里用 `.Wait()`/`.Result` 堵塞 |
+
+模拟源中的 `ConfigureAwait(false)` 表示它不需要回到调用者的上下文。窗口调用 `await _session.StartAsync(...)`，会话自身的 `await source.ReadAsync(...)` **没有**配置为放弃 UI 上下文；从 WPF UI 线程启动时，后续状态更新通常回到该上下文。这里不是让所有层都无条件加或删 `ConfigureAwait(false)`，而是按是否需要 UI 上下文划清边界。
+
+```csharp filename="SimulatedReadingSource.cs"
+public async Task<int> ReadAsync(bool simulateFailure, CancellationToken cancellationToken)
+{
+    await Task.Delay(TimeSpan.FromSeconds(3), cancellationToken).ConfigureAwait(false);
+    if (simulateFailure) throw new IOException("模拟连接中断");
+    return 72;
+}
+```
+
+`Task.Delay` 不占用 UI 线程去“忙等”，也不需要为这段等待再包一层 `Task.Run`。如果换成真正的 CPU 密集计算，可以考虑 `Task.Run` 把**纯计算**搬到线程池，然后在 UI 侧 `await` 结果；不能把 WPF 控件一起传到工作线程修改。真正的异步 I/O 则优先用它提供的异步 API。[官方线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)给出了 `Task.Run` 与 Dispatcher 的对照。
+
+## 可取消不等于“点了取消就已经停止”
+
+会话每次启动创建一个 `CancellationTokenSource`，把令牌传入实际等待。取消按钮调用 `Cancel()` 发出请求；只有底层操作观察令牌并结束后，任务才算完成。本例 `Task.Delay(..., token)` 会在取消时结束等待并产生 `OperationCanceledException`。[`Task.Delay` 官方 API](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.delay?view=net-10.0)提供可取消重载。
+
+```csharp filename="ReadingSession.cs"
+public void Cancel()
+{
+    if (!CanCancel) return;
+    _cancellation!.Cancel();
+    Changed(nameof(CanCancel));
+}
+
+private async Task RunCoreAsync(bool simulateFailure, CancellationTokenSource cancellation)
+{
+    try
+    {
+        int value = await source.ReadAsync(simulateFailure, cancellation.Token);
+        if (!_isClosed)
+        {
+            LastValueText = $"最近读数：{value} °C";
+            StatusText = "读取完成。";
+        }
+    }
+    catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+    {
+        if (!_isClosed) StatusText = "已取消；本次没有更新读数。";
+    }
+    catch (Exception error)
+    {
+        LastError = error;
+        if (!_isClosed) StatusText = "读取失败（模拟故障），请重试。";
+    }
+    finally
+    {
+        cancellation.Dispose();
+        _cancellation = null;
+        if (_isClosed) _isBusy = false;
+        else IsBusy = false;
+    }
+}
+```
+
+完成、主动取消和故障是不同结果。只有由本次令牌请求取消的 `OperationCanceledException` 被归为“已取消”；其他错误进入失败路径，并把异常保存在 `LastError` 供诊断，界面只显示简短提示。取消后不会把旧读数清成 0，失败后允许重试。`IsBusy` 在读取期间阻止第二次启动；重复点击并不会创建第二个读取任务。
+
+## 为什么关闭要等待当前任务
+
+用户在读取中关闭窗口时，若只让窗口消失、把操作留在后台，完成回调可能继续触碰已不再可见的界面或让错误无人观察。本例的关闭事件先取消本次关闭，再把会话标为关闭并请求取消，`await` 正在运行的任务；待它结束后才再次调用 `Close()`。会话看到 `_isClosed` 后不再发状态变化通知。若源不合作、不响应取消，关闭也会继续等待——生产应用应在真实 I/O 层设计超时和终止策略，而不是在这里假装取消必然立即完成。
+
+```csharp filename="MainWindow.xaml.cs"
+private async void Window_Closing(object? sender, CancelEventArgs e)
+{
+    if (_allowClose) return;
+    if (_isClosing) { e.Cancel = true; return; }
+    if (!_session.IsBusy) { await _session.CloseAsync(); return; }
+
+    e.Cancel = true;
+    _isClosing = true;
+    try { await _session.CloseAsync(); }
+    catch (Exception error) { Debug.WriteLine(error); }
+    finally { _allowClose = true; Close(); }
+}
+```
+
+这里 `async void` 只出现在 WPF 事件处理器这个必要边界；真正可组合、可测试的 `StartAsync` 和 `CloseAsync` 返回 `Task`。不要在 UI 线程上对这些任务调用 `.Wait()`、`.Result` 或 `GetAwaiter().GetResult()`：除了冻结界面，在等待需要回到同一上下文的续体时还可能死锁。[官方 async 场景说明](https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/async-scenarios)强调事件处理器之外应返回任务。窗口入口还应观察意外异常；会话已经处理了预期的取消和模拟故障。
+
+## 自动断言能证明什么
+
+运行 `dotnet run --project examples/wpf-async-readings-checks/AsyncReadingChecks.csproj`。受控数据源不用真实计时：测试主动完成或失败一个 `TaskCompletionSource<int>`，分别断言成功、运行中防重复、取消后不写结果、故障后可重试、关闭请求后不再发通知且任务结束。这样避免了依赖“三秒刚好过去”的脆弱测试。
+
+控制台断言没有启动 WPF Dispatcher，**不能**独自证明窗口在读取中持续响应或 UI 更新线程正确。请在 Windows 桌面运行窗口：开始后连续点“响应测试 +1”，取消一次、模拟失败一次，并在读取中关闭；如需检查线程，可在窗口 `await` 后观察 `Dispatcher.CheckAccess()`。启动烟测和静态站点构建也不等于这些桌面交互验收。
+
+## 面试自测
+
+1. `async` 方法在第一次 `await` 前执行三秒 CPU 循环，窗口会响应吗？为什么？
+2. 对真正异步 I/O 再套 `Task.Run` 有什么问题？CPU 计算放到线程池后能直接改 `TextBlock.Text` 吗？
+3. 点“取消”后为何还要等待任务结束？`CancellationToken` 是否能强制停止任意第三方调用？
+4. 为什么可测试的工作方法返回 `Task`，而 WPF `Click`/`Closing` 事件处理器可以是 `async void`？
+5. 关闭窗口前，如何防止旧操作完成后覆盖新的窗口状态或产生未观察异常？

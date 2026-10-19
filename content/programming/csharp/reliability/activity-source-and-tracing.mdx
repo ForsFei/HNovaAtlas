@@ -1,0 +1,127 @@
+---
+id: csharp-activity-source-tracing
+title: ActivitySource 与追踪：把异步步骤连成一次操作
+description: 用进程内监听器验证追踪 ID、父子 Activity、跨 await 的当前上下文和失败状态。
+tags: [CSharp, .NET, ActivitySource, 分布式追踪, 诊断, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-15"
+order: 35
+prerequisite: [csharp-async-await, csharp-exception-boundaries-filters]
+related: [csharp-managed-memory-disposal, csharp-io-http-end-to-end-deadline, csharp-synchronization-context-configureawait]
+---
+
+## 错误在哪一步发生，不靠猜线程号
+
+一个设备读取请求可能先读网络、再解析帧、最后保存结果。每一步都异步，日志顺序也可能与别的请求交错。仅靠“这个线程的日志”很难知道哪几个步骤属于同一次操作。[异常边界](/knowledge/programming/csharp/reliability/exception-boundaries-and-filters/)回答如何保留失败原因；本篇回答如何给一组步骤建立**可关联的诊断上下文**。
+
+在 .NET 的分布式追踪 API 中，`Activity` 表示一次操作的一段工作，也常被称为一个 *span*；这里的 span **不是**内存视图 `Span<T>`。同一次追踪中的父子活动共享 `TraceId`，各自有 `SpanId`，子活动的 `ParentSpanId` 指向父活动。`ActivitySource` 是生产者：应用代码从它开始/结束活动、添标签和状态。监听器或遥测库选择采样和收集，最终存到哪里是另一个责任。只创建 `ActivitySource` 不等于已经有可查询的监控系统。
+
+| 名称 | 回答的问题 |
+| --- | --- |
+| `TraceId` | 这些步骤属于哪一次追踪？ |
+| `SpanId` / `ParentSpanId` | 当前是哪一步，它直接接在谁后面？ |
+| `Activity.Current` | 当前异步执行流处于哪段活动？ |
+| `Status` / Tag | 该段工作是否失败，有哪些允许记录的低敏上下文？ |
+
+## 生产者、监听器与采样
+
+通常为一个组件长期持有一个命名稳定的 `ActivitySource`；不要每处理一条消息就创建一个新来源。`StartActivity` **可能返回 `null`**：没有监听者，或没有监听者选择采样时，不必生成活动和标签。生产仪表化代码因此常写 `using var activity = Source.StartActivity("..."); activity?.SetTag(...)`。下方是教学测试，**先装入会采样的监听器**，所以用 `?? throw` 断言它确实收到了活动。不要把这个测试断言直接复制到真实请求路径。
+
+`ActivityListener` 的 `ShouldListenTo` 只选择本示例来源，`Sample` 返回 `AllDataAndRecorded`，`ActivityStopped` 在结束时复制出要验证的字段。测试不连接外部遥测服务，也不依赖睡眠或精确耗时。运行 `dotnet run --project examples/csharp-activity-tracing/ActivityTracingReview.csproj`，完整代码如下：
+
+示例只有一条顺序执行的教学流程，因而用普通 `List<Snapshot>` 收集回调。生产进程可能并发触发监听回调，不能照搬这份列表作为线程安全遥测收集器；应交给合适的导出器或自行处理同步与背压。
+
+```csharp filename="Program.cs"
+using System.Diagnostics;
+
+using var source = new ActivitySource("HNova.Atlas.Reading", "1.0.0");
+var stopped = new List<Snapshot>();
+using var listener = new ActivityListener
+{
+    ShouldListenTo = candidate => candidate.Name == source.Name,
+    Sample = (ref ActivityCreationOptions<ActivityContext> _) =>
+        ActivitySamplingResult.AllDataAndRecorded,
+    ActivityStopped = activity => stopped.Add(new Snapshot(
+        activity.OperationName, activity.TraceId, activity.SpanId,
+        activity.ParentSpanId, activity.Status,
+        activity.GetTagItem("device.kind")?.ToString()))
+};
+ActivitySource.AddActivityListener(listener);
+
+Activity? previous = Activity.Current;
+ActivityTraceId traceId;
+ActivitySpanId parentSpanId;
+using (Activity parent = source.StartActivity("read-device", ActivityKind.Internal)
+    ?? throw new Exception("listener did not sample parent"))
+{
+    Check(parent.Recorded, "listener sampled the parent");
+    parent.SetTag("device.kind", "temperature");
+    traceId = parent.TraceId;
+    parentSpanId = parent.SpanId;
+
+    await Task.Yield();
+    Check(ReferenceEquals(Activity.Current, parent), "current activity flows across await");
+
+    try { await ParseAsync(source); }
+    catch (InvalidDataException)
+    {
+        parent.SetStatus(ActivityStatusCode.Error, "invalid frame");
+    }
+    Check(ReferenceEquals(Activity.Current, parent), "child scope restores parent");
+}
+
+Check(ReferenceEquals(Activity.Current, previous), "parent scope restores previous context");
+Check(stopped.Count == 2 && stopped[0].Name == "parse-frame" &&
+    stopped[1].Name == "read-device", "child stops before parent");
+Check(stopped.All(item => item.TraceId == traceId), "both operations share trace ID");
+Check(stopped[0].ParentSpanId == parentSpanId &&
+    stopped[0].SpanId != parentSpanId, "child has its own span ID and parent ID");
+Check(stopped.All(item => item.Status == ActivityStatusCode.Error) &&
+    stopped[1].DeviceKind == "temperature", "status and safe tag are captured");
+Console.WriteLine("Activity 父子关联、跨 await 上下文和错误状态验证通过。");
+
+static async Task ParseAsync(ActivitySource source)
+{
+    using Activity child = source.StartActivity("parse-frame", ActivityKind.Internal)
+        ?? throw new Exception("listener did not sample child");
+    Check(ReferenceEquals(Activity.Current, child),
+        "child becomes current activity");
+    await Task.Yield();
+    try { throw new InvalidDataException("bad frame"); }
+    catch (InvalidDataException)
+    {
+        child.SetStatus(ActivityStatusCode.Error, "invalid frame");
+        throw;
+    }
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+record Snapshot(string Name, ActivityTraceId TraceId, ActivitySpanId SpanId,
+    ActivitySpanId ParentSpanId, ActivityStatusCode Status, string? DeviceKind);
+```
+
+## 读懂跨 await、结束顺序与错误状态
+
+父活动启动后成为 `Activity.Current`；在普通的 `await Task.Yield()` 后，当前活动仍是父活动。进入 `ParseAsync` 时子活动成为当前值，子活动 `Dispose` 后恢复父活动，父活动结束后再恢复原来的上下文。这里验证的是 `Activity` 的异步上下文传播，**不能**据此推断恢复执行的线程 ID，也不表示业务状态自动线程安全；详见[await 恢复到哪里](/knowledge/programming/csharp/concurrency/synchronization-context-and-configureawait/)。
+
+子活动的 `throw;` 保留原始异常，外层捕获后也标记父活动失败。不要假设任意异常抛出就一定使每个自定义活动自动带 `Error` 状态；应在负责的边界明确设置，并保留原有异常传播或转换契约。`using` 结束活动，监听器在停止回调里看到最终标签/状态；子活动先停、父活动后停。示例只记录低敏的设备种类，不把原始报文、访问令牌、用户身份或异常全文无筛选地塞入标签。标签会进入可能跨系统传输的诊断数据，需按应用的数据治理规则筛选。
+
+这个例子没有展示跨进程传播。真实 HTTP 请求中的追踪上下文通常需要相应的服务端/客户端仪表化或遥测库来注入、提取、采样并导出；不能把“两个本地 Activity 同 TraceId”误认为外部系统已经连通。日志、指标、分布式追踪和内存剖析各回答不同问题，也不能用活动数量代替性能测量或 GC 诊断。
+
+要观察“多次请求中失败了多少、耗时样本如何分布、此刻待处理多少”，继续读[.NET 指标](/knowledge/programming/csharp/reliability/metrics-counters-histograms-and-gauges/)；它不替代本篇对单次操作的关联。
+
+要保留业务边界的一次事件、异常对象和可查询字段，参见[结构化日志](/knowledge/programming/csharp/reliability/structured-logging-and-scopes/)；日志不会自动建立或导出完整的父子追踪。
+
+## 面试自测
+
+1. `TraceId`、`SpanId`、`ParentSpanId` 分别识别什么？两个子步骤共享 `TraceId` 是否意味着它们是同一个活动？
+2. 为什么生产代码要允许 `StartActivity` 返回 `null`？没有监听者时业务逻辑是否应失败？
+3. `Activity.Current` 跨 `await` 保持，能否推断执行线程没有变化？
+4. 捕获异常后仅调用 `SetStatus(Error)`，是否等于异常已被记录、导出或业务上已处理？
+
+参考：[Microsoft Learn：分布式追踪概念](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/distributed-tracing-concepts)、[添加 ActivitySource 仪表化](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/distributed-tracing-instrumentation-walkthroughs)、[用 ActivityListener 收集追踪](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/distributed-tracing-collection-walkthroughs)。

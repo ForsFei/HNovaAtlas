@@ -1,25 +1,29 @@
 ---
 id: wpf-mvvm
-title: WPF MVVM 与数据绑定
-description: 从绑定源与绑定目标理解 View 和 ViewModel 的连接。
-tags: [WPF, MVVM, Binding]
+title: WPF MVVM 与数据绑定：属性、集合和集合项如何通知界面
+description: 从 DataContext、OneWay/TwoWay 到三种变化通知，用可运行窗口和独立断言理解绑定边界。
+tags: [WPF, MVVM, Binding, INotifyPropertyChanged, 面试]
 difficulty: beginner
 status: published
-updated: "2026-09-29"
+updated: "2026-10-15"
 order: 10
+prerequisite: [wpf-xaml-layout-basics]
+related: [wpf-learning-path, wpf-commands-and-validation]
 ---
 
 ## 从绑定关系开始
 
-WPF 数据绑定连接一个绑定目标与一个绑定源。在 MVVM 中，视图通常通过 `DataContext` 访问 ViewModel 暴露的数据。
+如果还不熟悉 `App.xaml`、窗口和 `Grid` 的空间分配，先读[WPF 应用、XAML 与布局](/knowledge/desktop/wpf/fundamentals/xaml-layout-basics/)；本篇只聚焦视图与数据对象如何连接。运行 `dotnet run --project examples/wpf-binding-notifications/WpfBindingNotifications.csproj` 可在 Windows 桌面观察界面，或用 `dotnet run --project examples/wpf-binding-notifications-checks/BindingNotificationChecks.csproj` 验证数据对象发出的事件；后一条命令**不运行 WPF 绑定引擎**。
+
+WPF 数据绑定至少要认清四件事：目标对象与目标属性、源对象与源属性路径。例如 `<TextBlock Text="{Binding PanelTitle}" />` 的目标是 `TextBlock.Text`，源通常是当前 `DataContext` 对象的 `PanelTitle`。未显式指定 Source 时，元素没有设置自己的 `DataContext`，就沿父元素向上寻找；局部覆盖 `DataContext` 会改变该子树的绑定源。[官方数据绑定概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/data-binding-overview)说明了这一继承规则。不要把 `{Binding PanelTitle}` 理解成“从任意全局对象搜索同名属性”。
 
 ## 一个属性绑定
 
 ```xml filename="MainWindow.xaml" {1}
-<TextBlock Text="{Binding DisplayName}" />
+<TextBlock Text="{Binding PanelTitle}" />
 ```
 
-这段 XAML 将 `Text` 绑定到当前数据上下文中的 `DisplayName`。排查问题时，先确认数据上下文，再检查属性路径。
+这段 XAML 将 `Text` 绑定到当前数据上下文中的 `PanelTitle`。示例在窗口构造函数中把 `DataContext` 设为 `ReadingsViewModel`；`ListBox` 的每个 `DataTemplate` 项目则以相应的 `ReadingItem` 作为绑定源，所以模板里的 `{Binding Temperature}` 并不是到 ViewModel 上找这个属性。
 
 <Tabs label="观察绑定两端">
   <Tab value="target" label="绑定目标">
@@ -29,14 +33,14 @@ WPF 数据绑定连接一个绑定目标与一个绑定源。在 MVVM 中，视�
   </Tab>
   <Tab value="source" label="绑定源">
 
-绑定源是当前 `DataContext` 指向对象的 `DisplayName` 属性；在 MVVM 中通常由 ViewModel 提供。
+绑定源是当前 `DataContext` 指向对象的 `PanelTitle` 属性；在 MVVM 中通常由 ViewModel 提供。
 
   </Tab>
 </Tabs>
 
 ## 数据变化如何通知视图
 
-绑定源实现 `INotifyPropertyChanged`，可以通知绑定系统属性已变化。集合增删通知与单个元素的属性变化，是两个需要分别处理的问题。
+源对象实现 `INotifyPropertyChanged`，可以通知绑定系统**它的某个属性**已变化。集合增删通知与单个元素的属性变化，是两个需要分别处理的问题。把它们混在一个“刷新列表”方法里，不利于定位实际缺失的是哪一层通知。
 
 <Callout type="warning" title="绑定不是轮询">
 
@@ -44,13 +48,129 @@ WPF 数据绑定连接一个绑定目标与一个绑定源。在 MVVM 中，视�
 
 </Callout>
 
-## 检查顺序
+## OneWay、TwoWay 与写回时机
 
-1. 目标控件的 `DataContext` 是否正确？
-2. 属性路径是否存在？
-3. 绑定方向是否符合交互需求？
-4. 源变化时是否发出通知？
+示例中，标题 `TextBlock` 显式使用 `Mode=OneWay`：`PanelTitle` 改了，文字跟着变；这个只读目标不会把编辑传回源。`TextBox` 则显式使用 `Mode=TwoWay`，用户输入可以写回 `PanelTitle`，ViewModel 更新也可以回显到输入框。不要凭控件表面能否编辑去推测默认模式；绑定模式由目标依赖属性的元数据默认值或显式配置决定。
+
+`TextBox.Text` 默认在**失去焦点**时更新源。本例为了让上方标题逐字变化，明确设置 `UpdateSourceTrigger=PropertyChanged`。这让每次输入变化都尝试写回源，适合当前简单字符串演示，不表示复杂表单也应每个按键都提交业务操作；输入验证和命令边界留给下一步。参见[官方更新时机说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/how-to-control-when-the-textbox-text-updates-the-source)。
+
+```xml filename="MainWindow.xaml"
+<TextBlock Text="{Binding PanelTitle, Mode=OneWay}" />
+<TextBox Text="{Binding PanelTitle, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}" />
+<ListBox ItemsSource="{Binding Readings}">
+    <ListBox.ItemTemplate>
+        <DataTemplate>
+            <StackPanel Orientation="Horizontal">
+                <TextBlock Text="{Binding DeviceId}" />
+                <TextBlock Text="{Binding Temperature}" />
+            </StackPanel>
+        </DataTemplate>
+    </ListBox.ItemTemplate>
+</ListBox>
+```
+
+这段只保留三条关键绑定；完整窗口 XAML 和按钮事件在 `examples/wpf-binding-notifications`。按钮暂用 code-behind 调用 ViewModel 方法，只为触发三类变化；[下一步的命令与输入验证](/knowledge/desktop/wpf/architecture/commands-and-validation/)引入 `ICommand`，并非推荐把复杂业务逻辑长期堆进窗口类。
+
+## 三层变化，各由谁发通知
+
+| 变化 | 谁发通知 | 本例观察 |
+| --- | --- | --- |
+| `PanelTitle` 从“设备读数”变为“实时读数” | ViewModel 的 `PropertyChanged(nameof(PanelTitle))` | 绑定标题与输入框更新 |
+| `Readings.Add` / `RemoveAt` | `ObservableCollection<T>.CollectionChanged` | 列表增加或移除一行 |
+| 已有 `ReadingItem.Temperature` 从 72 变 73 | 该项的 `PropertyChanged(nameof(Temperature))` | 该行数值更新；不是一次集合增删 |
+
+`ObservableCollection<T>` 并不会因为列表中某个对象的普通属性改变，就自动发出“集合发生增删”的事件。要让可变项的绑定属性更新，项自己要提供通知；若项本身是不变快照，可以改用替换整项，但那是另一种更新协议。[官方集合绑定示例](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/how-to-create-and-bind-to-an-observablecollection)也区分集合变动与项属性通知。
+
+ViewModel 用一个普通属性和一个可观测集合表达两层状态；初始的两项是窗口构造后可立即显示的数据：
+
+```csharp filename="ReadingsViewModel.cs"
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+
+namespace WpfBindingNotifications;
+
+public sealed class ReadingsViewModel : INotifyPropertyChanged
+{
+    private string _panelTitle = "设备读数";
+
+    public string PanelTitle
+    {
+        get => _panelTitle;
+        set
+        {
+            if (_panelTitle == value) return;
+            _panelTitle = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(PanelTitle)));
+        }
+    }
+
+    public ObservableCollection<ReadingItem> Readings { get; } =
+    [
+        new("泵 A", 72),
+        new("泵 B", 68)
+    ];
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+
+    public void AddReading() =>
+        Readings.Add(new ReadingItem($"设备 {Readings.Count + 1}", 20 + Readings.Count));
+
+    public void RemoveLastReading()
+    {
+        if (Readings.Count > 0) Readings.RemoveAt(Readings.Count - 1);
+    }
+
+    public void IncreaseFirstTemperature()
+    {
+        if (Readings.Count > 0) Readings[0].Temperature++;
+    }
+}
+```
+
+可变项单独实现属性通知。这里 `DeviceId` 构造后不变，所以只为 `Temperature` 发通知；同值赋值也不重复发事件。若将来允许改设备 ID，就必须重新审视它的通知和身份契约。
+
+```csharp filename="ReadingItem.cs"
+using System.ComponentModel;
+
+namespace WpfBindingNotifications;
+
+public sealed class ReadingItem(string deviceId, int temperature) : INotifyPropertyChanged
+{
+    private int _temperature = temperature;
+
+    public string DeviceId { get; } = deviceId;
+    public int Temperature
+    {
+        get => _temperature;
+        set
+        {
+            if (_temperature == value) return;
+            _temperature = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Temperature)));
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+}
+```
+
+独立断言直接订阅事件，验证属性赋相同值不重复通知、集合增删分别是 Add/Remove、改单项只产生项属性事件。它确认**数据对象履行了通知契约**，但没有实例化窗口、执行 WPF 绑定表达式或检查最终像素；实际界面仍应在 Windows 桌面运行 WPF 项目，逐项输入标题并点击三个按钮。后续测试篇再讨论自动化 UI 与 ViewModel 单元测试的分工。
+
+## 绑定不更新时的检查顺序
+
+1. 目标元素继承到哪个 `DataContext`？`DataTemplate` 内通常是单个列表项，不是外层 ViewModel。
+2. 绑定路径和公开属性名是否一致？例如 `Temperature` 拼错不会由 C# 编译器替 XAML 自动兜底。
+3. `Mode` 和 `UpdateSourceTrigger` 是否符合预期？“还没失焦”与“源没通知”是两个不同原因。
+4. 更改的是 ViewModel 属性、集合结构，还是现有项的属性？检查对应对象是否真的发出对应事件。
+5. 若仍不更新，查看 Visual Studio 输出窗口中的 WPF 绑定诊断，而不是盲目重复设置 `DataContext`。跨线程修改集合和 UI 的问题属于后续 UI 线程阶段，不应靠忽略异常解决。
+
+## 面试自测
+
+1. `DataContext` 设在窗口上，列表模板中的 `{Binding Temperature}` 默认向谁查找？
+2. `TextBox.Text` 的 `Mode=TwoWay` 已设置，为什么输入时标题不一定立即更新？
+3. `ObservableCollection<ReadingItem>` 已经可观测，为什么把 `Readings[0].Temperature` 改掉仍可能不刷新行？
+4. 属性事件断言全部通过，能否宣称 XAML 绑定路径、模板和真实 UI 一定正确？
 
 ## 参考资料
 
-[Microsoft Learn：WPF 数据绑定概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/)
+[Microsoft Learn：WPF 数据绑定概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/data-binding-overview)、[属性变化通知](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/how-to-implement-property-change-notification)、[ObservableCollection 绑定](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/how-to-create-and-bind-to-an-observablecollection)。

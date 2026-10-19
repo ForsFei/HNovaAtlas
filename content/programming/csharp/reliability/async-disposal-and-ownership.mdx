@@ -1,0 +1,127 @@
+---
+id: csharp-async-disposal-ownership
+title: IAsyncDisposable 与 await using：清理也需要等待
+description: 用受控资源验证 await using 会等待异步清理、异常离开时仍清理，并区分拥有与借用的资源责任。
+tags: [CSharp, IAsyncDisposable, await using, 资源管理, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 25
+prerequisite: [csharp-exceptions-disposal, csharp-managed-memory-disposal, csharp-async-await]
+related: [csharp-io-streams-ownership, csharp-io-async-files, csharp-async-streams-cancellation]
+---
+
+## `using` 关闭资源，`await using` 等清理完成
+
+[异常与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)介绍了同步 `using`，[托管内存、GC 与 IDisposable](/knowledge/programming/csharp/reliability/managed-memory-and-disposal/)区分了 GC 回收和资源清理。某些资源的收尾可能需要异步 I/O：例如刷新缓冲、结束事务或向远端发送关闭消息。它们可以实现 `IAsyncDisposable`，其 `DisposeAsync()` 返回 `ValueTask`；调用方在异步方法中用 `await using`，离开作用域时**等待**这项清理。
+
+`await using` 不是让所有 `Dispose` 变快的语法，也不会凭空给只有 `IDisposable` 的对象提供异步清理。它与 `using` 一样在异常离开作用域时执行清理；区别是清理本身可以暂停当前异步方法。调用方观察到这个方法完成或原工作异常时，正常的 `DisposeAsync` 流程已走完。若清理自身失败，还要在调用边界处理那个失败；不要假定工作错误和清理错误会自动合并成理想的报告。本篇先用清理成功的路径隔离最关键的生命周期语义。
+
+## 受控示例：清理未结束，作用域也未结束
+
+以下是完整 `Program.cs`，与 `examples/csharp-async-disposal` 一致。`TrackedLease` 是教学资源；它没有真实文件或网络，而是用 `TaskCompletionSource` 暂停清理。这样能确定地观察“已进入 `DisposeAsync`，但外层任务尚未完成”，不依赖计时或线程号。
+
+```csharp filename="Program.cs"
+var normalTrace = new List<string>();
+var normalGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var owned = new TrackedLease(normalGate.Task, normalTrace);
+Task normal = UseOwnedAsync(owned, normalTrace);
+Check(!normal.IsCompleted && normalTrace.SequenceEqual(["body", "dispose-start"]),
+    "await using waits for incomplete cleanup");
+normalGate.SetResult();
+await normal;
+Check(owned.DisposeCalls == 1 && normalTrace.SequenceEqual(["body", "dispose-start", "dispose-end"]),
+    "the scope completes only after disposal completes");
+
+var failureTrace = new List<string>();
+var failureGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+var failingLease = new TrackedLease(failureGate.Task, failureTrace);
+var expected = new InvalidOperationException("work failed");
+Task failed = UseFailingAsync(failingLease, failureTrace, expected);
+Check(!failed.IsCompleted && failureTrace.SequenceEqual(["body", "dispose-start"]),
+    "a body fault still awaits cleanup before reaching the caller");
+failureGate.SetResult();
+try { await failed; throw new Exception("expected work failure"); }
+catch (InvalidOperationException error) when (ReferenceEquals(error, expected)) { }
+Check(failingLease.DisposeCalls == 1 && failureTrace[^1] == "dispose-end",
+    "cleanup finished before the body fault was observed");
+
+var borrowedTrace = new List<string>();
+var borrowed = new TrackedLease(Task.CompletedTask, borrowedTrace);
+UseBorrowed(borrowed, borrowedTrace);
+Check(borrowed.DisposeCalls == 0, "a borrower does not dispose its caller's lease");
+await borrowed.DisposeAsync(); // The owner closes its own resource.
+Check(borrowed.DisposeCalls == 1 && borrowedTrace.SequenceEqual(["use", "dispose-start", "dispose-end"]),
+    "the owner eventually disposes the borrowed resource");
+
+Console.WriteLine("异步清理与资源所有权断言全部通过。");
+
+static async Task UseOwnedAsync(TrackedLease lease, List<string> trace)
+{
+    await using (lease) { trace.Add("body"); }
+}
+
+static async Task UseFailingAsync(TrackedLease lease, List<string> trace, Exception failure)
+{
+    await using (lease)
+    {
+        trace.Add("body");
+        throw failure;
+    }
+}
+
+static void UseBorrowed(TrackedLease lease, List<string> trace)
+{
+    Check(lease.DisposeCalls == 0, "borrowed lease is open");
+    trace.Add("use");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+sealed class TrackedLease(Task releaseGate, List<string> trace) : IAsyncDisposable
+{
+    private bool _disposed;
+    public int DisposeCalls { get; private set; }
+
+    public ValueTask DisposeAsync()
+    {
+        if (_disposed) return ValueTask.CompletedTask;
+        _disposed = true;
+        DisposeCalls++;
+        trace.Add("dispose-start");
+        return new ValueTask(FinishAsync());
+    }
+
+    private async Task FinishAsync()
+    {
+        await releaseGate.ConfigureAwait(false);
+        trace.Add("dispose-end");
+    }
+}
+```
+
+第一组：`UseOwnedAsync` 的主体已经结束，`DisposeAsync` 已开始，但闸门未开，所以外层 `normal` 仍未完成；开闸并等待后才看见 `dispose-end`。第二组：主体抛出指定异常，编译器安排的清理仍会执行并被等待；调用方在清理完成后才观察到原工作异常。这里没有让清理自身抛错，因此不测试两个异常相遇时的报告策略。
+
+第三组说明另一个独立问题：**谁拥有资源**。`UseBorrowed` 只使用调用方传入的 `borrowed`，不写 `await using`；创建者在自己的作用域结束时调用 `DisposeAsync`。如果把借来的共享流、DI 容器管理的服务或共享 `HttpClient` 随意包进 `await using`，语法正确却可能破坏所有权契约。反过来，创建者也不能仅因借用方返回就忘记清理自己拥有的资源。
+
+## 实现与调用边界
+
+示例的密封类只追踪一次清理，不拥有真实句柄，因此不需要终结器。真实包装器若拥有内部 `IAsyncDisposable`，应把 `DisposeAsync` 向下级联，并防止重复释放；若类型设计为可继承，还要按异步释放模式考虑可覆写的核心方法和基类清理。实现 `IAsyncDisposable` 并不自动实现 `IDisposable`；要同时支持同步/异步释放，必须分别设计两条路径，不能把异步 I/O 在 `Dispose()` 里用 `.Wait()` 草率阻塞。
+
+使用时优先让创建与清理处于清晰的作用域。`await using var resource = ...` 的清理发生在**所在作用域结束**时，不是下一行；若需要更早释放，就缩小花括号作用域。清理工作也可能失败或耗时较长，调用方应明确超时、取消和诊断策略；`await using` 只保证调用并等待相应清理方法，不保证文件写入已持久化、业务操作已回滚或远端已接受补偿。[异步文件 I/O](/knowledge/programming/csharp/io/async-files-and-cancellation/)中的半成品目标文件就是一个反例。
+
+## 面试自测与练习
+
+1. `DisposeAsync` 返回尚未完成的 `ValueTask` 时，包住它的异步方法能否先报告完成？
+2. `await using` 的主体抛异常，何时调用 `DisposeAsync`？本例何时把主体异常交给调用方？
+3. 从 DI 容器注入的共享服务支持 `IAsyncDisposable`，业务方法应否自行 `await using`？应由谁决定？
+4. 将 `await using (lease)` 改成 `await using var leaseAlias = lease;`，把方法中清理位置与声明所在作用域对应起来。
+
+验收标准：能区分资源所有权、清理调用、清理完成和 GC 回收；运行 `dotnet run --project examples/csharp-async-disposal/AsyncDisposalReview.csproj` 并解释三组断言。正文完整代码块由 `npm run test:csharp-articles` 编译。
+
+## 参考
+
+[Microsoft Learn：实现 DisposeAsync](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-disposeasync) · [`using` 与 `await using`](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using) · [`IAsyncDisposable.DisposeAsync`](https://learn.microsoft.com/en-us/dotnet/api/system.iasyncdisposable.disposeasync)

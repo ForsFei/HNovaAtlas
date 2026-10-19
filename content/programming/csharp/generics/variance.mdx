@@ -1,0 +1,78 @@
+---
+id: csharp-generic-variance
+title: 协变与逆变：为什么 IEnumerable 可以、List 不可以
+description: 用生产者与消费者理解 out/in，区分泛型接口、委托和可变集合的转换边界。
+tags: [CSharp, 泛型, 协变, 逆变, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-generic-methods-constraints, csharp-inheritance-polymorphism]
+related: [csharp-generic-api-design, csharp-collections-generics]
+---
+
+## 先看那个著名的“不能赋值”
+
+`Dog : Animal` 并不推出 `List<Dog> : List<Animal>`。如果允许把狗列表当成动物列表，调用者便能向其中加入一只猫，原来的 `List<Dog>` 就被破坏。`List<T>` 可读也可写，因此它在 `T` 上保持**不变**。但只负责产出的 `IEnumerable<out T>` 可以把狗逐项作为动物读取，这叫协变。
+
+下面完整示例可作为 `Program.cs`：
+
+```csharp filename="Program.cs"
+List<Dog> dogs = [new Dog("Mochi"), new Dog("Nori")];
+IEnumerable<Animal> animals = dogs; // 允许：只通过此接口读取 Animal
+foreach (Animal animal in animals)
+    Console.WriteLine(animal.Name);
+
+IComparer<Animal> byName = Comparer<Animal>.Create(
+    (left, right) => StringComparer.Ordinal.Compare(left.Name, right.Name));
+IComparer<Dog> dogComparer = byName; // 允许：能比较任意 Animal，自然能比较 Dog
+dogs.Sort(dogComparer);
+
+public class Animal(string name) { public string Name { get; } = name; }
+public sealed class Dog(string name) : Animal(name) { }
+```
+
+反向的 `IComparer<Dog> → IComparer<Animal>` 不安全：只会比较狗的比较器未必会处理猫。把“读取时更具体的可当更一般的”（`out`）和“接收时更一般的可处理更具体的”（`in`）分别理解，比死背单词方向更稳。
+
+## 自定义接口中的 `out` 与 `in`
+
+```csharp filename="Program.cs"
+IProducer<Dog> dogSource = new DogSource();
+IProducer<Animal> animalSource = dogSource;
+Console.WriteLine(animalSource.Get().Name);
+
+IConsumer<Animal> animalSink = new AnimalPrinter();
+IConsumer<Dog> dogSink = animalSink;
+dogSink.Accept(new Dog("Mochi"));
+
+public class Animal(string name) { public string Name { get; } = name; }
+public sealed class Dog(string name) : Animal(name) { }
+public interface IProducer<out T> { T Get(); }
+public interface IConsumer<in T> { void Accept(T value); }
+public sealed class DogSource : IProducer<Dog>
+{
+    public Dog Get() => new("Mochi");
+}
+public sealed class AnimalPrinter : IConsumer<Animal>
+{
+    public void Accept(Animal value) => Console.WriteLine(value.Name);
+}
+```
+
+两个代码块是**独立**的 `Program.cs`，不要直接粘在同一文件里，否则 `Animal` 和 `Dog` 会重复定义。`out T` 主要把 `T` 用在输出位置；`in T` 主要把 `T` 用在输入位置。C# 会检查接口定义，阻止把变型参数放进不安全的位置。泛型委托也能声明变型，例如常用的 `Func<in T, out TResult>`。
+
+## 变型成立的条件
+
+变型转换只支持引用类型实参之间的引用转换。`IEnumerable<int>` 不能像 `IEnumerable<string> → IEnumerable<object>` 那样转成 `IEnumerable<object>`；`int` 到 `object` 涉及装箱，不能据此推导泛型接口转换。变型是**接口或委托声明**的属性，不会让实现该接口的 `List<Dog>` 本身变为 `List<Animal>`。数组也有自己的协变规则，但可写数组可能在运行时抛类型异常，不宜当泛型集合设计的依据。
+
+## 面试自测与练习
+
+1. `IEnumerable<Dog>` 为什么可赋给 `IEnumerable<Animal>`？若调用者要 `Add(new Cat())`，接口有这个能力吗？
+2. `IComparer<Animal>` 为什么可用作 `IComparer<Dog>`？反向为什么不行？
+3. `IEnumerable<int>` 能否赋给 `IEnumerable<object>`？与逐项 `Cast<object>()` 有什么区别？
+
+验收标准：能从“产出/消费”的方向画出安全转换，而不是把继承关系机械套给所有 `Generic<T>`。
+
+## 参考
+
+[Microsoft Learn：泛型协变与逆变](https://learn.microsoft.com/en-us/dotnet/standard/generics/covariance-and-contravariance) · [创建变型接口](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/concepts/covariance-contravariance/creating-variant-generic-interfaces)

@@ -1,0 +1,112 @@
+---
+id: csharp-metrics-counters-histograms-gauges
+title: .NET 指标：Counter、Histogram 与当前值
+description: 用 MeterListener 观察计数增量、耗时样本和按需读取的当前值，理解标签与收集边界。
+tags: [CSharp, .NET, Metrics, Meter, 诊断, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-15"
+order: 36
+prerequisite: [csharp-activity-source-tracing]
+related: [csharp-managed-memory-disposal, csharp-io-http-end-to-end-deadline, csharp-unit-tests-boundaries]
+---
+
+## 追踪一次操作，指标观察一段时间
+
+上一篇[ActivitySource 与追踪](/knowledge/programming/csharp/reliability/activity-source-and-tracing/)能把某次设备读取的解析步骤连起来。当问题变成“最近失败次数是否升高”“读取耗时的尾部是否变慢”“现在有多少项待处理”时，需要的是随时间采集的**数值测量**。追踪、指标与日志各有用途：指标适合趋势、聚合和告警，但单条指标不保留某次失败的完整调用路径。
+
+`System.Diagnostics.Metrics.Meter` 是命名的仪表来源，类似追踪中的 `ActivitySource`；它创建不同语义的仪表。代码调用仪表记录原始值，监听器或遥测库决定如何采集、聚合和导出。仅调用 `Counter.Add` 并不会自动得到仪表盘。
+
+| 想回答的问题 | 仪表 | 记录方式 |
+| --- | --- | --- |
+| 完成了多少次读取？ | `Counter<long>` | 每完成一次 `Add(1)`，记录的是**增量**，不能减去一次 |
+| 每次读取用了多久？ | `Histogram<double>` | 每次 `Record(秒数)`，记录一个样本；百分位由收集端按窗口计算 |
+| 此刻有几项待处理？ | `ObservableGauge<int>` | 收集时回调读取当前值，不为每次变化各发一条记录 |
+
+一个常见误区是把 `Counter.Add(1)` 当作“把计数器设为 1”，或者把两个 Histogram 样本当作“平均值已自动存好”。本例的监听器会看到两个增量 `1, 1`、两个秒数 `0.012, 0.034`，以及主动采集时的当前值 `2, 1`。它**没有**实现生产级聚合器。
+
+## 离线可运行的三个仪表
+
+运行 `dotnet run --project examples/csharp-metrics/MetricsReview.csproj`。`InstrumentPublished` 仅启用 `HNova.Atlas.Reading` 这个 Meter 下的仪表；另一个来源的计数不应进入本监听器。`MeterListener.RecordObservableInstruments()` 显式触发两次当前值读取，因此示例不依赖定时器、外网或监控服务。
+
+```csharp filename="Program.cs"
+using System.Diagnostics.Metrics;
+
+using var meter = new Meter("HNova.Atlas.Reading", "1.0.0");
+Counter<long> completed = meter.CreateCounter<long>("atlas.readings.completed",
+    unit: "{reading}");
+Histogram<double> duration = meter.CreateHistogram<double>("atlas.readings.duration",
+    unit: "s");
+int pending = 2;
+meter.CreateObservableGauge<int>("atlas.readings.pending", () => pending,
+    unit: "{reading}");
+
+var counts = new List<(long Value, string? Result)>();
+var seconds = new List<double>();
+var pendingValues = new List<int>();
+using var listener = new MeterListener
+{
+    InstrumentPublished = (instrument, current) =>
+    {
+        if (instrument.Meter.Name == meter.Name)
+            current.EnableMeasurementEvents(instrument);
+    }
+};
+listener.SetMeasurementEventCallback<long>((instrument, value, tags, _) =>
+{
+    if (instrument.Name == "atlas.readings.completed")
+        counts.Add((value, tags.Length > 0 ? tags[0].Value?.ToString() : null));
+});
+listener.SetMeasurementEventCallback<double>((instrument, value, _, _) =>
+{
+    if (instrument.Name == "atlas.readings.duration") seconds.Add(value);
+});
+listener.SetMeasurementEventCallback<int>((instrument, value, _, _) =>
+{
+    if (instrument.Name == "atlas.readings.pending") pendingValues.Add(value);
+});
+listener.Start();
+
+completed.Add(1, new KeyValuePair<string, object?>("result", "ok"));
+completed.Add(1, new KeyValuePair<string, object?>("result", "error"));
+duration.Record(0.012);
+duration.Record(0.034);
+listener.RecordObservableInstruments();
+pending = 1;
+listener.RecordObservableInstruments();
+
+using var otherMeter = new Meter("HNova.Unrelated");
+otherMeter.CreateCounter<int>("other.count").Add(1);
+
+Check(counts.SequenceEqual([(1L, "ok"), (1L, "error")]),
+    "counter callbacks receive increments and bounded tags");
+Check(seconds.SequenceEqual([0.012, 0.034]),
+    "histogram callbacks receive samples, not calculated percentiles");
+Check(pendingValues.SequenceEqual([2, 1]),
+    "observable gauge reads current state only when collected");
+Console.WriteLine("Counter、Histogram 与 ObservableGauge 测量验证通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+```
+
+## 指标的三个设计边界
+
+首先，**单位要描述每次测量**。耗时 Histogram 用秒数 `double` 并声明单位 `s`；别把数值实际记录为毫秒却标注为秒。计数单位 `{reading}` 只是这个示例对“条读数”的描述，不改变增量算法。时间窗口、速率和百分位都是收集端的展示或聚合选择，不应把它们混进仪表原始值的含义。
+
+其次，**标签要有界**。`result=ok|error` 只有少量稳定取值，便于按结果拆分；若把每次请求 ID、设备原始序列号或用户 ID 当指标标签，组合数量可能随请求无限增长，收集端需要为每个组合保留状态，成本和丢失风险都会增加。也不要把凭据、个人数据放进指标标签。需要定位单次请求时，用受控的日志或追踪信息，而不是高基数指标标签。
+
+最后，**可观测回调应快速且安全地读取状态**。本例只有一条顺序执行的测试流程，所以闭包中的 `pending` 与三个普通 `List` 足以验证 API；生产中收集回调可能与业务更新并发，必须为共享状态选择合适的同步/原子快照策略。回调不该为了取“当前值”再发网络请求或做昂贵计算。真实应用通常长期持有 Meter，并由 `dotnet-counters`、OpenTelemetry 等收集工具监听；测试的 `MeterListener` 不应被误当作完整导出器。
+
+若要定位某一次失败在业务边界记录了什么，继续读[结构化日志：模板、异常与作用域](/knowledge/programming/csharp/reliability/structured-logging-and-scopes/)；日志的命名字段与本篇低基数指标标签并非同一用途。
+
+## 面试自测
+
+1. 两次 `Counter.Add(1)`，监听器看到的原始测量是什么？若想看每分钟速率，谁负责计算？
+2. Histogram 收到 `0.012` 与 `0.034` 秒，是否足以声称“p95 是某个值”？为什么？
+3. `ObservableGauge` 由 `2` 改为 `1`，却没有采集调用，监听器是否一定会收到新值？
+4. 为什么 `result=ok|error` 可作标签，而每次唯一的请求 ID 不适合？
+
+参考：[Microsoft Learn：创建指标](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/metrics-instrumentation)、[收集指标与 MeterListener](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/metrics-collection)、[RecordObservableInstruments](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.metrics.meterlistener.recordobservableinstruments?view=net-10.0)。

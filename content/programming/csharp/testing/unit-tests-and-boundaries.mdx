@@ -1,0 +1,162 @@
+---
+id: csharp-unit-tests-boundaries
+title: 单元测试：边界用例、替身与集成测试分工
+description: 用 xUnit 测试设备告警规则，覆盖阈值、无效输入和出口故障，理解隔离、自检与测试边界。
+tags: [CSharp, 单元测试, xUnit, 测试替身, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 10
+prerequisite: [csharp-composition-dependency-injection, csharp-exception-boundaries-filters]
+related: [csharp-sqlite-integration-test, csharp-controlled-concurrency-tests]
+---
+
+## 从控制台断言走到可发现的测试
+
+课程前面的 `examples` 多用 `Check(...)`、`Require(...)` 在控制台项目中验证行为。这很适合解释一条语言规则，但项目增长后，更需要可独立运行、自动发现且失败定位清楚的测试。这里使用真实的 **xUnit 测试项目**；生产类和测试类分在两个项目中，通过 `dotnet test` 运行。示例只需本机 .NET SDK 与首次还原测试包，不需要数据库、网络服务或 DI 容器。
+
+一个可靠的单元测试通常是快速、隔离、可重复、自检的。先写清楚输入和预期，再按 Arrange（准备）→ Act（执行）→ Assert（断言）组织；“测试通过”只能证明已覆盖的场景满足预期，不能证明所有可能输入都正确。相比追求一个漂亮的覆盖率数字，先覆盖业务边界和失败分支更有价值。
+
+## 被测代码：规则与通知出口分开
+
+以下是 `ReadingAlerts/AlarmMonitor.cs` 的核心代码。它拒绝无效设备 ID 和非有限读数；达到阈值时才调用 `IAlertSink`。`IAlertSink` 是真正有外部效果的边界：单元测试注入一个仅记录调用的实现，无需发送邮件或访问网络。这个接缝与[组合及依赖注入](/knowledge/programming/csharp/object-oriented/composition-and-dependency-injection/)篇一致，但这里关注**如何组织测试用例**。
+
+```csharp filename="AlarmMonitor.cs"
+namespace ReadingAlerts;
+
+public sealed record Reading(string DeviceId, double Value);
+public sealed record Alert(string DeviceId, double Value);
+
+public interface IAlertSink
+{
+    void Send(Alert alert);
+}
+
+public sealed class AlarmMonitor
+{
+    private readonly double _limit;
+    private readonly IAlertSink _sink;
+
+    public AlarmMonitor(double limit, IAlertSink sink)
+    {
+        if (!double.IsFinite(limit)) throw new ArgumentOutOfRangeException(nameof(limit));
+        _limit = limit;
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+    }
+
+    public void Observe(Reading reading)
+    {
+        ArgumentNullException.ThrowIfNull(reading);
+        if (string.IsNullOrWhiteSpace(reading.DeviceId))
+            throw new ArgumentException("设备 ID 不能为空", nameof(reading));
+        if (!double.IsFinite(reading.Value))
+            throw new ArgumentException("读数必须是有限数字", nameof(reading));
+
+        if (reading.Value >= _limit)
+            _sink.Send(new Alert(reading.DeviceId, reading.Value));
+    }
+}
+```
+
+测试应约束调用方关心的行为，而非照抄实现细节。例如阈值 `70` 的关键问题是：`69.9` 不告警、`70.0` 告警、`70.1` 告警；读数为 `NaN` 时抛异常且不能已发出告警。若改写内部 `if`，只要契约不变，测试不应无谓地失败。
+
+## xUnit：事实、参数化和失败路径
+
+`[Fact]` 是一个固定场景；`[Theory]` 配合 `[InlineData]` 让同一行为在多个边界输入下分别运行。下面的 `RecordingSink` 是手写测试替身；它没有框架魔法，只按接口记录传入值。异常测试不仅确认抛出类型，也确认没有发生部分副作用。`FailingSink` 则检查出口故障没有被业务类偷偷吞掉。
+
+```csharp filename="AlarmMonitorTests.cs"
+using ReadingAlerts;
+using Xunit;
+
+namespace ReadingAlerts.Tests;
+
+public sealed class AlarmMonitorTests
+{
+    [Theory]
+    [InlineData(69.9, 0)]
+    [InlineData(70.0, 1)]
+    [InlineData(70.1, 1)]
+    public void Observe_AtBoundary_SendsExpectedCount(double value, int expectedCount)
+    {
+        // Arrange
+        var sink = new RecordingSink();
+        var monitor = new AlarmMonitor(70, sink);
+
+        // Act
+        monitor.Observe(new Reading("pump-A", value));
+
+        // Assert
+        Assert.Equal(expectedCount, sink.Alerts.Count);
+    }
+
+    [Fact]
+    public void Observe_AtLimit_SendsReadingDetails()
+    {
+        var sink = new RecordingSink();
+        var monitor = new AlarmMonitor(70, sink);
+
+        monitor.Observe(new Reading("pump-A", 70));
+
+        Assert.Equal(new Alert("pump-A", 70), Assert.Single(sink.Alerts));
+    }
+
+    [Fact]
+    public void Observe_NonFiniteValue_ThrowsWithoutSending()
+    {
+        var sink = new RecordingSink();
+        var monitor = new AlarmMonitor(70, sink);
+
+        Assert.Throws<ArgumentException>(() => monitor.Observe(new Reading("pump-A", double.NaN)));
+        Assert.Empty(sink.Alerts);
+    }
+
+    [Fact]
+    public void Observe_SinkFailure_IsNotHidden()
+    {
+        var failure = new InvalidOperationException("sink unavailable");
+        var monitor = new AlarmMonitor(70, new FailingSink(failure));
+
+        var thrown = Assert.Throws<InvalidOperationException>(
+            () => monitor.Observe(new Reading("pump-A", 70)));
+        Assert.Same(failure, thrown);
+    }
+
+    private sealed class RecordingSink : IAlertSink
+    {
+        public List<Alert> Alerts { get; } = [];
+        public void Send(Alert alert) => Alerts.Add(alert);
+    }
+
+    private sealed class FailingSink(Exception failure) : IAlertSink
+    {
+        public void Send(Alert alert) => throw failure;
+    }
+}
+```
+
+每次运行测试都会创建新的 `sink` 和 `monitor`，避免测试之间共享可变状态。不要靠执行顺序、当前时间、随机数或外部网络决定结果。出现间歇性失败时，先查共享状态与等待条件，不应简单地无限重试。对于复杂数据，测试替身可比这里丰富，但不要为了测试而把所有小类都抽象成接口。
+
+## 在仓库运行，并认识测试的边界
+
+仓库源码位于 `examples/csharp-unit-testing/ReadingAlerts`，测试位于同级的 `ReadingAlerts.Tests`。在项目根目录执行：
+
+```text
+dotnet test examples/csharp-unit-testing/ReadingAlerts.Tests/ReadingAlerts.Tests.csproj
+```
+
+测试项目引用源码项目，并使用本机 .NET SDK xUnit 模板对应的 `Microsoft.NET.Test.Sdk`、`xunit` 和 `xunit.runner.visualstudio` 固定版本。首次运行要从 NuGet 还原包，离线机器需先准备缓存。`dotnet test` 会编译、发现并运行测试；失败时返回非零退出码，适合接入 CI。这里的测试替身只证明 `AlarmMonitor` 的逻辑和对出口的调用契约，**没有**证明邮件服务器可用、数据库事务正确或应用容器注册无误。
+
+这些外部协作应在隔离环境中做集成测试。站内 [SQLite 本地集成验证](/knowledge/programming/csharp/collections/sqlite-integration-test/)展示了真实数据库的参数和事务行为，但也明确不等同 SQL Server。对完整 Web 请求、真实文件发布或外部服务恢复，还要有更高层的端到端/契约测试；单元测试的速度与隔离不能替代这些验证。
+
+## 面试自测与练习
+
+1. 为什么 `69.9`、`70.0`、`70.1` 比随机抽三个数字更有测试价值？
+2. 若 `Observe` 先调用 `Send` 再检查 `NaN`，哪条测试会失败？失败告诉你什么？
+3. 给空白设备 ID 增加一个 `[Fact]`：断言异常、`sink.Alerts` 仍为空；不要依赖异常消息的完整文字。
+4. 若将 `RecordingSink` 替换为真实 HTTP 出口，这项测试还算快速、隔离的单元测试吗？另需验证哪些真实连接行为？
+
+验收标准：能独立执行 `dotnet test`，按正常、边界、无效输入和依赖失败设计用例，并说出单元测试未覆盖的外部系统边界。
+
+## 参考
+
+[Microsoft Learn：单元测试最佳实践](https://learn.microsoft.com/en-us/dotnet/core/testing/unit-testing-best-practices) · [使用 xUnit 与 dotnet test](https://learn.microsoft.com/en-us/dotnet/core/testing/unit-testing-csharp-with-xunit) · [.NET 测试平台概览](https://learn.microsoft.com/en-us/dotnet/core/testing/test-platforms-overview)

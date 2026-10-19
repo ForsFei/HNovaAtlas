@@ -1,0 +1,72 @@
+---
+id: csharp-io-streams-ownership
+title: 流、缓冲与资源所有权：字节从哪里来
+description: 从 Stream 抽象理解文件、内存和网络 I/O，掌握短读、定位、刷新及 leaveOpen 的所有权约定。
+tags: [CSharp, IO, Stream, IDisposable, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-exceptions-disposal, csharp-types-nullability]
+related: [csharp-async-disposal-ownership, csharp-io-encoding-paths, csharp-io-async-files]
+---
+
+## `Stream` 操作的是字节，不是“文件”
+
+`Stream` 把“顺序读取/写入字节”抽象出来，后端可以是文件、内存、网络或压缩层。`FileStream`、`MemoryStream`、`NetworkStream` 共享读取/写入接口，但能力不完全相同。先看 `CanRead`、`CanWrite`、`CanSeek`：网络流通常不能 `Seek`，不能把 `Length`、`Position` 当成所有流都有的概念。
+
+文本需要再经过编码层：`StreamWriter` 把字符编码为字节，`StreamReader` 把字节解码为字符。下面是可独立运行的 `Program.cs`，故意把底层流保留到两个包装器退出之后：
+
+```csharp filename="Program.cs"
+using System.Text;
+
+using MemoryStream bytes = new();
+var utf8 = new UTF8Encoding(encoderShouldEmitUTF8Identifier: false);
+
+using (var writer = new StreamWriter(bytes, utf8, bufferSize: 1024, leaveOpen: true))
+{
+    writer.WriteLine("pump-A,72.5");
+} // Dispose 刷新 Writer 自己的缓冲；leaveOpen 让 bytes 仍可使用
+
+bytes.Position = 0; // MemoryStream 可定位；NetworkStream 不可照搬
+using (var reader = new StreamReader(bytes, utf8,
+           detectEncodingFromByteOrderMarks: false, bufferSize: 1024, leaveOpen: true))
+{
+    Console.WriteLine(reader.ReadLine()); // pump-A,72.5
+}
+Console.WriteLine(bytes.CanRead); // True；底层流最终由外层 using 释放
+```
+
+若包装器拥有底层流，不传 `leaveOpen: true` 时释放包装器通常也会关闭底层流。谁创建、谁持有、谁关闭，是 API 契约，不是靠垃圾回收碰运气。更多 `using` 与异常基础见[异常、输入失败与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)。
+
+## 读取次数不等于消息数
+
+`Read` / `ReadAsync` 返回**实际读到的字节数**，可能小于请求的缓冲区长度；只有在非零长度请求下读到 0，才表示这个流没有更多字节可给出。不能假设 `ReadAsync(buffer)` 一次就填满整个数组，更不能把一次读取当作一条 TCP 消息。若协议要求固定长度，可循环累计，或在支持的运行时使用 `ReadExactlyAsync`；若复制到目标流，`CopyToAsync` 负责循环读取和写入。
+
+```csharp filename="CopyFileAsync.cs"
+static async Task CopyFileAsync(string sourcePath, string targetPath,
+    CancellationToken cancellationToken)
+{
+    await using FileStream source = File.OpenRead(sourcePath);
+    await using FileStream target = new(targetPath, FileMode.CreateNew, FileAccess.Write);
+    await source.CopyToAsync(target, cancellationToken);
+}
+```
+
+这段是方法片段，由调用方提供已存在的源文件、尚不存在的目标路径，并处理重名/权限/取消。`FileMode.CreateNew` 避免意外覆盖；复制中失败或取消时，**目标可能已部分写入**，`using` 只保证资源关闭，不保证自动回滚。需要原子发布时，应先写同目录临时文件，成功后再按目标平台语义完成替换，并设计失败清理。
+
+## 缓冲、刷新与内存
+
+文本 Writer 可能在内部缓冲字符，底层流也可能缓冲字节。`Flush` 让本层缓冲向下传递；它不等于“数据已经永久落盘”，也不替代关闭资源。`File.ReadAllBytes` / `ReadAllText` 适合已知且不大的文件；未知或很大的输入，应限制大小并按块处理，否则会把整份内容装进内存。分块不代表可以无限制接收：仍需上限、超时和故障策略。
+
+## 面试自测与练习
+
+1. `StreamReader` 与 `FileStream` 分别处理字符还是字节？包装器退出时底层流为何有时仍可读？
+2. 为什么不能对所有 `Stream` 都使用 `Position = 0`？
+3. 复制中取消后目标文件可能是什么状态？`using` 能否撤销已经写出的字节？
+
+验收标准：能画出“字符 → 编码器 → 字节流 → 存储介质”的层次，说明所有权、短读和部分写入。
+
+## 参考
+
+[Microsoft Learn：文件与流 I/O](https://learn.microsoft.com/en-us/dotnet/standard/io/) · [Stream.ReadAsync](https://learn.microsoft.com/en-us/dotnet/api/system.io.stream.readasync) · [异步文件 I/O](https://learn.microsoft.com/en-us/dotnet/standard/io/asynchronous-file-i-o)

@@ -1,0 +1,123 @@
+---
+id: csharp-ref-struct-scoped-stackalloc
+title: ref struct、scoped 与 stackalloc：引用不能逃到哪里
+description: 用自定义字节游标和有上限的临时缓冲理解引用生存期、栈上分配及异步作用域。
+tags: [CSharp, Span, ref struct, scoped, stackalloc, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-15"
+order: 31
+prerequisite: [csharp-spans-memory-pooling]
+related: [csharp-arrays-strings, csharp-managed-memory-disposal, csharp-io-network-streams]
+---
+
+## 从视图走到引用安全
+
+上一篇[Span、Memory 与 ArrayPool](/knowledge/programming/csharp/fundamentals/spans-memory-and-pooling/)讲了视图、异步缓冲和租期。本篇追问更底层的一层：如果一个值可能指向当前方法的栈上区域，编译器怎样阻止它在方法返回后仍被使用？
+
+`Span<T>` 是 `ref struct`。我们也可以定义自己的 `ref struct`，让它保存 `ReadOnlySpan<T>` 字段，例如下方的 `ByteCursor`。这个限制约束的是**值及其内部引用的生存期**，不是断言它看的数据一定在栈上：`Span<T>` 也完全可以指向托管数组。`ref struct` 不能作为普通类的字段、数组元素、被装箱成 `object`，也不能被闭包捕获；这些位置可能使它活得比所引用的局部内存更久。
+
+`scoped` 可加在 `ref struct` 类型的参数等位置，表达“被传入的引用或视图不会从本方法逃逸”。它不是“把对象放到栈上”的指令，也不是让底层数组变只读或自动复制。下面 `SumBytes(scoped ReadOnlySpan<byte> input)` 只返回整数结果；若改成返回 `input` 视图，编译器会拒绝这条逃逸路径。调用者仍应遵守底层缓冲的所有权与并发规则。
+
+## stackalloc 适合有界、短命的暂存区
+
+`stackalloc` 在当前方法执行期间分配栈上区域，随着方法返回而失效。赋给 `Span<T>` 时无需写 `unsafe`，但大小必须保守：栈空间有限，过大分配可能导致栈溢出；不要按无上限的外部输入直接分配，也应避免在循环里反复 `stackalloc`。与 `new byte[n]` 不同，`stackalloc byte[n]` 的新区域**不能假定已清零**，应先完整初始化或只读取实际写入的部分。示例把阈值设为 128 字节，超出就用数组；这个数只是教学选择，不是通用性能阈值。
+
+这里先把输入复制到 `scratch`，再交给游标读取，展示栈/堆两条分支使用同一个 `Span<byte>` API。真实代码若只需要只读遍历，通常直接读取传入的 `ReadOnlySpan<byte>`，无需为了使用 `stackalloc` 而额外复制。不要仅凭“用了栈”就宣称更快；具体性能要由数据规模和基准测试决定。
+
+运行 `dotnet run --project examples/csharp-ref-safety/RefSafetyReview.csproj`。以下 `Program.cs` 与仓库示例一致：
+
+```csharp filename="Program.cs"
+byte[] small = [3, 5, 7];
+Check(SumBytes(small) == 15, "small input");
+Check(small.SequenceEqual(new byte[] { 3, 5, 7 }), "caller buffer remains unchanged");
+
+{
+    Span<byte> local = stackalloc byte[] { 4, 6 };
+    Check(SumBytes(local) == 10, "scoped parameter accepts a stack-backed view");
+}
+
+byte[] large = Enumerable.Repeat((byte)1, 200).ToArray();
+Check(SumBytes(large) == 200, "large input uses the array branch");
+Check(await SumAfterYieldAsync(small) == 15, "ref struct local stays after await");
+Console.WriteLine("ref struct、scoped 与栈/堆缓冲分支验证通过。");
+
+static int SumBytes(scoped ReadOnlySpan<byte> input)
+{
+    const int stackLimit = 128;
+    Span<byte> scratch = input.Length <= stackLimit
+        ? stackalloc byte[input.Length]
+        : new byte[input.Length];
+
+    // stackalloc 的未初始化区域不可先读；这里先完整填充有效区域。
+    input.CopyTo(scratch);
+    var cursor = new ByteCursor(scratch);
+    int sum = 0;
+    while (cursor.TryRead(out byte value)) sum += value;
+    return sum;
+}
+
+static async Task<int> SumAfterYieldAsync(byte[] bytes)
+{
+    await Task.Yield();
+    int sum;
+    {
+        ReadOnlySpan<byte> view = bytes;
+        sum = SumBytes(view);
+    }
+    return sum;
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+ref struct ByteCursor
+{
+    private ReadOnlySpan<byte> _remaining;
+
+    public ByteCursor(ReadOnlySpan<byte> source) => _remaining = source;
+
+    public bool TryRead(out byte value)
+    {
+        if (_remaining.IsEmpty)
+        {
+            value = default;
+            return false;
+        }
+        value = _remaining[0];
+        _remaining = _remaining[1..];
+        return true;
+    }
+}
+```
+
+`ByteCursor` 每读一个字节，就把 `_remaining` 缩短一格；切片只是新视图，没有复制底层字节。因为整个游标是 `ref struct`，不能把它装入普通对象并长期保存。示例的 `sum` 使用 `int`，当前输入长度下不会溢出；若实际解析任意大输入，应另外定义溢出、大小上限和错误处理契约。
+
+看两个**故意不能编译**的改动，更容易把规则与代码对应起来：
+
+```csharp filename="RejectedExamples.cs"
+// scoped 视图不能直接作为返回值逃出方法。
+static ReadOnlySpan<byte> Escape(scoped ReadOnlySpan<byte> input) => input;
+
+// Span<byte> 是 ref struct，不能放进普通类的字段。
+class CachedBuffer { public Span<byte> View; }
+```
+
+两处限制的理由不同：前者是这个参数的引用不能离开当前方法；后者是类对象可能进入托管堆并长期存活。若业务真的需要长期保存，明确复制到自有数组，或以 `Memory<T>` 持有受管理的缓冲并遵守其租期，而不是试图关闭编译器的引用安全检查。
+
+## async 中的限制并非“完全禁用”
+
+旧教材常写“异步方法里不能出现 `Span<T>`”，现在这样说太绝对。C# 13 起可以在 `async` 方法中的合适局部代码段使用 `ref struct`，但不能让它跨越 `await` 挂起点。示例先 `await Task.Yield()`，然后在独立作用域里创建 `ReadOnlySpan<byte>`、完成同步计算，最后只带普通 `int` 结果离开作用域。如果某段异步 I/O 真的要跨 `await` 保留缓冲，应使用 `Memory<T>` / `ReadOnlyMemory<T>` 并管理底层缓冲租期，而不是尝试让栈上视图跨越挂起。
+
+C# 13 也允许 `ref struct` 在满足 `allows ref struct` 反约束时成为泛型类型参数，并允许它实现接口；这**不**意味着能把它装箱为该接口类型。实际 API 设计先选择简单的 `ReadOnlySpan<T>` 参数或普通泛型；只有泛型算法确实需要支持 ref-like 类型时才引入反约束。
+
+## 面试自测
+
+1. `Span<byte>` 指向 `byte[]` 时，为什么它仍是 `ref struct`？`ref struct` 是否意味着底层字节都在栈上？
+2. `scoped ReadOnlySpan<byte>` 限制什么？它会复制数组或锁住其他写入者吗？
+3. 为什么不能根据外部报文中的任意长度直接 `stackalloc`？分配后为何要先写再读？
+4. 哪种 `Span<T>` 用法可以出现在 C# 13+ 的 `async` 方法里？哪些数据应改用 `Memory<T>` 跨 `await`？
+
+参考：[Microsoft Learn：ref struct](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/ref-struct)、[scoped 局部变量与参数](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/declarations)、[stackalloc](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/stackalloc)、[C# 13 的 ref 安全更新](https://learn.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-13)。

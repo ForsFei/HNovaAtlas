@@ -1,0 +1,126 @@
+---
+id: csharp-managed-memory-disposal
+title: 托管内存、GC 与 IDisposable：谁回收，谁清理
+description: 从 GC 可达性和代际回收理解内存，再用可运行案例区分对象回收、资源释放与所有权。
+tags: [CSharp, GC, IDisposable, 内存管理, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 20
+prerequisite: [csharp-data-types-conversions, csharp-exceptions-disposal]
+related: [csharp-async-disposal-ownership, csharp-value-equality, csharp-events-lifecycle, csharp-io-streams-ownership, csharp-spans-memory-pooling]
+---
+
+## 先分清两种生命周期
+
+`new` 出来的普通托管对象占用的内存由 .NET 垃圾回收器（GC）管理；文件句柄、套接字等外部资源需要在业务上不再使用时及时关闭。`Dispose()` 解决后者的**确定性清理**，不等于“立即释放这个 C# 对象的内存”；即使已 `Dispose()`，若还有引用，对象仍可能存活。反过来，失去引用也不等于资源已及时关闭。先读[异常与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)中的 `using` 入门，再用本篇解释为什么需要它。
+
+| 问题 | 负责方 | 时机 |
+| --- | --- | --- |
+| 普通托管对象内存何时可回收 | GC 根据可达性判断，运行时安排回收 | 不由词法作用域结束或 `Dispose()` 直接保证 |
+| 已拥有的流/句柄何时关闭 | 所有者调用 `Dispose()` / `DisposeAsync()` | 通常在 `using` / `await using` 离开时 |
+| 借来的流何时关闭 | 创建者或约定的最终所有者 | 借用者不能擅自关闭 |
+
+## GC 看的是可达性，不是“变量出了花括号”
+
+GC 从运行时识别的根（例如栈上活跃引用、静态字段等）出发，沿对象引用追踪；不可达对象的托管内存**有资格**在后续回收中被回收。这里的“有资格”不意味着马上回收，也不能用 `GC.Collect()` 当正常业务清理方法。JIT 可缩短局部变量的实际活跃区间，因此不要仅凭源码花括号预测某个对象恰好在哪一刻被收集。
+
+长寿命对象误留短寿命对象的引用会令后者继续可达。例如静态缓存无限增长，或长寿命事件发布者仍持有订阅者委托；这类“托管内存泄漏”不是 GC 失效，而是应用仍保留了引用。[事件与订阅生命周期](/knowledge/programming/csharp/delegates-events/events-and-lifecycle/)有可运行的退订案例。两对象一同不可达时，彼此形成引用环本身并不阻止 GC 回收。
+
+GC 把对象按寿命组织为 0、1、2 代，年轻对象通常先接受较频繁的回收，存活对象可能晋升；大对象堆有自己的处理细节。代数是运行时优化策略，不是“第 2 代永远不会回收”，也不该作为业务正确性条件。需要诊断分配或保留时，用分析器、计数器和内存快照找根与分配热点，避免以一次 `GC.GetGeneration()` 或强制回收来推断所有执行环境。
+
+## 值类型、装箱和“栈/堆口诀”
+
+值类型赋值通常复制值，引用类型赋值通常复制引用；它们描述的是**语义**，不是固定存储地址。结构体可以是类对象的字段、数组元素，也可以被装箱成对象；JIT 还可能进行优化。`int` 不总在栈上，引用局部变量也不等于它指向的对象就在栈上。先掌握[类型选择、转换与装箱](/knowledge/programming/csharp/fundamentals/data-types-and-conversions/)和[值语义与相等性](/knowledge/programming/csharp/object-oriented/value-semantics-and-equality/)中的可观察行为，再针对真实热点测量分配。
+
+## `using` 实际保证了什么
+
+`using` 在离开作用域时调用所管理对象的 `Dispose()`；抛异常离开时也会调用，效果相当于 `try/finally` 中清理。但它不能替你决定**是否拥有**传入的资源。下例封装一个流，`ownsStream: true` 表示会级联释放，`false` 表示仅借用。示例使用 `MemoryStream` 以便离线运行；真实文件/网络流的关闭通常更加重要。完整代码也在 `examples/csharp-memory-lifecycle`，执行 `dotnet run --project examples/csharp-memory-lifecycle/MemoryLifecycleReview.csproj`。
+
+```csharp filename="Program.cs"
+var owned = new TrackingStream([42]);
+try
+{
+    using var session = new StreamSession(owned, ownsStream: true);
+    Check(session.ReadFirstByte() == 42, "应读到第一个字节");
+    throw new InvalidOperationException("模拟处理失败");
+}
+catch (InvalidOperationException)
+{
+    // using 在异常离开作用域时已执行 Dispose。
+}
+Check(owned.WasDisposed, "拥有的流应在异常路径关闭");
+
+var borrowed = new TrackingStream([7]);
+var borrowedSession = new StreamSession(borrowed, ownsStream: false);
+Check(borrowedSession.ReadFirstByte() == 7, "借用流应可读取");
+borrowedSession.Dispose();
+borrowedSession.Dispose(); // 重复清理应安全
+Check(!borrowed.WasDisposed, "借用者不应关闭流");
+try
+{
+    borrowedSession.ReadFirstByte();
+    throw new Exception("应拒绝使用已释放的包装器");
+}
+catch (ObjectDisposedException) { }
+borrowed.Dispose(); // 创建者负责关闭
+Check(borrowed.WasDisposed, "最终所有者应关闭流");
+Console.WriteLine("所有生命周期断言通过");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+sealed class StreamSession(Stream stream, bool ownsStream) : IDisposable
+{
+    private bool _disposed;
+
+    public int ReadFirstByte()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        return stream.ReadByte();
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        _disposed = true;
+        if (ownsStream) stream.Dispose();
+    }
+}
+
+sealed class TrackingStream(byte[] data) : MemoryStream(data)
+{
+    public bool WasDisposed { get; private set; }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) WasDisposed = true;
+        base.Dispose(disposing);
+    }
+}
+```
+
+这里验证的是 `Dispose` 调用及所有权，不声称 `owned` 或 `borrowed` 的托管内存已被 GC 回收。`StreamSession` 是密封类、只包装一个托管可释放成员，因此无需为了示例机械加入终结器或 `Dispose(bool)` 继承模板；在多线程同时读/释放的生产场景还需额外定义同步契约。
+
+## 终结器、SafeHandle 与异步释放
+
+终结器运行时机不确定，也不适合访问其他可能已被清理的托管对象。仅因为类实现了 `IDisposable`，**不需要**再写终结器。直接拥有原生句柄等少见场景，优先让 `SafeHandle` 承担安全兜底，再在自己的 `Dispose` 中释放它。`GC.SuppressFinalize(this)` 的作用是对象已经清理时跳过**该对象自己的终结器**；没有终结器时调用它不会释放额外内存。普通只拥有托管 `IDisposable` 成员的密封类可像上例直接级联释放。
+
+若真正的清理过程需要等待异步 I/O，使用该类型提供的 `IAsyncDisposable` 与 `await using`；不要把同步 `Dispose` 假装成异步完成。由 DI 容器创建并持有的服务通常由容器按作用域清理；收到注入依赖的类不应随意 `Dispose` 它，详见[组合与依赖注入](/knowledge/programming/csharp/object-oriented/composition-and-dependency-injection/)。
+
+可继续读[`await using` 与异步清理所有权](/knowledge/programming/csharp/reliability/async-disposal-and-ownership/)：受控例子显示清理尚未完成时作用域也尚未结束，以及主体故障时仍会等待清理。
+
+## 面试追问与练习
+
+1. 一个对象 `Dispose()` 后仍被静态字典引用，会立即回收吗？为什么？
+2. 一个事件订阅者不再显示，却仍被长寿命发布者引用；这是 GC 错误还是引用管理错误？
+3. 为什么 `using` 应放在拥有资源的一侧？把示例的 `ownsStream` 两种取值互换，预期哪个断言失败？
+4. 哪些类型确实需要终结器？为什么普通封装 `MemoryStream` 的类不需要？
+
+验收标准：能画出“根 → 长寿命发布者 → 订阅者”的引用链，区分内存回收与句柄关闭，并能解释示例中两个流的清理责任。
+
+## 参考
+
+[Microsoft Learn：GC 基础](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/fundamentals) · [实现 Dispose](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/implementing-dispose) · [清理非托管资源](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/unmanaged) · [using 语句](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/using)

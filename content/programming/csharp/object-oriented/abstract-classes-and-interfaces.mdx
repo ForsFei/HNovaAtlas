@@ -1,0 +1,80 @@
+---
+id: csharp-abstract-interfaces
+title: 抽象类与接口：共享实现还是定义能力
+description: 用告警规则比较抽象基类、接口和组合，说明继承限制、默认实现与实际选型。
+tags: [CSharp, OOP, 抽象类, 接口, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-constructors-invariants]
+related: [csharp-inheritance-polymorphism, csharp-classes-interfaces, csharp-explicit-default-interface-members]
+---
+
+## 两种抽象，回答不同问题
+
+接口首先表达调用方依赖的**能力**：能否判断一条读数告警？抽象类首先表达一组子类共同的**身份、状态与部分实现**：这些规则是否都属于同一类、共享设备 ID 与公共校验？一个类只能继承一个类，却可以实现多个接口；因此不要只因为“以后可能扩展”就先建立一层抽象基类。
+
+下面示例同时展示两者的职责，整段可作为 `Program.cs`：
+
+```csharp filename="Program.cs"
+IAlarmRule threshold = new HighRule("pump-A", 80);
+IAlarmRule composite = new AnyRule(threshold, new LowRule(10));
+Console.WriteLine(composite.IsAlarm(85)); // True
+Console.WriteLine(composite.IsAlarm(50)); // False
+
+public interface IAlarmRule
+{
+    bool IsAlarm(double value);
+}
+
+public abstract class DeviceAlarmRule : IAlarmRule
+{
+    protected DeviceAlarmRule(string deviceId)
+    {
+        DeviceId = !string.IsNullOrWhiteSpace(deviceId)
+            ? deviceId
+            : throw new ArgumentException("设备 ID 不能为空", nameof(deviceId));
+    }
+
+    public string DeviceId { get; }
+    public abstract bool IsAlarm(double value);
+}
+
+public sealed class HighRule(string deviceId, double limit) : DeviceAlarmRule(deviceId)
+{
+    public override bool IsAlarm(double value) => value >= limit;
+}
+
+public sealed class LowRule(double limit) : IAlarmRule
+{
+    public bool IsAlarm(double value) => value <= limit;
+}
+
+public sealed class AnyRule(IAlarmRule first, IAlarmRule second) : IAlarmRule
+{
+    public bool IsAlarm(double value) => first.IsAlarm(value) || second.IsAlarm(value);
+}
+```
+
+`DeviceAlarmRule` 无法直接 `new`，非抽象派生类必须实现其抽象成员。`LowRule` 不需要设备 ID，所以仅实现接口。`AnyRule` 不继承 `HighRule` 或 `LowRule`，而是**组合**两个能力；它能复用行为，又不强迫它们进入同一继承树。
+
+## 如何选择
+
+先从调用者出发：若调用者只需要 `IsAlarm`，参数应写成 `IAlarmRule`。当多种实现确实需要共用构造验证、受保护状态或模板行为，并且有稳定的“是一个”关系，再考虑抽象类。接口可以有默认方法实现，但这不等于它拥有每个实例的字段状态，也不意味着应该把大量业务实现塞进接口。公开 API 的兼容性与测试替换边界比“抽象层数量”更重要。
+
+纯接口不是“没有任何代码”的绝对规则；现代 C# 支持默认接口成员。反过来，抽象类也能包含已实现的普通方法与虚方法，而非每个成员都必须 `abstract`。这些细节在面试中值得补一句，但不应盖过设计意图。
+
+接口有同名但不同语义的成员，或者接口自带默认实现时，再读[显式接口实现与默认接口成员](/knowledge/programming/csharp/object-oriented/explicit-and-default-interface-members/)；那里用可运行断言区分接口视图和类公开方法。
+
+## 面试自测与练习
+
+1. `LowRule` 为什么不继承 `DeviceAlarmRule`？若强行继承，会被迫提供什么无意义数据？
+2. 一个类能同时继承 `DeviceAlarmRule` 和另一抽象类吗？能同时实现两个接口吗？
+3. 给 `AnyRule` 增加第三条规则时，考虑用 `IReadOnlyList<IAlarmRule>` 代替三个固定字段，并决定空列表的语义。
+
+验收标准：能用调用方契约、共享状态和组合成本解释选型，而不是背“接口是完全抽象、抽象类是部分抽象”。
+
+## 参考
+
+[Microsoft Learn：接口](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/interfaces) · [抽象类与继承](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/inheritance)

@@ -1,0 +1,92 @@
+---
+id: csharp-linq
+title: LINQ：过滤、投影、分组与延迟执行
+description: 用清晰的查询处理集合，并理解 ToList、重复枚举和内存查询边界。
+tags: [CSharp, LINQ, 集合]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-collections-generics]
+related: [csharp-linq-joins-key-semantics, csharp-query-boundaries, csharp-exceptions-disposal]
+---
+
+## 查询是一条数据变换流水线
+
+LINQ 让「选哪些数据」与「对每项做什么」更清楚。`Where` 过滤，`Select` 投影，`OrderBy` 排序，`GroupBy` 分组。它并非只用于数据库；下面操作的是内存中的 `List<T>`。不同数据源的 LINQ 实现和可翻译操作可能不同，不要把内存行为直接推断给数据库。
+
+```csharp filename="Program.cs"
+List<Reading> readings =
+[
+    new("pump-A", 68.5), new("pump-B", 73.0),
+    new("pump-A", 72.5), new("pump-B", 66.0)
+];
+
+var alarms = readings
+    .Where(item => item.Value >= 70)
+    .OrderBy(item => item.DeviceId)
+    .Select(item => $"{item.DeviceId}: {item.Value:F1}")
+    .ToList();
+
+foreach (string alarm in alarms)
+    Console.WriteLine(alarm);
+
+public record Reading(string DeviceId, double Value);
+```
+
+结果是两个超限读数，按设备 ID 排序。链式调用从上到下描述了数据流。`Select` 不会修改原 `Reading`；这里产生的是字符串。若某一步比普通循环更难读，就用循环，LINQ 不是越长越好。
+
+## 延迟执行与快照
+
+许多返回 `IEnumerable<T>` 的 LINQ 操作是延迟执行的：创建查询时只描述规则，真正枚举时才处理数据。`ToList` 会立刻枚举并保存当时的结果。下面第二次查看 `query` 会看见后来加入的元素，但 `snapshot` 不会。
+
+```csharp filename="Program.cs"
+List<int> values = [1, 2, 3];
+IEnumerable<int> query = values.Where(value => value > 2);
+List<int> snapshot = query.ToList();
+values.Add(4);
+
+Console.WriteLine(string.Join(", ", query));    // 3, 4
+Console.WriteLine(string.Join(", ", snapshot)); // 3
+```
+
+`Count()`、`First()`、`ToList()` 等会触发处理，但各自做的工作不同；例如 `Count()` 通常无需构造列表。重复枚举一个昂贵或有副作用的查询，可能重复执行读取。需要稳定结果时在合适边界物化一次，不必每步都 `ToList()`。
+
+## 分组与聚合
+
+```csharp filename="Program.cs"
+var summary = readings
+    .GroupBy(item => item.DeviceId, StringComparer.Ordinal)
+    .Select(group => new
+    {
+        DeviceId = group.Key,
+        Count = group.Count(),
+        Average = group.Average(item => item.Value)
+    })
+    .OrderBy(item => item.DeviceId);
+
+foreach (var row in summary)
+    Console.WriteLine($"{row.DeviceId}: {row.Count} 条，均值 {row.Average:F1}");
+```
+
+这段接在第一份示例中、`Reading` 定义之前运行。分组后的每组非空，所以 `Average` 有值；直接对可能为空的原集合调用 `Average` 时要事先决定如何处理空数据。聚合是一种业务统计，不等于修复脏数据：无效读数应先被识别、排除或报告。
+
+## 常见误区
+
+- `First` 找不到时抛异常；「可能没有」时用 `FirstOrDefault`，并处理默认值。对引用类型结果要考虑 null。
+- `OrderBy` 返回新的查询结果，不会原地重排原列表。多关键字排序使用 `ThenBy`，第二次 `OrderBy` 不是追加次序。
+- `Select` 可变换每项，`Where` 只决定是否保留。把外部可变计数器藏在查询表达式里，会让延迟和重复枚举变得危险。
+
+## 动手练习
+
+1. 只保留每台设备大于等于 70 的读数，按数值降序输出；数值相同再按设备 ID 排序。
+2. 分组求每台设备最大值、平均值和样本数。加入没有读数的设备时，说明为什么它不会自动出现在 `GroupBy` 结果里。
+3. 移除示例中的 `ToList`，在创建查询后追加新读数，预测并验证输出差异。
+
+验收标准：能说清查询何时执行，并为「需要实时视图还是固定快照」作出选择。
+
+## 参考
+
+[继续读：Join、GroupJoin、左连接与键比较](/knowledge/programming/csharp/collections/linq-joins-and-key-semantics/)：通过缺失键、重复键与显式比较器，把本篇的分组知识用于两个序列的连接。
+
+[Microsoft Learn：LINQ 入门](https://learn.microsoft.com/dotnet/csharp/linq/get-started/introduction-to-linq-queries) · [标准查询运算符](https://learn.microsoft.com/en-us/dotnet/csharp/linq/standard-query-operators/)

@@ -1,0 +1,81 @@
+---
+id: csharp-enums-flags
+title: 枚举与 Flags：命名状态、位组合和输入验证
+description: 从状态码与权限组合出发，弄清枚举的底层数值、未声明值、解析及 Flags 的边界。
+tags: [CSharp, enum, Flags, 面试]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 28
+prerequisite: [csharp-data-types-conversions]
+related: [csharp-pattern-matching, csharp-access-const-readonly]
+---
+
+## 枚举解决什么问题
+
+当一组整数代表固定领域状态时，`enum` 为值起名字，避免在代码中散落 `1`、`2` 等魔法数字。它是值类型，默认底层类型为 `int`；成员若未显式赋值，从 `0` 开始依次加一。给第一个成员命名为 `Unknown = 0` 往往能解释字段的默认值，但这只是约定，不会自动验证外部输入。
+
+```csharp filename="Program.cs"
+JobState state = JobState.Running;
+Console.WriteLine((int)state); // 2
+Console.WriteLine(default(JobState)); // Unknown
+
+enum JobState { Unknown = 0, Queued = 1, Running = 2, Done = 3 }
+```
+
+枚举不是“只允许声明过的几个值”的运行时约束：`(JobState)99` 可以得到一个未命名值。`Enum.TryParse<JobState>("99", out var parsed)` 也可能成功，因为解析成功不代表值被定义。接收配置、数据库或请求参数时，要明确允许未知值还是拒绝它。
+
+## 普通状态与位标志是两种模型
+
+普通状态通常只能选一个：`Queued`、`Running` 或 `Done`。位标志则允许同时拥有多个权限。`[Flags]` 改善组合值的文本表达，但真正让位组合成立的是互不重叠的二进制位：`1`、`2`、`4`、`8`。`None = 0` 代表没有任何位；不要把顺序编号 `1, 2, 3` 当作独立标志，因为 `3` 已等于 `1 | 2`。
+
+```csharp
+[Flags]
+enum Access { None = 0, Read = 1, Write = 2, Execute = 4 }
+
+Access granted = Access.Read | Access.Write;
+bool canWrite = (granted & Access.Write) == Access.Write; // true
+```
+
+`HasFlag` 也可以检查位，但在判断零值时要格外小心：任意值都“包含”零位。组合值不一定是单独声明的枚举成员，`Enum.IsDefined` 对 `Read | Write` 往往返回 `false`，因此不能用它直接验证所有合法组合。应把输入中的未知位遮掉或拒绝，并对 `None` 单独判断。
+
+## 一个可运行的验证例子
+
+以下整段可放入 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+using System;
+
+JobState state = (JobState)99;
+Console.WriteLine(Enum.IsDefined(state)); // False：强制转换不验证定义
+
+if (Enum.TryParse<JobState>("Running", ignoreCase: true, out var parsed)
+    && Enum.IsDefined(parsed))
+{
+    Console.WriteLine(parsed); // Running
+}
+
+Access granted = Access.Read | Access.Write;
+Console.WriteLine((granted & Access.Write) == Access.Write); // True
+
+Access incoming = (Access)9; // Read + 未定义的第 4 位
+const Access known = Access.Read | Access.Write | Access.Execute;
+Console.WriteLine((incoming & ~known) == Access.None); // False：含未知位
+
+enum JobState { Unknown = 0, Queued = 1, Running = 2, Done = 3 }
+
+[Flags]
+enum Access { None = 0, Read = 1, Write = 2, Execute = 4 }
+```
+
+实际 API 若要求未来版本可增加新状态，可以保留未知原始数值并提供降级处理；若输入会直接授予权限，则应拒绝未知位。验证策略来自业务契约，而不是由 `enum` 自动决定。
+
+## 自测与追问
+
+1. `Enum.TryParse<JobState>("99", out var value)` 成功后，能否证明 `value` 是合法状态？为什么？
+2. `[Flags]` 写成 `Read = 1, Write = 2, Execute = 3`，检查 `Execute` 时会发生什么歧义？
+3. 为什么 `Enum.IsDefined(Access.Read | Access.Write)` 不适合作为位组合的唯一验证？
+
+可运行验证还在 `examples/csharp-foundations-part2`。先理解[类型选择与转换](/knowledge/programming/csharp/fundamentals/data-types-and-conversions/)，再用[模式匹配](/knowledge/programming/csharp/fundamentals/pattern-matching/)处理不同状态。
+
+参考：[Microsoft Learn：枚举类型](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/builtin-types/enum)、[Enum.IsDefined](https://learn.microsoft.com/en-us/dotnet/api/system.enum.isdefined)。

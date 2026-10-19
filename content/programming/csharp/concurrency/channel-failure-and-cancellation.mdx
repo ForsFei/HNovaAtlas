@@ -1,0 +1,135 @@
+---
+id: csharp-channel-failure-cancellation
+title: 异步管线故障与取消：Channel 两端如何收尾
+description: 通过故障注入和取消等待的断言，理解生产者完成信号、读端错误、未消费项和任务观察的责任边界。
+tags: [CSharp, Channel, 异步, 取消, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 45
+prerequisite: [csharp-concurrent-collections, csharp-cancellation-throttling]
+related: [csharp-controlled-concurrency-tests, csharp-async-await]
+---
+
+## 管线的结束有三种不同含义
+
+[并发集合与 Channel](/knowledge/programming/csharp/concurrency/concurrent-collections-and-channels/)已经介绍有界缓冲与背压，[取消、超时与限流](/knowledge/programming/csharp/concurrency/cancellation-and-throttling/)介绍令牌。把它们放进真实管线后，“停止”至少涉及三件独立的事：
+
+1. **生产者不再写**：写端调用 `TryComplete()`；若生产失败，传入原始异常 `TryComplete(error)`。
+2. **消费者停止等待**：给 `ReadAsync`/`ReadAllAsync` 的取消令牌请求取消；这只影响对应读取，不会自动完成写端。
+3. **调用方观察所有任务**：保存生产者和消费者的 `Task`，等待它们结束并处理故障。只看到“读循环结束”不能推断生产者成功。
+
+若写端因异常直接退出，却没发完成信号，读端排空缓冲区后可能一直等待。反过来，若消费者提前停止，有界通道可能很快填满，让仍在写的生产者卡在 `WriteAsync`。拥有管线生命周期的调用方需要决定取消、完成、错误上报和剩余项如何处理；`Channel<T>` 不会替业务做决定。
+
+## 故障注入：先写入，再失败
+
+以下示例让生产者先写入 `7`，随后抛出指定异常。`finally` 无论成功或失败都尝试完成写端；失败时带上原始异常。消费者可能先读到已缓冲的 `7`，之后才在继续读取时观察到完成错误。这不是“处理事务已提交”的保证，只说明数据已经从通道取出；若处理动作失败，通道不会自动重投。
+
+调用方分别等待生产者和消费者，避免只捕获其中一个异常而遗漏另一个任务。`Task.WhenAll` 可等待两者全部结束，但一个任务失败不会自动给另一个任务请求取消；若另一端因缺少完成信号卡住，单靠 `WhenAll` 也无法救场。这里使用超时只作为测试防挂保护：`WaitAsync(timeout)` 超时**不取消**底层任务，生产代码仍必须有真正的停止协议。
+
+## 取消读等待，不等于关闭通道
+
+第二个场景在空通道上启动 `ReadAsync(token)`，确认它处于等待中，再请求取消。断言读取抛出 `OperationCanceledException`，同时写端仍未完成；随后由拥有者显式调用 `TryComplete()`。如果用 `ReadAllAsync(token)`，官方文档还特别说明：即便已请求取消，已有数据立即可读时也可能先产出该项，因此不能把“取消时刻”当作严格的最后消费边界。
+
+完整管线遇到消费者主动退出时，通常需要通过共享的 `CancellationTokenSource` 通知生产者，并把令牌传到 `WriteAsync` 等可取消等待，随后等待生产者清理并完成写端。以下最小例子把两条边界分开验证，不冒充持久消息、失败重试或跨进程交付方案。
+
+## 完整可运行例子
+
+可将以下整段保存为 .NET 10 控制台项目的 `Program.cs`；仓库项目 `examples/csharp-channel-failures` 运行同样的断言。
+
+```csharp filename="Program.cs"
+using System.Threading.Channels;
+
+var timeout = TimeSpan.FromSeconds(5);
+var failed = Channel.CreateBounded<int>(1);
+var received = new List<int>();
+
+Task producer = ProduceAsync();
+Task consumer = ConsumeAsync();
+
+bool producerFailed = false;
+try { await producer.WaitAsync(timeout); }
+catch (InvalidOperationException ex) when (ex.Message == "injected failure")
+{
+    producerFailed = true;
+}
+
+bool consumerSawFailure = false;
+try { await consumer.WaitAsync(timeout); }
+catch (InvalidOperationException ex) when (ex.Message == "injected failure")
+{
+    consumerSawFailure = true;
+}
+
+Require(producerFailed && consumerSawFailure, "两端都观察到生产者故障");
+Require(received.SequenceEqual([7]), "故障前写入的数据已被读取");
+Require(failed.Reader.Completion.IsFaulted, "读端完成状态保留故障");
+
+var cancelled = Channel.CreateBounded<int>(1);
+using var source = new CancellationTokenSource();
+Task<int> pendingRead = cancelled.Reader.ReadAsync(source.Token).AsTask();
+Require(!pendingRead.IsCompleted, "读取正在等待数据");
+source.Cancel();
+
+bool readCancelled = false;
+try { await pendingRead.WaitAsync(timeout); }
+catch (OperationCanceledException) when (source.IsCancellationRequested)
+{
+    readCancelled = true;
+}
+
+Require(readCancelled, "令牌取消了等待中的读取");
+Require(!cancelled.Reader.Completion.IsCompleted, "取消读取不等于完成通道");
+cancelled.Writer.TryComplete();
+await cancelled.Reader.Completion.WaitAsync(timeout);
+
+Console.WriteLine("Channel 故障传播与取消边界断言通过。");
+
+async Task ProduceAsync()
+{
+    Exception? failure = null;
+    try
+    {
+        await failed.Writer.WriteAsync(7);
+        throw new InvalidOperationException("injected failure");
+    }
+    catch (Exception ex)
+    {
+        failure = ex;
+        throw;
+    }
+    finally
+    {
+        failed.Writer.TryComplete(failure);
+    }
+}
+
+async Task ConsumeAsync()
+{
+    await foreach (int item in failed.Reader.ReadAllAsync())
+        received.Add(item);
+}
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+```
+
+运行仓库项目：`dotnet run --project examples/csharp-channel-failures/ChannelFailureReview.csproj`。正文完整代码块还由 `npm run test:csharp-articles` 单独编译；实际故障传播由项目断言验证。
+
+## 生产代码还要定下的协议
+
+- **谁拥有写端完成权？** 上例只有一个写者；若有多个生产者，不能让任意一个先完成通道，应由协调者在全部生产者结束后统一完成，并决定哪个失败原因上报。
+- **消费者处理失败怎么办？** 需通知生产者停止写入、解除可能阻塞的背压等待、观察所有任务，并明确已取出但未完成处理的项是否重试或丢弃。
+- **错误与取消如何区分？** 外部请求取消可视为预期停止；生产者的 I/O 或数据错误不应被 `catch (Exception) { }` 吞掉。若两种情况同时发生，应定义主错误的报告规则。
+- **资源何时释放？** 在获得资源后用 `try/finally` 或 `using` 清理；取消等待不等于已取消外部副作用。若要求至少一次/恰好一次交付，还需要持久化与确认机制，进程内 Channel 不提供这些承诺。
+
+## 自测与面试追问
+
+1. 生产者抛异常后不调用 `TryComplete(error)`，消费者读完已缓冲数据会发生什么？
+2. 消费者取消 `ReadAsync` 后，生产者的 `WriteAsync` 会自动取消吗？谁应发出停止请求？
+3. `Task.WhenAll(producer, consumer)` 会替你取消仍在运行的另一端吗？
+4. 读到一条消息，和这条消息已经成功写入数据库，是同一个承诺吗？
+
+参考：[Microsoft Learn：Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)、[`TryComplete`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channelwriter-1.trycomplete)、[`ReadAllAsync`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.channels.channelreader-1.readallasync)、[`Task.WhenAll`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall)。

@@ -1,0 +1,118 @@
+---
+id: python-conditionals
+title: 条件判断
+description: 用 if / elif / else 让程序学会做选择。
+tags: [Python, if, 条件]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 40
+prerequisite: [python-operators]
+related: [python-loops]
+---
+
+## 程序需要做选择
+
+到目前为止，我们的程序都是从头执行到尾。现实中到处是"如果……就……"：如果密码正确就放行，如果分数及格就打印祝贺。**条件判断**让程序拥有分支。
+
+## if 的基本写法
+
+```python filename="if-basic.py"
+temperature = 35
+
+if temperature > 30:
+    print("今天很热，注意防暑")
+
+print("程序结束")   # 这一行不受 if 控制，总会执行
+```
+
+注意两个**必须**：
+
+1. `if 条件:` 末尾要有**冒号**
+2. 下一行开头要**缩进**（推荐 4 个空格），表示"这些属于 if"
+
+缩进在 Python 里不是装饰，而是语法本身。缩进相同的连续行组成一个代码块。
+
+## if / else：两条路
+
+```python filename="if-else.py"
+password = input("请输入密码：")
+
+if password == "123456":
+    print("登录成功")
+else:
+    print("密码错误")
+```
+
+条件成立走 `if` 分支，不成立走 `else` 分支，必然走其中一条。
+
+## if / elif / else：多条路
+
+```python filename="grade.py"
+score = 85
+
+if score >= 90:
+    print("优秀")
+elif score >= 80:
+    print("良好")
+elif score >= 60:
+    print("及格")
+else:
+    print("不及格")
+```
+
+`elif` 是"否则如果"。判断**从上到下**进行，一旦命中某个分支，后面的就不再检查——所以上面 85 分命中"良好"后就结束了，不会再看"及格"。
+
+<Callout type="warning" title="分支顺序很重要">
+
+如果把 `score >= 60` 写在 `score >= 90` 前面，85 分会先命中"及格"，90 分以上的判断就永远轮不到了。把更严格的条件放在前面。
+
+</Callout>
+
+## 条件里可以放什么
+
+任何能算出 `True` / `False` 的表达式都可以：
+
+```python filename="conditions.py"
+age = 20
+is_vip = True
+name = ""
+
+print(age >= 18 and is_vip)    # 组合条件
+print(not is_vip)              # 取反
+print(name == "")              # 判断空字符串
+print(age != 0)                # 不等于
+```
+
+## 嵌套与合并
+
+条件里可以再套 if，但层次一深就难读。能用 `and` 合并的尽量合并：
+
+```python filename="nesting.py"
+age = 20
+has_ticket = True
+
+# 嵌套写法：能用，但层次深
+if age >= 18:
+    if has_ticket:
+        print("可以入场")
+
+# 合并写法：更推荐
+if age >= 18 and has_ticket:
+    print("可以入场")
+```
+
+## 动手试一试
+
+1. 读取用户输入的年份，判断是否为闰年（能被 4 整除且不能被 100 整除，或能被 400 整除）。
+2. 读取一个数字，输出它是正数、负数还是零。
+3. 故意去掉 if 下面那行的缩进运行一次，看看 Python 怎么报错——认识 IndentationError。
+
+<Quiz
+  question="score = 60 时，下面代码输出什么？if score > 90: print('A') elif score > 50: print('B') else: print('C')"
+  options={["A", "B", "C", "B 和 C"]}
+  answer={1}
+  explanation="分支从上到下检查：60 不大于 90，跳过第一个；60 大于 50，命中 elif 输出 B。命中后其余分支不再检查，所以不会输出 C。"
+/>
+
+<FlashCard front="if / elif / else 的执行顺序是什么？" back="从上到下依次检查条件，命中第一个成立的分支后执行它，然后跳过剩余所有分支；全都不成立时执行 else（如果有）。" />

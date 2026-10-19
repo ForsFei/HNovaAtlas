@@ -1,0 +1,133 @@
+---
+id: csharp-exception-boundaries-filters
+title: 异常边界与筛选：保留故障原因，不吞掉失败
+description: 将 Try 模式、catch when、原样重抛和 InnerException 放到同一故障链里，区分可预期输入与外部 I/O 故障。
+tags: [CSharp, 异常, 错误处理, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 30
+prerequisite: [csharp-exceptions-disposal, csharp-parameters-overloads]
+related: [csharp-cancellation-throttling, csharp-io-testable-http-download]
+---
+
+## 错误处理先划边界
+
+[异常、输入失败与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)已经区分“用户输入无效”与“文件读取失败”。更进一步，设计 API 时应明确：什么失败是可预期的业务分支，调用方该如何判断；什么失败意味着操作没完成，需要异常向能恢复的边界传播。不要为了“永远不抛异常”把磁盘、网络或程序错误都转换为 `false`，也不要让无效数字每次都经过 `try { Parse } catch`。
+
+| 情况 | 适合的表达 | 调用方需做什么 |
+| --- | --- | --- |
+| 用户输入 `bad`，预期经常发生 | `TryParse` 返回 `false` | 提示修改输入，不把它当系统故障 |
+| 外部存储读取中断 | `IOException` 等异常 | 在有重试、回退或报告能力的边界处理 |
+| 底层失败需要附业务上下文 | 新异常加 `InnerException` | 看外层业务含义，也能追踪根因 |
+| 只处理某些同类异常 | `catch (...) when (条件)` | 条件不匹配时让异常继续传播 |
+
+`TryXxx` 只覆盖方法契约明确列出的预期失败。例如“文本不是有效的有限温度”可以返回 `false`，但实现中若因配置文件不可读而失败，不能静默返回 `false` 假装用户输入有错。对于参数本身违反 API 前置条件，使用合适的 `ArgumentException` 系列；不要把所有无效参数都强行包装成业务结果。
+
+## `catch when` 是选择处理器，不是先抓住再判断
+
+异常筛选表达式在栈展开前求值；若 `when` 为 `false`，该 `catch` 不处理异常，运行时继续查找其他处理器。这与先进入 `catch`，再用 `if` 判断并重抛，不完全相同。筛选条件应简单、稳定，不在里面做会改变状态的复杂逻辑；它适合按已知上下文或错误类别选择是否处理。已有[取消与限流](/knowledge/programming/csharp/concurrency/cancellation-and-throttling/)使用 `when (linked.IsCancellationRequested)`，就是为了只把**当前操作确实发出取消请求**的异常视为预期结束。
+
+下面示例不读真实文件，向方法注入一个会抛 `IOException` 的动作：`pump-` 设备在这一层获得明确的业务异常，其他设备的同一底层异常不由该层处理。实际项目中的筛选条件应来自清晰的业务策略，而非靠解析异常消息文本。
+
+## 完整可运行示例
+
+把以下内容放入 .NET 10 控制台 `Program.cs`，或运行仓库项目 `dotnet run --project examples/csharp-exception-boundaries/ExceptionBoundariesReview.csproj`。它验证预期输入失败、筛选匹配与不匹配、`InnerException` 及原样重抛。断言的是异常类型和对象关系，不依赖本地化的错误文字或特定堆栈行号。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+Check(!TryReadTemperature("bad", out _), "无效输入是预期失败");
+Check(!TryReadTemperature("NaN", out _), "非有限数值不能进入业务计算");
+Check(TryReadTemperature("72.5", out double temperature) && temperature == 72.5,
+    "有效输入应成功解析");
+
+var diskFailure = new IOException("注入的存储失败");
+try
+{
+    ReadDevice("pump-A", () => throw diskFailure);
+    throw new Exception("应抛出带上下文的异常");
+}
+catch (DeviceReadException ex)
+{
+    Check(ReferenceEquals(ex.InnerException, diskFailure), "原始原因应保留");
+}
+
+var otherFailure = new IOException("另一个注入失败");
+try
+{
+    ReadDevice("sensor-X", () => throw otherFailure);
+    throw new Exception("筛选不匹配时应继续传播原异常");
+}
+catch (IOException ex)
+{
+    Check(ReferenceEquals(ex, otherFailure), "不匹配的筛选不应包装异常");
+}
+
+var relayFailure = new IOException("原始异常");
+try
+{
+    Relay(() => throw relayFailure);
+    throw new Exception("应原样重抛");
+}
+catch (IOException ex)
+{
+    Check(ReferenceEquals(ex, relayFailure), "throw; 保留同一异常对象");
+}
+Console.WriteLine("错误边界断言通过");
+
+static bool TryReadTemperature(string? text, out double value) =>
+    double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value)
+    && double.IsFinite(value);
+
+static void ReadDevice(string deviceId, Action read)
+{
+    try { read(); }
+    catch (IOException ex) when (deviceId.StartsWith("pump-", StringComparison.Ordinal))
+    {
+        throw new DeviceReadException($"设备 {deviceId} 读取失败。", ex);
+    }
+}
+
+static void Relay(Action action)
+{
+    try { action(); }
+    catch (IOException) { throw; } // 同一 catch 内保留原始堆栈信息
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+public sealed class DeviceReadException : Exception
+{
+    public DeviceReadException() { }
+    public DeviceReadException(string message) : base(message) { }
+    public DeviceReadException(string message, Exception innerException)
+        : base(message, innerException) { }
+}
+```
+
+这个自定义异常有存在理由：调用方可能按“设备读取失败”选择处理策略，而不必猜测所有 `IOException` 都来自哪个业务步骤。若标准异常类型已经足够，不要为每个方法新造一个异常类；若要提供机器可读的设备 ID，也可以在异常类上增设经验证的属性，而不是要求调用方解析 `Message`。
+
+## 重抛与包装不是一回事
+
+同一个 `catch` 中只想传播原故障，用 `throw;`；写 `throw ex;` 会从当前处重置堆栈，掩盖更早的调用路径。要在**离开 catch 后**延迟抛出同一异常，可使用 `ExceptionDispatchInfo.Capture(ex)` 保存再 `Throw()`，不是把异常对象放到字段后随手 `throw ex;`。若确需改变抽象层级，创建新异常并把原异常传为 `InnerException`；此时外层堆栈从包装点开始，底层原因仍在内层异常中。
+
+不要用 `catch (Exception) { return false; }` 把编程错误、超时或取消改写成“输入不合法”。取消尤其不是普通成功返回：只有对应令牌确实取消时才按取消协议处理，其他异常应继续报告。异常进入日志时注意去除凭据、隐私数据和不可信原文；面向用户的提示也不应直接打印完整内部堆栈。
+
+当一个失败跨越多个异步步骤，进一步读[ActivitySource 与追踪](/knowledge/programming/csharp/reliability/activity-source-and-tracing/)：它负责关联操作和记录有限诊断上下文，不替代这里的异常传播规则。
+
+## 面试追问与练习
+
+1. `catch (IOException ex) when (condition)` 中条件为 `false`，异常是否已经被这个 `catch` 吞掉？
+2. 同一 `catch` 里 `throw;` 与 `throw ex;` 的诊断差别是什么？新建异常时怎样保留原始原因？
+3. `TryReadTemperature` 为什么拒绝 `NaN`？若读取配置文件时抛 `IOException`，能否也返回 `false`？
+4. 修改示例，让两个不同设备 ID 走不同处理策略；验证不匹配分支仍收到原始 `IOException`。
+
+验收标准：能说明哪一层负责恢复、哪一层只补充上下文，并能指出示例四种断言分别验证的契约，而不是只背 `try/catch` 语法。
+
+## 参考
+
+[Microsoft Learn：异常处理语句与筛选](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/exception-handling-statements) · [异常最佳实践](https://learn.microsoft.com/en-us/dotnet/standard/exceptions/best-practices-for-exceptions) · [Try 模式与性能](https://learn.microsoft.com/en-us/dotnet/standard/design-guidelines/exceptions-and-performance)

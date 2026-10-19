@@ -1,0 +1,60 @@
+---
+id: csharp-inheritance-polymorphism
+title: 继承与多态：override、new 和运行时分派
+description: 通过同一对象的不同静态类型，理解 virtual/override 与成员隐藏，辨析重载、重写和组合。
+tags: [CSharp, OOP, 多态, 继承, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 50
+prerequisite: [csharp-abstract-interfaces]
+related: [csharp-composition-dependency-injection, csharp-parameters-overloads, csharp-value-equality]
+---
+
+## 同一个对象，调用哪个实现
+
+多态的重点不是“有继承”四个字，而是调用方持有基类或接口引用时，仍能执行对象实际类型的实现。基类成员要允许派生重写，需声明 `virtual` 或 `abstract`；派生类用 `override` 接续同一个虚成员链。`new` 则是**隐藏**同名成员，依赖变量的静态类型选择，并不实现同样的动态分派。
+
+```csharp filename="Program.cs"
+Device device = new Pump();
+Pump pump = new Pump();
+Console.WriteLine(device.Describe()); // Pump：override 运行时分派
+Console.WriteLine(device.Kind());     // Device：按基类成员
+Console.WriteLine(pump.Kind());       // Pump：派生类隐藏成员
+
+public class Device
+{
+    public virtual string Describe() => "Device";
+    public string Kind() => "Device";
+}
+
+public sealed class Pump : Device
+{
+    public override string Describe() => "Pump";
+    public new string Kind() => "Pump";
+}
+```
+
+`Device device = new Pump()` 没有把对象“切成”基类；对象仍是 `Pump`。但 `Kind()` 不是虚成员，所以 `device.Kind()` 绑定基类实现。`new` 告诉编译器这是有意隐藏，通常不应拿它模拟多态。`sealed` 类不可再被继承；也可用 `sealed override` 截止某一个虚成员的继续重写。
+
+## 重载不是重写
+
+**重载**是同名、参数列表不同的方法，由编译器结合实参和静态类型选择；**重写**是在继承体系中替换可重写成员，由运行时根据实际对象选择实现。比如 `Print(Device)` 和 `Print(Pump)` 是重载：若实参变量声明为 `Device`，即使实际指向 `Pump`，重载解析通常选择 `Print(Device)`。把这点与上面的 `Describe()` 输出对照，才容易记牢。
+
+## 何时不继承
+
+继承适合稳定的“是一个”关系和真正需要的可替换性。若只是想复用一点代码，可提取普通服务或组合对象；派生类若不得不覆盖大量方法并抛 `NotSupportedException`，通常说明基类契约不合适。接口依赖与组合在多种独立维度变化时更灵活，抽象类在共享状态与模板行为明确时更有价值。
+
+下一篇[组合与依赖注入](/knowledge/programming/csharp/object-oriented/composition-and-dependency-injection/)把这种选择落到业务服务的构造、装配和替身测试中。
+
+## 面试自测与练习
+
+1. 将 `Pump.Kind()` 的 `new` 去掉，编译器会提示什么？输出会变吗？
+2. 将 `Device.Describe()` 的 `virtual` 去掉，`Pump` 的 `override` 是否还能编译？
+3. 写一个 `Valve : Device`，把 `List<Device>` 中不同对象的 `Describe()` 逐个打印；再说明为什么不需要 `if (device is Pump)` 链。
+
+验收标准：看到方法声明就能区分重载、重写和隐藏，并能预测“基类变量指向派生对象”时的输出。
+
+## 参考
+
+[Microsoft Learn：多态](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/object-oriented/polymorphism) · [继承](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/inheritance)

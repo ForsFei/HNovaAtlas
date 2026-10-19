@@ -1,0 +1,114 @@
+---
+id: python-modules-pip
+title: 模块、标准库与 pip
+description: 学会使用 import 复用现成代码，认识标准库，并用 pip 安装第三方库。
+tags: [Python, import, pip, 标准库]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 90
+prerequisite: [python-functions]
+related: [python-stdlib-essentials]
+---
+
+## 模块：站在巨人的肩膀上
+
+Python 的强大一半来自海量现成代码。一个**模块**（module）就是一个装满函数和工具的 `.py` 文件，用 `import` 取来即用。
+
+## 标准库：自带的家当
+
+安装 Python 就附带了一大箱模块，叫**标准库**。举两个例子感受一下：
+
+```python filename="random.py"
+import random
+
+print(random.randint(1, 6))      # 掷骰子：1 到 6 的随机整数
+print(random.choice(["红", "蓝", "绿"]))   # 随机选一个
+```
+
+```python filename="math.py"
+import math
+
+print(math.sqrt(16))    # 4.0  平方根
+print(math.pi)          # 3.141592653589793
+```
+
+`import 模块名` 后用 `模块名.函数名()` 调用。嫌长可以起别名：
+
+```python filename="alias.py"
+import random as r
+
+print(r.randint(1, 100))
+```
+
+也可以只导入需要的函数：
+
+```python filename="from-import.py"
+from random import randint, choice
+
+print(randint(1, 6))      # 不用再写 random. 前缀
+print(choice([1, 2, 3]))
+```
+
+<Callout type="tip" title="别背标准库，知道去查就行">
+
+标准库有几百个模块，没人背得完。记住它存在，遇到"这个功能是不是现成的？"就去查官方文档或搜索"python 标准库 + 需求"。下个阶段会带你实战几个最常用的。
+
+</Callout>
+
+## pip：安装全世界的库
+
+标准库之外的代码叫**第三方库**，全世界的开发者把自己的作品发布在 PyPI（Python 包索引）上，用 **pip** 一条命令安装：
+
+```bash filename="命令行"
+pip install requests        # 安装
+pip uninstall requests      # 卸载
+pip list                    # 查看已安装的库
+```
+
+安装后 `import` 的用法和标准库完全一样。
+
+```python filename="use-requests.py"
+import requests    # 一个用于发 HTTP 请求的第三方库
+
+response = requests.get("https://example.com")
+print(response.status_code)   # 200 表示请求成功
+```
+
+<Callout type="info" title="库是生态的一部分，但新手期别贪多">
+
+第三方库是 Python 生态的核心优势，但初学阶段先把标准库玩熟。需要装什么，等具体项目需要时再装——每装一个库，就多一个要理解的东西。
+
+</Callout>
+
+## 自己的代码也能成模块
+
+你写的任何 `.py` 文件都是模块。同目录下的文件互相 import：
+
+```python filename="utils.py"
+def area(width, height):
+    return width * height
+```
+
+```python filename="main.py"
+import utils
+
+print(utils.area(3, 4))    # 12
+```
+
+项目大了以后，按功能拆成多个模块是管理复杂度的基本手段。
+
+<FlashCard front="标准库和第三方库的区别？" back="标准库随 Python 自带、无需安装（如 random、math）；第三方库由社区发布在 PyPI，需要用 pip install 安装（如 requests）。用法都是 import。" />
+
+## 动手试一试
+
+1. 用 `random` 写一个小程序：每次运行随机推荐一部电影（准备 5 部片名）。
+2. 用 `from math import pi` 计算半径为 3 的圆面积。
+3. 在命令行运行 `pip list`，看看你的 Python 目前装了哪些库。
+
+<Quiz
+  question="import random 后，正确的调用方式是？"
+  options={["randint(1, 6)", "random.randint(1, 6)", "import randint(1, 6)", "random->randint(1, 6)"]}
+  answer={1}
+  explanation="import 模块后，要用 模块名.函数名() 的方式调用。写 randint(1, 6) 会报 NameError，除非用 from random import randint 单独导入。"
+/>

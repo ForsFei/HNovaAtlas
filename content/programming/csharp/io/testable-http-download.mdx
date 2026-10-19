@@ -1,0 +1,171 @@
+---
+id: csharp-io-testable-http-download
+title: 可测试 HTTP 下载：流式限额、故障与取消
+description: 注入 HTTP 测试响应，验证状态码、Content-Length 与实际字节上限、正文取消和资源所有权。
+tags: [CSharp, IO, HttpClient, 测试, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 45
+prerequisite: [csharp-io-network-streams, csharp-composition-dependency-injection]
+related: [csharp-io-http-retry-idempotency, csharp-io-async-files, csharp-cancellation-throttling]
+---
+
+## 从“能下载”推进到“能验证失败”
+
+[网络 I/O 与消息边界](/knowledge/programming/csharp/io/network-streams-and-framing/)已展示 `HttpClient` 的 `ResponseHeadersRead` 与响应流。本篇补上生产下载更容易遗漏的边界：HTTP 非成功状态、声明长度超限、未声明长度却实际超限、正文读取中取消。测试通过注入 `HttpMessageHandler` 返回内存响应，不依赖外网、服务器速度或 `Thread.Sleep`。
+
+这里的下载方法接收调用方已有的 `HttpClient`、`Uri`、目标 `Stream` 和令牌。它**拥有本次响应及正文流**，但不关闭共享客户端和调用方的目标流。这样既方便测试，也让谁负责资源清理明确。目标可能是文件；成功之前已写出的字节不会因为异常自动撤销，所以生产环境应先写受控临时文件，完整验证后再发布。详见[异步文件 I/O 与取消](/knowledge/programming/csharp/io/async-files-and-cancellation/)。
+
+## 两层大小上限
+
+若 `Content-Length` 存在且已超出限制，可以在读取正文前拒绝，省去无谓传输。但它不是完整保护：响应可能不提供该头，也可能实际发送更多字节。因此循环每次读取后，用 `read > maxBytes - total` 检查**实际累计字节**，通过才写入目标。先做减法比较，避免简单相加在极端大值下溢出。
+
+示例使用 3 字节缓冲仅为了让分块与半成品容易观察；真实应用可以合理增大缓冲，但大小上限不能随缓冲改变而失效。`ReadAsync` 可以短读，返回的 `read` 才是本次有效字节数。这里没有调用 `ReadAsByteArrayAsync` 或 `LoadIntoBufferAsync` 把未知大小内容先装进内存。
+
+`ResponseHeadersRead` 的另一个坑是超时：`HttpClient.Timeout` 在这种模式下覆盖到响应头阶段，后续正文读取需由调用方设计总预算或单独的可取消预算，并把令牌继续传到读取/写入。不要把“请求拿到 200”当作正文已经完整、安全落地。
+
+## 完整可运行例子
+
+以下是 .NET 10 控制台 `Program.cs`，仓库 `examples/csharp-http-download` 也包含同样的断言。`example.invalid` 是固定测试地址，测试处理器直接返回内存响应，不会发真实网络请求。
+
+```csharp filename="Program.cs"
+using System.Net;
+using System.Net.Http;
+
+Uri address = new("https://example.invalid/readings.bin");
+
+using (HttpClient client = NewClient(() => Response([1, 2, 3, 4])))
+using (MemoryStream target = new())
+{
+    long count = await DownloadAsync(client, address, target, 4, CancellationToken.None);
+    Require(count == 4 && target.ToArray().SequenceEqual(new byte[] { 1, 2, 3, 4 }), "限额内下载成功");
+    Require(target.CanWrite, "下载方法不拥有目标流");
+}
+
+using (HttpClient client = NewClient(() => new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)))
+using (MemoryStream target = new())
+{
+    await ExpectAsync<HttpRequestException>(async () =>
+        await DownloadAsync(client, address, target, 4, CancellationToken.None));
+    Require(target.Length == 0, "状态码失败时没有写入正文");
+}
+
+using (HttpClient client = NewClient(() => Response([1, 2, 3, 4, 5])))
+using (MemoryStream target = new())
+{
+    await ExpectAsync<InvalidDataException>(async () =>
+        await DownloadAsync(client, address, target, 4, CancellationToken.None));
+    Require(target.Length == 0, "长度头超限时提前拒绝");
+}
+
+using (HttpClient client = NewClient(() => Response([1, 2, 3, 4, 5], knownLength: false)))
+using (MemoryStream target = new())
+{
+    await ExpectAsync<InvalidDataException>(async () =>
+        await DownloadAsync(client, address, target, 4, CancellationToken.None));
+    Require(target.Length > 0 && target.Length <= 4, "未知长度仍受实际字节限制");
+}
+
+using (var source = new CancellationTokenSource())
+using (HttpClient client = NewClient(() => new HttpResponseMessage(HttpStatusCode.OK)
+{
+    Content = new StreamContent(new CancelOnFirstReadStream([1, 2, 3, 4], source))
+}))
+using (MemoryStream target = new())
+{
+    await ExpectAsync<OperationCanceledException>(async () =>
+        await DownloadAsync(client, address, target, 10, source.Token));
+    Require(source.IsCancellationRequested, "正文读取时触发取消");
+}
+
+Console.WriteLine("HTTP 成功、状态码、大小上限与取消断言通过。");
+
+static async Task<long> DownloadAsync(HttpClient client, Uri address, Stream destination,
+    long maxBytes, CancellationToken cancellationToken)
+{
+    ArgumentOutOfRangeException.ThrowIfNegative(maxBytes);
+    using HttpResponseMessage response = await client.GetAsync(
+        address, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+    response.EnsureSuccessStatusCode();
+
+    if (response.Content.Headers.ContentLength is long declared && declared > maxBytes)
+        throw new InvalidDataException("响应声明长度超出上限");
+
+    await using Stream body = await response.Content.ReadAsStreamAsync(cancellationToken);
+    byte[] buffer = new byte[3]; // 教学用小缓冲，方便观察分块；实际应用可调大
+    long total = 0;
+    int read;
+    while ((read = await body.ReadAsync(buffer, cancellationToken)) != 0)
+    {
+        if (read > maxBytes - total)
+            throw new InvalidDataException("实际响应体超出上限");
+        await destination.WriteAsync(buffer.AsMemory(0, read), cancellationToken);
+        total += read;
+    }
+    return total;
+}
+
+static HttpClient NewClient(Func<HttpResponseMessage> factory) => new(new StubHandler(factory));
+
+static HttpResponseMessage Response(byte[] bytes, bool knownLength = true)
+{
+    var response = new HttpResponseMessage(HttpStatusCode.OK)
+    {
+        Content = new StreamContent(new MemoryStream(bytes))
+    };
+    if (!knownLength) response.Content.Headers.ContentLength = null;
+    return response;
+}
+
+static async Task ExpectAsync<TException>(Func<Task> action) where TException : Exception
+{
+    try { await action(); }
+    catch (TException) { return; }
+    throw new InvalidOperationException($"未观察到预期异常：{typeof(TException).Name}");
+}
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public sealed class StubHandler(Func<HttpResponseMessage> factory) : HttpMessageHandler
+{
+    protected override Task<HttpResponseMessage> SendAsync(
+        HttpRequestMessage request, CancellationToken cancellationToken) =>
+        Task.FromResult(factory());
+}
+
+public sealed class CancelOnFirstReadStream(byte[] bytes, CancellationTokenSource source)
+    : MemoryStream(bytes)
+{
+    public override async ValueTask<int> ReadAsync(
+        Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        int read = await base.ReadAsync(buffer, cancellationToken);
+        if (read > 0) source.Cancel();
+        return read;
+    }
+}
+```
+
+运行仓库项目：`dotnet run --project examples/csharp-http-download/HttpDownloadReview.csproj`。正文完整代码块由 `npm run test:csharp-articles` 单独编译，项目实际运行验证四类结果。`StubHandler` 只供单线程教学测试；真实共享 `HttpClient` 的自定义处理器必须考虑并发调用。
+
+## 从教学方法走向生产下载
+
+- **地址与重定向**：这个方法假设调用方已经审查 `Uri`。若地址来自用户，必须在发请求和处理重定向时实施目标限制，防止访问内网/本机等不允许的资源；仅检查字符串前缀不够。
+- **超时与取消**：调用方可创建总预算的令牌源并传入方法；网络栈和目标流对取消的响应取决于各自实现。`WaitAsync(timeout)` 只限制等待时，不能替代底层协作取消。
+- **文件半成品**：超限、网络中断、取消或目标写入失败都可能留下部分内容。决定重试、续传、临时文件清理与最终发布规则；`using` 负责关闭，不负责事务回滚。
+- **响应约束**：大小之外还可能需要检查媒体类型、摘要、压缩解码后大小、内容格式和业务签名。`Content-Length` 是一个可用的提前拒绝信号，不是可信完整性证明。
+
+## 自测与面试追问
+
+1. 为什么只检查 `Content-Length` 不足以挡住大响应？为什么只设 `HttpClient.Timeout` 也不够？
+2. 未知长度的例子在抛异常时目标流可能已经写入了什么？谁负责处理它？
+3. 为什么测试应替换 `HttpMessageHandler`，而不是依赖一个不稳定的外部网站？
+4. `DownloadAsync` 为什么释放 `HttpResponseMessage`，却不释放传入的 `HttpClient` 和 `destination`？
+
+[继续读：HTTP 重试与幂等边界](/knowledge/programming/csharp/io/http-retry-and-idempotency/)：单次下载失败后，先判断请求可否重复、失败是否暂时，再谈次数与超时预算。
+
+参考：[Microsoft Learn：HttpCompletionOption](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcompletionoption?view=net-10.0)、[`HttpContent.ReadAsStreamAsync`](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpcontent.readasstreamasync?view=net-10.0)、[`HttpMessageHandler.SendAsync`](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpmessagehandler.sendasync)、[`HttpResponseMessage.Dispose`](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.httpresponsemessage.dispose)。

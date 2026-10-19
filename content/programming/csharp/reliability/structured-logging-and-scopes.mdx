@@ -1,0 +1,124 @@
+---
+id: csharp-structured-logging-scopes
+title: .NET 结构化日志：模板、异常与作用域
+description: 用可控 ILogger 验证级别、事件 ID、模板字段、异常对象和作用域，分清日志记录与输出边界。
+tags: [CSharp, .NET, ILogger, 日志, 诊断, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-15"
+order: 37
+prerequisite: [csharp-activity-source-tracing, csharp-metrics-counters-histograms-gauges]
+related: [csharp-exception-boundaries-filters, csharp-io-http-end-to-end-deadline, csharp-unit-tests-boundaries]
+---
+
+## 从字符串到诊断事件
+
+前两篇分别用 [ActivitySource](/knowledge/programming/csharp/reliability/activity-source-and-tracing/) 关联一次操作的步骤，用 [Meter](/knowledge/programming/csharp/reliability/metrics-counters-histograms-and-gauges/) 记录跨多次操作的数值。日志则回答“这次操作在这个边界发生了什么”。`ILogger` 的一次调用不只是写一行字符串：它还携带级别、类别、事件 ID、模板参数、可选异常和作用域上下文。是否真正写到控制台、文件或远端，取决于配置的 provider 与筛选规则。
+
+例如 `"Reading {ReadingId} failed"` 是稳定的**消息模板**，`43` 是命名为 `ReadingId` 的字段。日志平台既能展示格式化消息，也可以按字段检索；`$"Reading {id} failed"` 则在调用前就生成普通字符串，不保留这个模板字段契约。占位符按传入参数的**位置**绑定，而名称成为结构化字段名；重排模板后也要核对参数顺序。不要把用户输入直接当模板，模板最好保持常量。此处不意味着每个 provider 都会持久化所有字段：`ILogger` 把结构化状态交给 provider，最终呈现由它决定。[官方日志指南](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/)也建议使用消息模板，并说明类别和筛选的作用。
+
+| 信息 | 适合承载什么 | 不要误解为 |
+| --- | --- | --- |
+| `LogLevel` | 某条记录的严重程度，供筛选 | 全系统统一的故障分类；级别阈值会因环境改变 |
+| category | 通常由 `ILogger<T>` 提供的来源名称 | 每次请求的唯一 ID |
+| `EventId` | 稳定的事件编号和名称，例如“读数拒绝” | 例外实例的标识或自动生成的追踪 ID |
+| 模板字段 | 低成本、可查询的业务维度，如读数 ID | 可随意写入凭据、令牌或完整私人数据 |
+| `Exception` | 原始异常对象及堆栈上下文 | 仅一段 `ex.Message` 文本 |
+| scope | 多条日志共享的操作上下文 | 自动出现的分布式追踪或持久事务 |
+
+## 离线验证 `ILogger` 的状态
+
+运行 `dotnet run --project examples/csharp-structured-logging/StructuredLoggingReview.csproj`。项目通过 `Microsoft.AspNetCore.App` 框架引用获得日志抽象，不要求真实 Web 服务器或日志后端。下方 `CaptureLogger` 是**顺序测试替身**：检查交给 `ILogger.Log` 的原始状态，而不是声称控制台输出一定具备同样的查询能力。它只实现本例用到的字典作用域，不具备生产 provider 的并发与异步上下文传播能力。
+
+```csharp filename="Program.cs"
+using Microsoft.Extensions.Logging;
+
+var logger = new CaptureLogger();
+logger.LogDebug("Skipped reading {ReadingId}", 41);
+using (logger.BeginScope(new Dictionary<string, object?>
+       {
+           ["DeviceKind"] = "temperature"
+       }))
+{
+    logger.LogInformation(new EventId(1001, "ReadingAccepted"),
+        "Reading {ReadingId} accepted", 42);
+    var error = new InvalidDataException("bad frame");
+    logger.LogWarning(new EventId(1002, "ReadingRejected"), error,
+        "Reading {ReadingId} failed", 43);
+}
+logger.LogInformation("Reading {ReadingId} accepted", 44);
+
+Check(logger.Entries.Count == 3, "Debug is filtered");
+var accepted = logger.Entries[0];
+Check(accepted.Level == LogLevel.Information && accepted.EventId.Id == 1001,
+    "level and stable event ID are retained");
+Check(accepted.Template == "Reading {ReadingId} accepted" &&
+      Equals(accepted.ReadingId, 42), "template and typed field are retained");
+Check(Equals(accepted.ScopeDeviceKind, "temperature"), "scope enriches both records");
+var rejected = logger.Entries[1];
+Check(rejected.Level == LogLevel.Warning && rejected.EventId.Id == 1002 &&
+      rejected.Exception is InvalidDataException && Equals(rejected.ReadingId, 43) &&
+      Equals(rejected.ScopeDeviceKind, "temperature"),
+    "exception object and structured field are retained");
+Check(logger.Entries[2].ScopeDeviceKind is null, "scope ends at its boundary");
+Console.WriteLine("结构化日志、异常与作用域验证通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+sealed record LogEntry(LogLevel Level, EventId EventId, string? Template,
+    object? ReadingId, Exception? Exception, object? ScopeDeviceKind);
+
+sealed class CaptureLogger : ILogger
+{
+    private IReadOnlyDictionary<string, object?>? _scope;
+    public List<LogEntry> Entries { get; } = [];
+
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull
+    {
+        var previous = _scope;
+        _scope = state as IReadOnlyDictionary<string, object?>;
+        return new RestoreScope(() => _scope = previous);
+    }
+
+    public bool IsEnabled(LogLevel logLevel) =>
+        logLevel is >= LogLevel.Information and < LogLevel.None;
+
+    public void Log<TState>(LogLevel logLevel, EventId eventId, TState state,
+        Exception? exception, Func<TState, Exception?, string> formatter)
+    {
+        if (!IsEnabled(logLevel)) return;
+        var fields = state as IReadOnlyList<KeyValuePair<string, object?>>;
+        object? Field(string name) => fields?.FirstOrDefault(item => item.Key == name).Value;
+        Entries.Add(new LogEntry(logLevel, eventId,
+            Field("{OriginalFormat}")?.ToString(), Field("ReadingId"), exception,
+            _scope?.GetValueOrDefault("DeviceKind")));
+    }
+
+    private sealed class RestoreScope(Action restore) : IDisposable
+    {
+        public void Dispose() => restore();
+    }
+}
+```
+
+本例先过滤 `Debug`，再在作用域中保留两条记录：成功记录的 `ReadingId` 仍是整数 `42`，失败记录带 `InvalidDataException` 对象而不只是“bad frame”。离开 `using` 后又写一条日志，验证共享上下文不会泄漏到下一条。`{OriginalFormat}` 是模板原文；格式化后的消息和结构化状态是两个不同的观察层。示例没有写入真实文件，也没有证明某个 provider 的输出格式。
+
+## 设计边界与生产实践
+
+**异常要传对象。** 在 `catch (Exception ex)` 里若决定于边界记录，调用 `LogWarning(eventId, ex, "... {ReadingId}", id)` 可让 provider 获得异常类型和堆栈；只记录 `ex.Message` 会丢失这些信息。也不要每层都记录同一故障并再次抛出，避免一处失败被算成多次事件。该记录仍不处理异常，恢复、传播或转换要由调用契约决定；回看[异常边界](/knowledge/programming/csharp/reliability/exception-boundaries-and-filters/)。
+
+**作用域只给相关记录共享字段。** 请求、作业或批次开始时建立 scope，结束时释放。真实日志系统通常用 `ILogger<T>` 获得类别，用依赖注入配置 provider、最低级别与按类别过滤；是否显示 scope 也受 provider 选项影响。[`ILogger` API](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.logging.ilogger)提供 `BeginScope`、`IsEnabled` 和底层 `Log`。若要跨服务关联一次操作，应沿用 Activity 的 TraceId/SpanId 传播，而不是把测试替身的 `_scope` 字段当成生产关联机制。
+
+**注意开销与隐私。** 级别筛选不会替你撤销已经执行的昂贵参数计算；遇到序列化大对象等代价时可先检查 `IsEnabled`，并避免记录令牌、连接字符串与未经审核的个人数据。高频热路径可考虑 [`[LoggerMessage]` 源生成](https://learn.microsoft.com/en-us/dotnet/core/extensions/high-performance-logging/)，但普通业务代码先保持清晰的常量模板和明确字段。数值趋势用指标，单次路径用追踪，具体边界事件用日志；三者互补，不必为每个变量变化都打一条日志。
+
+## 面试自测
+
+1. `LogInformation($"Reading {id} failed")` 与 `LogInformation("Reading {ReadingId} failed", id)` 交给 provider 的结构有什么差别？
+2. 记录 `ex.Message` 与传入 `Exception` 对象的差别是什么？日志能代替异常处理吗？
+3. `BeginScope` 外的一条记录还应带前一个作用域的 `DeviceKind` 吗？为什么示例不能证明真实 provider 的 scope 输出？
+4. `Debug` 被筛选后，为何仍要警惕日志参数表达式中的昂贵计算？
+
+参考：[Microsoft Learn：.NET 日志](https://learn.microsoft.com/en-us/dotnet/core/extensions/logging/)、[`ILogger` API](https://learn.microsoft.com/en-us/dotnet/api/microsoft.extensions.logging.ilogger)、[高性能日志](https://learn.microsoft.com/en-us/dotnet/core/extensions/high-performance-logging/)。

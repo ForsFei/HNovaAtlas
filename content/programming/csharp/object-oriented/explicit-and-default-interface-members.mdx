@@ -1,0 +1,105 @@
+---
+id: csharp-explicit-default-interface-members
+title: 显式接口实现与默认接口成员：调用视图决定看到什么
+description: 用两个同名 Render 契约和一个默认版本方法，辨认接口映射、默认实现与类公开 API 的边界。
+tags: [CSharp, 接口, 面向对象, 默认接口成员, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 35
+prerequisite: [csharp-abstract-interfaces]
+related: [csharp-inheritance-polymorphism, csharp-composition-dependency-injection]
+---
+
+## 先问：调用方拿到的是什么类型
+
+假设设备快照同时支持两种文本输出：导出给内部处理程序的原始读数，以及写入审计记录的脱敏文字。两个接口碰巧都把方法命名为 `Render()`，但契约不同。如果类只提供一个普通的 `public Render()`，它可以同时满足两个接口；两个接口视图将调用同一个实现。这不是“编译器自动选出更合适的一版”。
+
+需要为两个接口分别定义行为时，可用**显式接口实现**：`string ITextExport.Render()` 与 `string IAuditText.Render()`。显式成员不写 `public` 等访问修饰符，也不能通过 `snapshot.Render()` 调用；先取得对应接口视图，再调用该契约。下方整段就是可运行的 `Program.cs`：
+
+```csharp filename="Program.cs"
+var snapshot = new DeviceSnapshot("pump-A", 72);
+ITextExport export = snapshot;
+IAuditText audit = snapshot;
+IFormatVersion versioned = snapshot;
+
+Check(export.Render() == "pump-A,72", "export interface exposes the reading");
+Check(audit.Render() == "device=pump-A;value=[masked]",
+    "audit interface uses a distinct implementation");
+Check(versioned.FormatVersion() == "v1", "interface reference calls the default body");
+Check(typeof(DeviceSnapshot).GetMethod("Render") is null
+    && typeof(DeviceSnapshot).GetMethod("FormatVersion") is null,
+    "neither member appears on the class public surface");
+
+IFormatVersion customized = new CustomSnapshot();
+Check(customized.FormatVersion() == "v2", "a class member can replace the default");
+Console.WriteLine("显式接口实现、默认成员与调用视图断言全部通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public interface ITextExport
+{
+    string Render();
+}
+
+public interface IAuditText
+{
+    string Render();
+}
+
+public interface IFormatVersion
+{
+    string FormatVersion() => "v1";
+}
+
+public sealed class DeviceSnapshot(string id, int value)
+    : ITextExport, IAuditText, IFormatVersion
+{
+    string ITextExport.Render() => $"{id},{value}";
+    string IAuditText.Render() => $"device={id};value=[masked]";
+}
+
+public sealed class CustomSnapshot : IFormatVersion
+{
+    public string FormatVersion() => "v2";
+}
+```
+
+运行 `dotnet run --project examples/csharp-interface-dispatch/InterfaceDispatchReview.csproj`。示例断言：同一个对象经两个接口调用会得到不同文本；默认版本方法经接口可调用，却没有自动出现在 `DeviceSnapshot` 的公开成员列表；类也能提供自己的版本实现。反射检查只是在此例验证类的**公开方法面**，不是判断对象“有没有实现接口”的通用方法。
+
+## 显式实现解决的是什么
+
+`ITextExport` 和 `IAuditText` 的 `Render` 签名相同。显式实现为每个接口槽位指定不同的方法体，避免一个公共方法被无意共享。调用者必须明确选择接口：
+
+```csharp
+var snapshot = new DeviceSnapshot("pump-A", 72);
+var auditText = ((IAuditText)snapshot).Render();
+```
+
+这也适用于接口成员与类原有成员同名、但语义不同的情况。不过，不要把显式实现当作安全控制。持有 `DeviceSnapshot` 的代码仍可转换成 `ITextExport` 读取原始值；是否允许导出，必须由真正的权限与数据访问边界保证。显式实现主要是在设计 API：让不同能力只从相应接口视图暴露。
+
+如果只需要同一语义，普通公开实现更直接；过度使用显式实现会让调用者处处强制转换，也不利于发现功能。
+
+## 默认接口成员不是类的继承方法
+
+`IFormatVersion` 自带 `FormatVersion() => "v1"`，因此 `DeviceSnapshot` 不必写一个实现。但调用位置是 `versioned.FormatVersion()`，而不是 `snapshot.FormatVersion()`：默认实现**不会自动成为实现类的公开方法**。这和继承一个基类、直接拥有基类公开方法的模型不同。
+
+`CustomSnapshot` 声明了公开的 `FormatVersion()`，因此该类与 `IFormatVersion` 视图都可以调用它；本例经接口视图得到 `v2`。默认接口成员常用于给已有接口增添有合理默认值的能力，降低现有实现者立刻修改代码的成本；但新增成员是否真的语义兼容、既有调用方是否期待这一默认行为，仍要逐一评估。接口默认实现也不应变成储存每个对象可变实例状态的借口。
+
+这里的接口映射不是类继承中的 `new` 隐藏或 `override` 重写。面试遇到“为什么转成接口后结果不同”，先列出每个接口的成员契约、实际实现映射与变量的静态类型，不要仅凭方法名猜派发结果。
+
+## 面试自测与练习
+
+1. 如果移除两段显式实现，改为一个 `public string Render()`，`export.Render()` 和 `audit.Render()` 会调用几个方法？审计需求是否仍满足？
+2. 为什么 `snapshot.Render()` 与 `snapshot.FormatVersion()` 在本例不能编译，而对应接口变量可以？
+3. 给 `CustomSnapshot` 再加一个显式 `IFormatVersion.FormatVersion()`，并移除公共版本，预测两种变量类型各能调用什么。
+4. 若不可信调用者可以拿到 `DeviceSnapshot`，显式实现能否阻止它读出原始值？实际授权应该放在哪里？
+
+验收标准：能画出“接口成员 → 实现方法”的映射，写出接口转换后的调用结果，并解释默认成员与类公开 API 的区别。
+
+## 参考
+
+[Microsoft Learn：显式接口实现](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/interfaces/explicit-interface-implementation) · [使用默认接口方法演进接口](https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/interface-implementation/default-interface-methods-versions) · [interface 关键字](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/interface)

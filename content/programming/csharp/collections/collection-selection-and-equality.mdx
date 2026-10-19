@@ -1,0 +1,72 @@
+---
+id: csharp-collection-selection
+title: 集合选型与相等性：查找、去重、队列和快照
+description: 从操作需求选择 List、Dictionary、HashSet、Queue 与只读视图，理解比较器和可变键陷阱。
+tags: [CSharp, 集合, Dictionary, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 15
+prerequisite: [csharp-collections-generics, csharp-value-equality]
+related: [csharp-collection-complexity, csharp-linq, csharp-query-boundaries, csharp-immutable-collections-snapshots]
+---
+
+## 从操作倒推数据结构
+
+先问“最频繁的操作是什么”，再选集合。需要按位置访问和保持输入顺序，用 `List<T>`；按设备 ID 查读数，用 `Dictionary<TKey,TValue>`；只需唯一性及成员判断，用 `HashSet<T>`；按进入顺序处理待办，用 `Queue<T>`；后进先出才用 `Stack<T>`。它们各有时间、空间和语义取舍，不应只靠“哪个更快”判断。
+
+| 需求 | 首选 | 需要额外确认 |
+| --- | --- | --- |
+| 允许重复、频繁追加、按索引读取 | `List<T>` | 中间插入/删除可能移动元素 |
+| 按唯一键查一条 | `Dictionary<TKey,TValue>` | 键不存在如何处理；键的相等性是否稳定 |
+| 去重与成员判断 | `HashSet<T>` | 相等比较器；展示时是否另行排序 |
+| 先进先出处理 | `Queue<T>` | 队列为空怎么办；是否涉及跨线程 |
+| 保留不可变快照 | 复制到新集合 | 只读接口不等于不可变对象图 |
+
+## 同一业务键要用同一比较规则
+
+下面的 `StringComparer.OrdinalIgnoreCase` 同时给字典和集合使用。若同一服务里一个地方忽略大小写、另一个地方区分大小写，设备总数和去重结果就会互相矛盾。整段可作为 `Program.cs`：
+
+```csharp filename="Program.cs"
+var counts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+var unique = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+var pending = new Queue<string>();
+
+foreach (string id in new[] { "pump-A", "PUMP-A", "pump-B" })
+{
+    unique.Add(id);
+    counts.TryGetValue(id, out int previous);
+    counts[id] = previous + 1;
+    pending.Enqueue(id);
+}
+
+Console.WriteLine(unique.Count);       // 2
+Console.WriteLine(counts["pump-a"]);  // 2
+Console.WriteLine(pending.Dequeue());  // pump-A
+```
+
+`Dictionary` 索引器读取缺失键会抛异常；`TryGetValue` 把“可能没有”显式表示出来。用 `Add` 加入已存在键也会失败，而 `counts[id] = ...` 会新增或覆盖。别依赖 `HashSet` 的枚举顺序来做业务展示；若 UI 要稳定顺序，展示前排序。
+
+## 键与快照的两个陷阱
+
+哈希集合/字典要求：对象相等时哈希码也相等。若把可变对象放进键或 `HashSet`，插入后改变参与相等比较的字段，后续查找可能异常或找不到。通常用稳定的字符串、数字、不可变记录作为键，并在创建时固定比较器。
+
+`IReadOnlyList<T>` 只是调用者通过该接口不能增删；若另一个引用持有原 `List<T>`，它仍能修改数据。`list.AsReadOnly()` 也是随底层列表变化的只读视图。需要当时的独立列表快照时复制，例如 `list.ToArray()`；但若元素本身是可变对象，数组只是复制元素引用，不是深拷贝。把“容器只读”“容器快照”“元素不可变”分开讨论。
+
+这些边界可在[不可变集合与快照](/knowledge/programming/csharp/collections/immutable-collections-and-snapshots/)中运行对照：同一源列表变化后，视图、数组副本与 `ImmutableArray<T>` 的结果不同。
+
+多线程访问不是把 `Dictionary` 包成 `IReadOnlyDictionary` 就安全；多个线程共享并修改时，要建立同步边界或选择适合的并发集合。只读 API 不能替代并发控制。
+
+## 面试自测与练习
+
+1. 为什么 `HashSet<string>` 的去重结果可能是 2，而按默认区分大小写规则可能是 3？
+2. 将 `pending` 换为 `Stack<string>`，最后移出的设备 ID 会变成什么？业务语义改变了吗？
+3. 从可变 `List<Reading>` 得到 `IReadOnlyList<Reading>`、`ToArray()` 和“深层不可变”的差别分别是什么？
+
+验收标准：能从访问、顺序、重复、相等性、可变性与并发这六个维度解释选型。
+
+下一篇[集合操作复杂度](/knowledge/programming/csharp/collections/collection-complexity-and-search/)进一步计算批量查询、扩容和二分查找的实际成本。
+
+## 参考
+
+[Microsoft Learn：集合与数据结构](https://learn.microsoft.com/en-us/dotnet/standard/collections/) · [常用集合类型](https://learn.microsoft.com/en-us/dotnet/standard/collections/commonly-used-collection-types)

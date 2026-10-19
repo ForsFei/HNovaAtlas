@@ -1,0 +1,99 @@
+---
+id: csharp-task-vs-valuetask
+title: Task 与 ValueTask：完成形态、消费约束和组合
+description: 用受控缓存命中/未命中示例比较 Task 与 ValueTask，说明单次消费、AsTask 转换及何时不该优化。
+tags: [CSharp, Task, ValueTask, 异步, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 12
+prerequisite: [csharp-async-await]
+related: [csharp-async-streams-cancellation, csharp-task-composition-faults-timeouts, csharp-synchronization-context-configureawait, csharp-channel-failure-cancellation]
+---
+
+## 先有 `Task` 心智模型，再谈 `ValueTask`
+
+[`async / await` 入门](/knowledge/programming/csharp/concurrency/async-await/)已经说明 `Task<T>` 表示将来完成、失败或取消的操作。它适合多数异步 API：调用方可把同一 `Task<T>` 传给多个观察者、反复 `await` 已完成的任务，也能直接交给 `Task.WhenAll` / `Task.WhenAny` 组合。`Task` 不是一个工作线程，也不自动让 CPU 代码并行。
+
+`ValueTask<T>` 则是一个**值类型的等待结果容器**，可以承载立即得到的 `T`、一个 `Task<T>`，或提供单次消费语义的异步源。它针对某些“频繁调用且常同步完成”的热路径有潜在分配收益，但这个收益取决于实际实现、调用频率和消费方式。它不是 `Task<T>` 的无脑升级版；公开 API 默认从 `Task<T>` 出发，只有测量确实发现分配压力、调用方也能处理额外约束时才考虑 `ValueTask<T>`。
+
+| 问题 | `Task<T>` | `ValueTask<T>` |
+| --- | --- | --- |
+| 表示什么 | 一次异步操作的对象 | 可能是直接结果、Task 或异步源的值容器 |
+| 可否多次观察 | 同一 Task 可多次 await | 一般契约按**消费一次**设计；不要复制后各自 await |
+| `WhenAll` / `WhenAny` | 直接参与 | 先**一次性**调用 `AsTask()`，之后使用所得 Task |
+| 默认选择 | 常规异步 API 的起点 | 性能测量支持且能遵守约束时考虑 |
+
+## 固定结果的可运行实验
+
+以下代码是完整 `Program.cs`。`CachedReading` 用 `TaskCompletionSource<int>` 控制首次结果尚未完成，随后缓存命中可直接提供结果。它只是教学模型，不访问网络，也不测量性能；控制流程全部由断言验证。
+
+```csharp filename="Program.cs"
+Task<int> reusable = Task.FromResult(7);
+Check(await reusable == 7 && await reusable == 7, "Task supports repeated awaits");
+
+var cache = new CachedReading();
+ValueTask<int> pending = cache.ReadAsync();
+Check(!pending.IsCompletedSuccessfully, "cache miss is pending");
+cache.Complete(42);
+Check(await pending == 42, "pending result"); // 只消费这份 ValueTask 一次
+
+ValueTask<int> ready = cache.ReadAsync();
+Check(ready.IsCompletedSuccessfully, "cache hit is ready");
+Check(await ready == 42, "ready result"); // 新取得的 ValueTask，也只消费一次
+
+ValueTask<int> toCompose = cache.ReadAsync();
+Task<int> stable = toCompose.AsTask(); // 转换一次，之后只使用 Task
+int[] results = await Task.WhenAll(stable, Task.FromResult(1));
+Check(results.SequenceEqual([42, 1]), "Task.WhenAll composition");
+
+Console.WriteLine("Task 与 ValueTask 消费契约断言全部通过");
+
+static void Check(bool condition, string name)
+{
+    if (!condition) throw new Exception($"断言失败：{name}");
+}
+
+sealed class CachedReading
+{
+    private readonly TaskCompletionSource<int> _pending =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private int? _cached;
+
+    public ValueTask<int> ReadAsync() => _cached is int value
+        ? ValueTask.FromResult(value)
+        : new ValueTask<int>(_pending.Task);
+
+    public void Complete(int value)
+    {
+        _cached = value;
+        _pending.SetResult(value);
+    }
+}
+```
+
+第一条断言展示同一 `Task<int>` 可再次等待。缓存未命中时，`ValueTask<int>` 包装尚未完成的 `Task<int>`；完成后可以 `await` 得到 42。缓存命中时，新的 `ValueTask<int>` 直接承载 42，`IsCompletedSuccessfully` 为真。最后一段只对 `toCompose` 调用**一次** `AsTask()`，以后复用的是转换得到的 `Task<int>`；`WhenAll` 不接收 `ValueTask<int>` 集合。
+
+这个小例子的 `ValueTask<int>` 仅承载 Task 或结果，并未使用可复用的 `IValueTaskSource<T>`。**不能**因为在这里重复等待碰巧可能工作，就推论所有 `ValueTask<T>` 都可重复等待；API 的通用消费约束按单次处理。也不要在尚未完成时读取 `Result`，不要一边 `await valueTask` 一边 `AsTask()`，或对同一个值重复调用 `AsTask()` 后分别消费。若确实需要多处观察，先转换一次，后续只共享 `Task<T>`。
+
+## 何时选哪个，以及常见误区
+
+- 普通业务方法、需要组合/缓存/多处观察的操作，默认返回 `Task` / `Task<T>`。API 可读性与正确性通常比未测量的分配假设更重要。
+- 已在高频路径观察到任务对象分配确实成为瓶颈，而且同步完成比例高、消费者可以直接等待一次时，才评估 `ValueTask`；还应针对真实负载比较吞吐、分配及调用方成本。
+- `ValueTask` 是 `struct` 不意味着“零分配”：它可能包装 Task，`AsTask()` 也可能生成 Task；反过来，已完成的 `Task` 也有缓存等优化。不要从类型名直接推出速度。
+- `TaskCompletionSource` 在例子里只是测试同步点；真实缓存要考虑并发读写、失败、失效和取消。该 `CachedReading` **不是线程安全的生产缓存**。
+
+在 [.NET 的异步流](/knowledge/programming/csharp/concurrency/async-streams-and-cancellation/)和 [Channel 读端](/knowledge/programming/csharp/concurrency/channel-failure-and-cancellation/)等 API 中会看到 `ValueTask`。按它们的具体契约消费，通常直接 `await` 一次；要给 `WhenAll` 使用时才在边界转成 Task。`ValueTask` 仍然表示异步完成状态，**不**等于开启新线程、自动超时或自动取消。
+
+## 面试自测与练习
+
+1. 为什么普通业务 API 的返回值不应统一替换为 `ValueTask<T>`？需要什么测量证据？
+2. `ValueTask<int> operation` 想与另一任务一起 `WhenAll`，怎样只转换和消费一次？
+3. `IsCompletedSuccessfully` 为 `false` 是否就意味着失败？它还可能是什么状态？
+4. 为示例增加一个失败分支，用 `TaskCompletionSource<int>.SetException` 触发异常并在 `await` 处观察；不要用“未完成时访问 Result”来检测失败。
+
+验收标准：能解释 `Task<T>` 与 `ValueTask<T>` 的选择依据、一次消费约束和 `AsTask()` 的组合边界；能运行仓库断言 `dotnet run --project examples/csharp-task-valuetask/TaskValueTaskReview.csproj`。正文完整代码块由 `npm run test:csharp-articles` 单独编译。
+
+## 参考
+
+[Microsoft Learn：TAP 设计与返回类型](https://learn.microsoft.com/en-us/dotnet/standard/asynchronous-programming-patterns/task-based-asynchronous-pattern-tap) · [`ValueTask<T>` 使用约束](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.valuetask-1) · [`AsTask`](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.valuetask-1.astask)

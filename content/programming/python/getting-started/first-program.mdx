@@ -1,0 +1,125 @@
+---
+id: python-first-program
+title: 第一个程序
+description: 写下并运行你的第一行 Python 代码，认识交互模式和脚本文件两种运行方式。
+tags: [Python, print, 入门]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 30
+prerequisite: [python-setup]
+related: [python-variables-types]
+---
+
+## 程序是什么
+
+一个程序就是一串指令：计算机从上到下逐行执行你写下的代码。先不着急理解原理，本篇的目标只有一个——亲手让一段代码跑起来。
+
+## 先试试交互模式
+
+打开命令行，输入 `python` 回车，你会看到 `>>>` 提示符。这就是**交互模式**（REPL）：你输入一行，它执行一行，立刻给你结果。
+
+```python filename="命令行（REPL）"
+>>> print("你好，世界")
+你好，世界
+>>> 2 + 3
+5
+```
+
+注意两个细节：
+
+- `print("...")` 让计算机把括号里的内容显示出来，输出不带引号。
+- 直接输入 `2 + 3` 时结果自动显示；交互模式就像一台高级计算器。
+
+输入 `exit()` 并回车即可退出交互模式。
+
+## 写成文件再运行
+
+交互模式适合试验，真正的程序要保存在文件里。创建你的第一个程序文件：
+
+<Tabs label="查看两种建立文件的方式" defaultValue="vscode">
+  <Tab value="vscode" label="用 VS Code">
+
+1. 新建一个文件夹（例如 `python-learning`），在 VS Code 中打开它。
+2. 新建文件，命名为 `hello.py`。
+3. 输入下面两行代码并保存（`Ctrl + S`）。
+
+  </Tab>
+  <Tab value="manual" label="用记事本">
+
+1. 打开记事本，输入下面两行代码。
+2. 另存为 `hello.py`，保存类型选"所有文件"，编码选 UTF-8。
+3. 记住保存的位置，比如桌面。
+
+  </Tab>
+</Tabs>
+
+```python filename="hello.py"
+# 我的第一行代码：向世界问好
+print("你好，世界")
+print("我正在学 Python")
+```
+
+以 `#` 开头的行是**注释**，写给人类看的说明，计算机直接跳过。好的注释是给自己（和以后的同事）留的笔记。
+
+然后回到命令行，进入文件所在目录并运行：
+
+```bash filename="命令行"
+python hello.py
+```
+
+你会看到两行输出。恭喜——这是一个真正意义上的 Python 程序了。
+
+```mermaid caption="从代码到输出的流程"
+flowchart LR
+  A[编写 hello.py] --> B[保存文件]
+  B --> C[python hello.py 运行]
+  C --> D[解释器逐行执行]
+  D --> E[屏幕显示输出]
+```
+
+## print 还能做什么
+
+`print` 可以一次打印多个内容，用逗号隔开，中间会自动加空格：
+
+```python filename="hello2.py"
+print("姓名:", "小明")
+print("1 + 2 =", 1 + 2)
+```
+
+输出：
+
+```text
+姓名: 小明
+1 + 2 = 3
+```
+
+逗号后面如果是算式，Python 会先算出结果再打印——你已经能用它当计算器了。
+
+<Callout type="danger" title="初学者最常见的两个报错">
+
+1. **忘记引号**：`print(你好)` 会报 `SyntaxError`。文字内容要用引号包起来。
+2. **中英文标点混用**：引号、括号必须用英文符号。中文引号 `""` 和英文引号 `" "` 看着像，计算机只认后者。报错时先检查标点。
+
+</Callout>
+
+<Accordion title="报错了怎么办？">
+
+先读错误信息的**最后一行**，那是错误类型；再看它指出的**行号**，回到对应位置检查。语法错误（SyntaxError）多半是少了引号、括号或用了中文标点。把错误信息复制去搜索，也是完全正当的学习手段。
+
+</Accordion>
+
+## 动手试一试
+
+1. 用交互模式计算 `365 * 24`，看看一年有多少小时。
+2. 写一个 `about.py`，用两行 `print` 打印你的名字和今天想完成的事。
+3. 故意把 `print` 写成 `pritn` 运行一次，观察错误信息，认识 NameError 长什么样。
+
+<Quiz
+  question="print('Hello') 中漏掉引号写成 print(Hello)，会发生什么？"
+  options={["正常输出 Hello", "报 SyntaxError 语法错误", "输出空白", "报 NameError：Hello 未定义"]}
+  answer={1}
+  explanation="没有引号时，Python 把 Hello 当作一个名字而不是文字，找不到它的定义，于是报 NameError（未定义）。若整行还有其他语法问题则可能先报 SyntaxError。总之：要打印的文字必须放在引号里。"
+/>
+
+<FlashCard front="交互模式和运行脚本文件有什么区别？" back="交互模式在命令行逐行执行、立即显示结果，适合试验和验证；脚本文件把代码保存为 .py 文件一次性运行，适合可重复使用的完整程序。" />

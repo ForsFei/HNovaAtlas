@@ -1,0 +1,78 @@
+---
+id: wpf-collection-views-and-virtualization
+title: WPF 列表与性能：集合视图、筛选排序和 UI 虚拟化
+description: 从三千条读数的可运行对照理解源集合、集合视图、ListBox 容器回收、虚拟化失效与绑定诊断。
+tags: [WPF, 集合视图, ListBox, 虚拟化, 性能, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-16"
+order: 50
+prerequisite: [wpf-mvvm, wpf-ui-thread-and-async]
+related: [wpf-learning-path, wpf-commands-and-validation, wpf-dashboard-integration-and-testing]
+---
+
+## 一个列表其实有三层数量
+
+打开一个设备读数列表时，不要只问“有多少条”。至少区分：**源集合中的数据项**、**经筛选排序后视图中的数据项**、**当前为界面生成的列表项容器**。这三层由不同机制管理。`ObservableCollection<T>` 通知集合增删；`ICollectionView` 提供显示顺序、筛选和当前位置；`ListBox`/`ListView` 的面板决定哪些 `ListBoxItem`/`ListViewItem` 需要创建。集合项自身的属性变化仍由前篇的 `INotifyPropertyChanged` 负责，集合视图不能替它发属性通知。[Microsoft Learn：数据绑定概览](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/data/data-binding-overview)
+
+`ItemsControl` 是列表展示的基础控件；需要选择行为时可用 `ListBox`，需要列式呈现时常用 `ListView`。不要因为都继承自 `ItemsControl` 就推断它们有相同的默认虚拟化设置：自定义 `ItemsControl` 往往还需明确选择虚拟化面板和有限的滚动视口。[Microsoft Learn：控件性能](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/optimizing-performance-controls)
+
+运行 `dotnet run --project examples/wpf-list-performance/WpfListPerformance.csproj`。示例一次性在内存中生成 3,000 条确定性读数；输入设备片段、勾选“仅报警”或切换温度排序，再看窗口顶部计数。源项数保持 3,000，视图项数按条件改变；它们不应与当前可视树中的 `ListBoxItem` 数混为一谈。这个程序故意不是分页服务，也没有真实设备数据。
+
+## 在视图上筛选和排序，不改原始顺序
+
+直接把集合绑定到控件时，WPF 实际通过该集合的**默认视图**访问数据。`CollectionViewSource.GetDefaultView(Source)` 取到的是共享默认视图：多个直接绑定同一集合的控件会共享排序、筛选和当前项。若两个区域需要不同条件，应分别创建 `CollectionViewSource`，别在共享默认视图上各改各的。[官方 API 说明](https://learn.microsoft.com/en-us/dotnet/api/system.windows.data.collectionviewsource.getdefaultview)
+
+示例的 `ReadingList` 明确保存 `Source` 和 `View`，在视图上设置 `Filter` 与 `SortDescriptions`：
+
+```csharp filename="ReadingList.cs"
+View = CollectionViewSource.GetDefaultView(Source);
+View.Filter = item => item is Reading reading
+    && (!alertsOnly || reading.IsAlert)
+    && reading.Device.Contains(query, StringComparison.OrdinalIgnoreCase);
+
+using (View.DeferRefresh())
+{
+    View.SortDescriptions.Clear();
+    View.SortDescriptions.Add(new SortDescription(
+        nameof(Reading.Temperature), ListSortDirection.Descending));
+    View.SortDescriptions.Add(new SortDescription(nameof(Reading.Id), ListSortDirection.Ascending));
+}
+```
+
+第二排序键 `Id` 让同温度读数的顺序稳定。`DeferRefresh()` 将两次排序描述修改合为一次视图刷新；它不让任意筛选算法变成常数时间。这里文本变化就重新筛选 3,000 条，便于教学；若真实数据更大、过滤昂贵，需衡量输入防抖、后台检索、分页或服务端查询。把 100 万项都先装进 `ObservableCollection<T>`，再打开 UI 虚拟化，依然要承担数据加载与视图运算成本。
+
+## UI 虚拟化节省的是容器，不是数据
+
+`ListBox` 和 `ListView` 在数据绑定情形下默认启用 UI 虚拟化。列表滚动时，可视区域附近的项才需要对应的 UI 容器；`VirtualizingPanel.VirtualizationMode="Recycling"` 还允许旧容器用于新数据项。它减少的是界面对象及布局工作，**不是数据虚拟化**：本例的 3,000 个 `Reading` 始终在内存里。[Microsoft Learn：控件性能](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/optimizing-performance-controls)
+
+示例让 `ListBox` 位于 `Grid` 的 `*` 行，窗口给它有限视口，并保留 `ScrollViewer.CanContentScroll="True"`。切换“启用 UI 虚拟化”，滚动一段后点“刷新计数”，观察同一筛选条件下 `ListBoxItem` 当前数量的变化。关闭虚拟化可能在 UI 线程创建并布局大量容器，演示时先保持 3,000 条规模，不要在生产窗口盲目对海量数据做开关试验。
+
+```xml filename="MainWindow.xaml"
+<ListBox ItemsSource="{Binding Readings}"
+         ScrollViewer.CanContentScroll="True"
+         VirtualizingPanel.IsVirtualizing="True"
+         VirtualizingPanel.VirtualizationMode="Recycling" />
+```
+
+上段是最小配置示意；可运行示例用 `ReadingsList.ItemsSource = _readings.View` 绑定实际视图，并将 `IsVirtualizing` 绑定到对照开关。不要把这个示意片段误当成可直接粘贴的完整窗口。
+
+官方列出的常见失效条件包括：直接添加 `ListBoxItem` 而不是数据项、混用不同容器类型、将 `CanContentScroll` 设为 `false`、把 `IsVirtualizing` 设为 `false`。改掉虚拟化面板、把列表放在使其获得无限高度的布局中，也可能让有限视口的前提消失；这类布局问题应在具体窗口中观察实际测量结果，不宜只凭 XAML 字面下结论。[官方失效条件与容器回收说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/optimizing-performance-controls)
+
+回收还有状态陷阱：如果展开、勾选等状态只留在容器上，容器复用后可能把旧项的视觉状态带给新项。属于数据项的状态应放在模型或 ViewModel 属性上再绑定，不能只依赖 `ListBoxItem` 暂存。[官方容器状态说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/optimizing-performance-controls)
+
+## 怎么诊断，哪些结论不能直接下
+
+示例遍历当前 `ListBox` 可视树，统计 `ListBoxItem`。这是**一次布局后的容器快照**，可帮助确认开关效果；它不是滚动耗时、内存峰值或吞吐率。缓存、视口大小、主题模板、滚动位置都会影响计数。要比较速度，应在同一机器、相同数据/窗口尺寸/构建模式下，多次记录启动与滚动的耗时、分配和 UI 响应，再使用分析器定位瓶颈；仅凭“看起来顺”或一次容器计数不能宣称性能提升多少倍。
+
+如果列表空白或字段不显示，先确认 `ItemsSource` 是数据/视图而非手工容器，`DataTemplate` 绑定路径拼写正确，绑定源的属性是公开的；查看 Visual Studio 的“输出”窗口或 XAML 绑定失败信息。可在具体绑定上暂时添加 `diag:PresentationTraceSources.TraceLevel="High"` 获得更细的绑定轨迹，诊断后移除，避免大量调试输出。[Microsoft Learn：绑定跟踪](https://learn.microsoft.com/en-us/previous-versions/bb778381%28v%3Dvs.110%29)
+
+运行 `dotnet run --project examples/wpf-list-performance-checks/ListPerformanceChecks.csproj`，会在 STA 线程断言筛选、排序、清空筛选、源顺序未变化。这些断言**不启动窗口**，不能证明虚拟化、实际容器数、滚动流畅度或绑定模板外观；请在 Windows 桌面运行示例做上述观察。
+
+## 面试自测
+
+1. `ObservableCollection<T>` 有 3,000 条、视图筛出 30 条、可视树有 15 个 `ListBoxItem`，这三个数字分别说明什么？
+2. 两个列表直接绑定同一个集合，为什么其中一个列表改默认视图排序后，另一个也可能变化？如何隔离？
+3. UI 虚拟化开启后，为什么首次加载 100 万数据仍可能很慢？数据虚拟化与它的边界在哪里？
+4. `CanContentScroll=false`、手工添加 `ListBoxItem`、回收容器内保存展开状态，各有什么不同风险？
+5. 容器数减少能否直接推出“滚动快了 10 倍”？你会怎样设计可复查的性能测试？

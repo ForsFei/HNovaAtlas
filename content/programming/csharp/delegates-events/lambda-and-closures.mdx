@@ -1,0 +1,80 @@
+---
+id: csharp-lambda-closures
+title: Lambda 与闭包：捕获的是变量，不是当时的值
+description: 用阈值变化和 for 循环预测输出，理解 static Lambda、生命周期与共享状态风险。
+tags: [CSharp, Lambda, 闭包, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-delegates-func-action]
+related: [csharp-events-lifecycle, csharp-lock-shared-state]
+---
+
+## 先预测两次调用
+
+Lambda 是匿名函数的简洁写法；它通常转换为委托，也可在某些 API 中转换为表达式树。若 Lambda 使用外部局部变量，就形成闭包：被捕获变量的生命周期会延长，后续调用读取的是该变量**当时的当前值**，不是创建 Lambda 时复制的一份快照。
+
+```csharp filename="Program.cs"
+int threshold = 70;
+Func<int, bool> isAlarm = value => value >= threshold;
+Console.WriteLine(isAlarm(75)); // True
+
+threshold = 80;
+Console.WriteLine(isAlarm(75)); // False
+
+int fixedThreshold = threshold;
+Func<int, bool> fixedRule = value => value >= fixedThreshold;
+threshold = 90;
+Console.WriteLine(fixedRule(85)); // True
+```
+
+`fixedRule` 也捕获了一个变量，只是那个变量在后续没有被修改；不能说 C# Lambda 自动按值捕获。若想让意图更明确，可用工厂函数把参数绑定在一次调用的局部状态里，并避免之后修改它。
+
+## `for` 循环为何容易输出同一个数字
+
+`for` 的控制变量 `i` 是同一个变量，每个 Lambda 都引用它；循环结束后它为 3。将每轮值复制到循环体局部变量，才会得到 0、1、2：
+
+```csharp filename="Program.cs"
+List<Action> wrong = [];
+List<Action> right = [];
+for (int i = 0; i < 3; i++)
+{
+    wrong.Add(() => Console.Write(i));
+    int copy = i;
+    right.Add(() => Console.Write(copy));
+}
+
+foreach (Action action in wrong) action(); // 333
+Console.WriteLine();
+foreach (Action action in right) action(); // 012
+```
+
+现代 C# 的 `foreach` 迭代变量有不同的作用域规则，不应把上面 `for` 的结果机械套过去；预测输出时先确定究竟捕获了**哪一个变量实例**。在异步回调、事件订阅和并行任务中，这个区别尤其重要。
+
+## 捕获的内存与并发成本
+
+被捕获的对象可能因为委托仍被长期保存而无法回收，例如长寿命事件发布者保存了引用短寿命页面对象的处理器。闭包还可能共享可变变量；若多个线程同时调用并写它，闭包不会自动提供同步。需要时用局部不可变数据、消息传递或明确同步方式。`static` Lambda 可在编译期阻止捕获外部局部变量和 `this`：
+
+```csharp filename="Program.cs"
+Func<int, bool> positive = static value => value > 0;
+Console.WriteLine(positive(3)); // True
+```
+
+`static` 不是“更快”的无条件承诺，而是表达此回调不依赖外围状态的契约。Lambda 很长、需要递归或被多处复用时，用命名方法通常更清楚。
+
+## 委托与表达式树不要混淆
+
+`Func<Reading, bool>` 保存可执行代码；`Expression<Func<Reading, bool>>` 保存可检查的表达式结构，LINQ 数据库提供程序可能据此翻译查询。两者外观看起来都能写 `r => r.Value > 70`，但执行地点和支持的操作不同。给内存集合的委托不能假定会被数据库翻译成 SQL。
+
+## 面试自测与练习
+
+1. `isAlarm(75)` 两次输出为何不同？如果要求规则创建后阈值固定，应怎么改？
+2. 去掉示例中的 `copy`，两个列表的输出会怎样？
+3. 事件订阅中使用捕获 `this` 的匿名 Lambda，发布者长期存活时可能有什么生命周期问题？
+
+验收标准：能指出闭包捕获的变量实例、它的后续修改和委托保存多久，而不是只记“闭包会内存泄漏”。
+
+## 参考
+
+[Microsoft Learn：Lambda 表达式与变量捕获](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/operators/lambda-expressions) · [表达式树](https://learn.microsoft.com/en-us/dotnet/csharp/advanced-topics/expression-trees/)

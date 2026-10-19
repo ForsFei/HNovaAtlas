@@ -1,0 +1,109 @@
+---
+id: csharp-linq-joins-key-semantics
+title: LINQ 连接：Join、GroupJoin、左连接与键比较
+description: 用设备和读数理解内连接、分组连接、缺失键、重复键以及内存查询的比较规则。
+tags: [CSharp, LINQ, 集合, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 22
+prerequisite: [csharp-linq, csharp-collection-selection]
+related: [csharp-query-boundaries, csharp-database-access]
+---
+
+## 先问：哪边的行必须留下？
+
+假设设备目录是左序列，读数是右序列。`pump-A` 有两条读数，`pump-C` 没有读数，另有一条找不到设备的 `missing` 读数。如果需求是「只看有读数的设备」，用内连接 `Join`；如果要「每台设备及它的读数列表」，用 `GroupJoin`；如果要「每台设备至少占一行，每条读数展开一行」，用左连接。连接前先写清楚键、比较规则以及缺失数据如何表示，比记住方法名更重要。
+
+| 运算 | `pump-A` 两条 | `pump-C` 无读数 | 孤立的 `missing` 读数 |
+| --- | --- | --- | --- |
+| `Join` | 两行 | 不出现 | 不出现 |
+| `GroupJoin` | 一个包含两项的组 | 一个空组 | 不出现 |
+| `LeftJoin` | 两行 | 一行，右侧为 `null` | 不出现 |
+
+这里的「左」指调用连接方法的 `devices`，并不是 ID 的字典序。若改成以读数为左序列，保留规则也会跟着改变。重复键会让一个左项对应多个结果；它不是自动去重，也不是把整个左右集合做无条件笛卡尔积。
+
+## 可运行示例：同一批数据的三种视图
+
+以下完整示例在 .NET 10 上运行。`OrdinalIgnoreCase` 是本例对**内存中的设备标识符**约定的比较规则，所以 `PUMP-A` 能匹配 `pump-A`；最后换成 `Ordinal`，即可看到少一条匹配。固定数组和断言避免受本机文化、数据库或网络状态影响。
+
+```csharp filename="Program.cs"
+Device[] devices =
+[
+    new("pump-A", "一号泵"),
+    new("pump-B", "二号泵"),
+    new("pump-C", "备用泵")
+];
+Reading[] readings =
+[
+    new("PUMP-A", 70),
+    new("pump-A", 71),
+    new("pump-B", 68),
+    new("missing", 99)
+];
+StringComparer keys = StringComparer.OrdinalIgnoreCase;
+
+var inner = devices.Join(readings, device => device.Id, reading => reading.DeviceId,
+    (device, reading) => (device.Id, reading.Value), keys).ToArray();
+Check(inner.Select(row => row.Value).SequenceEqual([70, 71, 68]),
+    "Join excludes unmatched keys and keeps both duplicate matches");
+
+var grouped = devices.GroupJoin(readings, device => device.Id, reading => reading.DeviceId,
+    (device, matches) => new { device.Id, Values = matches.Select(x => x.Value).ToArray() },
+    keys).ToArray();
+Check(grouped.Length == 3 && grouped[0].Values.SequenceEqual([70, 71])
+    && grouped[2].Values.Length == 0, "GroupJoin retains the unmatched outer device");
+
+var left = devices.LeftJoin(readings, device => device.Id, reading => reading.DeviceId,
+    (device, reading) => (device.Id, Value: (int?)reading?.Value), keys).ToArray();
+Check(left.Length == 4 && left.Select(row => row.Value).SequenceEqual([70, 71, 68, null]),
+    "LeftJoin flattens matches and uses null for the missing right item");
+
+var portableLeft = devices.GroupJoin(readings, device => device.Id,
+        reading => reading.DeviceId, (device, matches) => new { device, matches }, keys)
+    .SelectMany(group => group.matches.DefaultIfEmpty(),
+        (group, reading) => (group.device.Id, Value: (int?)reading?.Value))
+    .ToArray();
+Check(portableLeft.SequenceEqual(left), "GroupJoin plus DefaultIfEmpty gives the same left rows");
+
+var exact = devices.Join(readings, device => device.Id, reading => reading.DeviceId,
+    (device, reading) => reading.Value, StringComparer.Ordinal).ToArray();
+Check(exact.SequenceEqual([71, 68]), "an ordinal comparer does not match PUMP-A to pump-A");
+
+Console.WriteLine("LINQ 连接、空匹配和键比较断言全部通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public record Device(string Id, string Name);
+public record Reading(string DeviceId, int Value);
+```
+
+在仓库根目录执行 `dotnet run --project examples/csharp-linq-joins/LinqJoinsReview.csproj`。`ToArray()` 在这里固定结果，让断言比较一次枚举的快照；若保留延迟查询并反复枚举，源集合变化或昂贵的查询可能带来不同结果与成本，详见[查询边界](/knowledge/programming/csharp/collections/query-boundaries/)。
+
+## `GroupJoin` 不是“每组至少一个匹配”
+
+`GroupJoin` 对每个左项都会调用结果选择器，因此 `pump-C` 对应的是**空集合**，不是整个设备消失。示例立即把每组转成数组，是为了明确稳定快照；真实代码若只需计数，可以在需要时计算，别无条件物化大量数据。右边没有设备的 `missing` 读数不会凭空生成一个左组；要审查孤立读数，应反向连接或单独做键完整性检查。
+
+从分组连接到传统左连接，关键步骤是 `DefaultIfEmpty()`：空组产生一个默认右项，接着 `SelectMany` 展平。对于引用类型 `Reading`，默认右项是 `null`，所以投影必须处理 `reading?.Value`。`.NET 10` 的 `LeftJoin` 直接表达同一意图；较早目标框架可使用示例里的 `GroupJoin` + `SelectMany`。不要把 `GroupJoin` 的「每个设备一个组」和 `LeftJoin` 的「每个匹配占一行」混为一谈。
+
+## 比较器、空键与数据库边界
+
+连接依据由键选择器和比较器共同决定。这里显式用 `StringComparer.OrdinalIgnoreCase` 比较机器标识；这是应用协议选择，不是对所有人类语言文本的通用排序规则。先按数据契约决定是否允许大小写差异、前后空白或规范化，再在数据进入系统的边界统一处理。不要指望连接方法自动清洗键。`null` 键和重复键还需要明确业务政策：本例只演示重复键，生产数据应对缺失 ID、唯一性和孤立记录分别验证。
+
+示例是 `IEnumerable<T>` 上的 LINQ to Objects。`IQueryable<T>` 的连接可由提供程序翻译成 SQL，但支持的重载、比较器、空值和大小写语义受提供程序与数据库排序规则影响；不能把这里的 `StringComparer` 直接套进 ORM 查询并断言产生同样的 SQL。先查看实际生成的查询和执行计划，再讨论性能。一般的 `IEnumerable` / `IQueryable` 区别见[查询边界](/knowledge/programming/csharp/collections/query-boundaries/)，键比较器的基础见[集合选型与相等性](/knowledge/programming/csharp/collections/collection-selection-and-equality/)。
+
+## 自测
+
+1. 若把 `pump-C` 的读数加入右序列，三个连接的输出行数分别怎样变化？先预测，再修改示例断言。
+2. 若设备目录也有两个相同 ID，每个对应两条读数，`Join` 会输出几行？为什么不能把它当去重？
+3. 产品要求列出所有孤立读数，应选择哪边作为左序列，或如何做反连接？
+4. 把 `OrdinalIgnoreCase` 换成 `Ordinal` 后哪条读数消失？这能否证明数据库的大小写比较规则？
+
+验收标准：面对真实需求，能先说清保留哪侧数据、重复键的行数、缺失值的形态，再选择运算符。
+
+## 参考
+
+[Microsoft Learn：Join](https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.join) · [GroupJoin](https://learn.microsoft.com/en-us/dotnet/api/system.linq.enumerable.groupjoin) · [分组连接与左连接](https://learn.microsoft.com/en-us/dotnet/csharp/linq/perform-grouped-joins)

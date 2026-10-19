@@ -1,0 +1,62 @@
+---
+id: csharp-threads-threadpool-tasks
+title: Thread、线程池与 Task：谁在执行，谁在等待
+description: 从直接创建线程到 Task.Run，区分 CPU 并行、异步 I/O 与任务生命周期。
+tags: [CSharp, 多线程, Thread, Task, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 5
+prerequisite: [csharp-control-flow-methods]
+related: [csharp-async-await, csharp-lock-shared-state]
+---
+
+## 三层概念不要混成一层
+
+`Thread` 是一条执行线程；线程池维护可复用的工作线程；`Task` 表示一个可等待、可失败、可取消的操作。`Task.Run` 通常把委托排到线程池执行，而原生异步 I/O 的 `Task` 可以在等待设备或网络时不占用一条工作线程。因此“一个 Task = 一个新线程”和“写了 async 就并行”都不成立。
+
+| 选择 | 典型用途 | 代价与注意 |
+| --- | --- | --- |
+| `new Thread(...)` | 需要专用线程的少数长驻或特殊线程场景 | 自己管理创建、退出与异常；不要每个请求建一个 |
+| 线程池 / `Task.Run` | 有界的 CPU 工作、避免阻塞 UI 线程 | 占用池线程直至同步计算结束；不能提高单项计算本身速度 |
+| 原生异步 API + `await` | 文件、数据库、网络等等待型 I/O | 不等于自动并行；应传递取消和处理失败 |
+
+下面的代码可直接放入控制台 `Program.cs`。它比较“显式线程”和“线程池任务”的生命周期，不依赖输出的线程 ID 数值：
+
+```csharp filename="Program.cs"
+Thread dedicated = new(() =>
+    Console.WriteLine($"Thread: {Environment.CurrentManagedThreadId}"));
+dedicated.Start();
+dedicated.Join(); // 仅为控制台演示，阻塞当前线程直到结束
+
+int answer = await Task.Run(() =>
+{
+    Console.WriteLine($"Task.Run: {Environment.CurrentManagedThreadId}");
+    return 6 * 7;
+});
+Console.WriteLine(answer); // 42
+```
+
+`Join` 与 `Task.Wait()` 都会阻塞当前线程；在正常异步调用链中优先 `await`。上例用 `Join` 只是为了展示专用线程如何结束。不要根据两次打印的线程 ID 推断线程总数或固定调度顺序；这些是运行时选择。
+
+## CPU 工作与 I/O 等待
+
+若要计算 1000 万条数据的哈希，CPU 在持续执行；在 UI 事件处理中可以用 `Task.Run` 把该同步计算移离 UI 线程。若已有 `ReadAsync`、`GetAsync` 等原生异步 API，把它包进 `Task.Run` 一般只是多占线程池资源，并不会让远端响应更快。服务器端还要考虑负载：每个请求都把大量 CPU 工作丢进线程池，可能造成竞争和线程池饥饿。
+
+`Task.WhenAll` 表达“这些操作都完成后继续”，并不自动限制并发数量；`Parallel.ForEach` 面向可并行的同步 CPU 工作，`Parallel.ForEachAsync` 支持异步主体且可设置并行度。选之前先看工作是 CPU 计算还是等待 I/O，以及是否真的允许同时访问外部资源。
+
+## 生命周期和异常归属
+
+调用 `Task.Run` 后应保存并等待返回的 `Task`，否则无法可靠获知失败与完成。专用 `Thread` 上的未处理异常也不是一个可由创建处随意 `try/catch` 捕获的“普通返回值”。避免为工作线程使用 `Thread.Abort`；让工作协作观察取消信号，并定义清理/退出顺序。`Task` 不是线程的所有权句柄：一个异步方法在不同阶段可能由不同线程继续执行，甚至等待期间不占线程。
+
+## 面试自测与练习
+
+1. `await Task.Delay(1000)` 会独占一个线程睡眠吗？为什么 `Thread.Sleep(1000)` 不同？
+2. 两个 `Task.Run` 必然同时运行在两条不同线程吗？什么时候 `WhenAll` 只保证等待，不保证并行？
+3. 把上例的 `Join` 去掉，主线程与工作线程的输出顺序有何不确定性？普通前台线程通常仍会让进程等待它结束；为什么不能用 `Sleep` 猜测完成时机？
+
+验收标准：看到一段代码，能分别指出操作、线程、等待方式、取消和异常的责任方。
+
+## 参考
+
+[Microsoft Learn：托管线程池](https://learn.microsoft.com/en-us/dotnet/standard/threading/the-managed-thread-pool) · [异步场景中的 CPU 与 I/O](https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/async-scenarios)

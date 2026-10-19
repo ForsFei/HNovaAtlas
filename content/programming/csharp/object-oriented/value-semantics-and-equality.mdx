@@ -1,0 +1,80 @@
+---
+id: csharp-value-equality
+title: class、struct、record：复制、相等性与装箱
+description: 用可运行示例拆开引用/值类型和引用/值相等两个维度，避免把 record、struct 与栈混为一谈。
+tags: [CSharp, OOP, record, 相等性, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 40
+prerequisite: [csharp-data-types-conversions, csharp-classes-interfaces]
+related: [csharp-user-defined-operators-conversions, csharp-inheritance-polymorphism, csharp-collections-generics, csharp-readonly-struct-copies]
+---
+
+## 两个维度，不是一条线
+
+`class` 与 `record class` 是引用类型：变量赋值复制引用，可能指向同一对象。`struct` 与 `record struct` 是值类型：赋值复制值。但**赋值如何复制**和**两个实例怎样比较相等**是两回事。普通类默认按身份比较；记录通常生成基于成员的相等性。普通结构体通过 `Equals` 具备值相等，但不会自动得到可用的 `==` 运算符；`record struct` 则会生成它。
+
+运行下面完整示例：
+
+```csharp filename="Program.cs"
+var a = new Sensor("A");
+var b = new Sensor("A");
+Console.WriteLine(a == b); // False：不同对象
+
+var r1 = new Reading("A", 20);
+var r2 = new Reading("A", 20);
+Console.WriteLine(r1 == r2);                 // True：成员值相同
+Console.WriteLine(ReferenceEquals(r1, r2)); // False：并非同一对象
+
+var p1 = new Point(1, 2);
+var p2 = p1;
+p2.X = 9;
+Console.WriteLine(p1.X); // 1：赋值复制值
+
+var c1 = new Coordinate(1, 2);
+var c2 = new Coordinate(1, 2);
+Console.WriteLine(c1 == c2); // True：record struct 生成 ==
+
+public sealed class Sensor(string id)
+{
+    public string Id { get; } = id;
+}
+
+public record Reading(string DeviceId, int Value);
+public struct Point { public int X; public int Y; public Point(int x, int y) { X = x; Y = y; } }
+public record struct Coordinate(int X, int Y);
+```
+
+注意 `string` 虽是引用类型，`==` 却按文本内容比较；不能把“引用类型”直接推导成“`==` 一定比较地址”。也不要把“值类型”直接说成“一定在栈上”：具体存储位置取决于它出现的位置和运行时实现。装箱是把值类型值转换成 `object` 等引用视图时产生包装对象，可能带来分配和复制成本；泛型集合通常可避免把元素反复装箱。
+
+## record 的浅复制陷阱
+
+`with` 创建新记录，但对引用类型成员通常复制的是引用，不是递归克隆。记录生成的相等性也沿用成员自身的相等规则；两个不同的 `List<T>` 即使元素相同，默认仍不因元素相同而相等。
+
+```csharp filename="Program.cs"
+var original = new Batch(new List<int> { 1 });
+var copy = original with { };
+copy.Values.Add(2);
+Console.WriteLine(string.Join(",", original.Values)); // 1,2
+
+public record Batch(List<int> Values);
+```
+
+因此“record = 深度不可变”是错误的。若业务要求快照，应在边界复制可变集合，并限制可变引用的外泄。若自定义类的相等语义，应让 `Equals` 与 `GetHashCode` 一致；作为字典键时尤其不能在入表后改变参与哈希的内容。
+
+## 面试自测与练习
+
+1. `record class` 是值类型吗？`record struct` 能继承另一个结构体吗？
+2. 两个内容相同的普通 `class` 实例、两个 `record` 实例，`==` 各是什么？为什么 `ReferenceEquals` 又可能不同？
+3. 把 `Point` 放入 `List<Point>`，修改取出的局部副本，列表里的原值会变化吗？实际运行验证。
+
+验收标准：分别说清赋值、相等、内存/装箱三个维度，而不是用“在栈上或堆上”代替语言语义。
+
+## 参考
+
+[延伸：自定义运算符与转换契约](/knowledge/programming/csharp/fundamentals/user-defined-operators-and-conversions/)用手写结构体检验 `==`、`Equals`、哈希及构造不变量，和这里的 `record struct` 自动生成行为对照。
+
+[延伸：record 继承与 with](/knowledge/programming/csharp/object-oriented/record-inheritance-and-with/)继续验证派生记录的运行时类型相等、基类视图下的复制，以及数组成员的浅复制边界。
+
+[Microsoft Learn：记录类型](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/records) · [相等性比较](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/expressions/equality) · [选择类型](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/tutorials/choosing-types)

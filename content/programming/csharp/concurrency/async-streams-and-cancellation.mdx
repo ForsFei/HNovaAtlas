@@ -1,0 +1,117 @@
+---
+id: csharp-async-streams-cancellation
+title: 异步流：IAsyncEnumerable、取消与提前退出
+description: 从同步 yield 和 Task 出发，逐项生成异步数据，验证 WithCancellation 传递、await foreach 退出和资源清理。
+tags: [CSharp, 异步流, IAsyncEnumerable, 取消, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 15
+prerequisite: [csharp-yield-iterators, csharp-async-await]
+related: [csharp-task-vs-valuetask, csharp-concurrent-collections, csharp-channel-failure-cancellation]
+---
+
+## 一项结果、整批结果，还是逐项等待？
+
+`Task<Reading>` 表示**最终一个结果**；`Task<List<Reading>>` 表示**整批完成后给出一个列表**；`IAsyncEnumerable<Reading>` 则允许消费者逐项请求，取得下一项时可能异步等待。它适合分页 API、异步读取大文件或设备持续读数：不必先把全部结果存进列表。但它本身不是并行处理器，也不保证上游会预取数据。是否缓冲、限速或背压，要看具体数据源；需要明确生产者/消费者解耦时，另读 [Channel](/knowledge/programming/csharp/concurrency/concurrent-collections-and-channels/)。
+
+这也连接了两篇基础文章：[同步 `yield`](/knowledge/programming/csharp/fundamentals/yield-and-iterators/)解释“请求下一项才执行”，[`async / await`](/knowledge/programming/csharp/concurrency/async-await/)解释“等待时不必阻塞当前线程”。异步迭代器把两者结合：`async IAsyncEnumerable<T>` 方法里可以 `await`，也可以 `yield return`；调用方用 `await foreach` 消费。
+
+## 可运行的生命周期实验
+
+把下面完整代码放入 `Program.cs`。`TrackedLease` 只是教学用资源，记录打开和关闭；`Task.Yield()` 只制造可观察的异步暂停点，**不模拟网络速度，也不证明线程切换**。所有结论由顺序断言验证，不依赖计时或外部服务。
+
+```csharp filename="Program.cs"
+using System.Runtime.CompilerServices;
+
+var earlyTrace = new List<string>();
+IAsyncEnumerable<int> pending = ReadAsync(earlyTrace);
+Check(earlyTrace.Count == 0, "body starts on enumeration");
+
+await foreach (int value in pending)
+{
+    Check(value == 0, "first item");
+    break;
+}
+Check(earlyTrace.SequenceEqual(["open", "item:0", "close"]), "break disposes enumerator");
+
+var cancelTrace = new List<string>();
+using var source = new CancellationTokenSource();
+int received = 0;
+try
+{
+    await foreach (int value in ReadAsync(cancelTrace).WithCancellation(source.Token))
+    {
+        Check(value == 0, "cancellation after first item");
+        received++;
+        source.Cancel();
+    }
+    throw new Exception("expected cancellation");
+}
+catch (OperationCanceledException) when (source.IsCancellationRequested)
+{
+    Check(received == 1, "one item delivered");
+}
+Check(cancelTrace.SequenceEqual(["open", "item:0", "close"]), "cancellation disposes enumerator");
+
+Console.WriteLine("异步流延迟、提前退出与取消断言全部通过");
+
+static async IAsyncEnumerable<int> ReadAsync(
+    List<string> trace, [EnumeratorCancellation] CancellationToken cancellationToken = default)
+{
+    await using var lease = new TrackedLease(trace);
+    for (int value = 0; value < 3; value++)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await Task.Yield(); // 只制造可观察的异步暂停点，不代表真实 I/O
+        cancellationToken.ThrowIfCancellationRequested();
+        trace.Add($"item:{value}");
+        yield return value;
+    }
+}
+
+static void Check(bool condition, string name)
+{
+    if (!condition) throw new Exception($"断言失败：{name}");
+}
+
+sealed class TrackedLease : IAsyncDisposable
+{
+    private readonly List<string> _trace;
+
+    public TrackedLease(List<string> trace)
+    {
+        _trace = trace;
+        _trace.Add("open");
+    }
+
+    public ValueTask DisposeAsync()
+    {
+        _trace.Add("close");
+        return ValueTask.CompletedTask;
+    }
+}
+```
+
+第一条断言说明：取得 `IAsyncEnumerable<int>` 时，迭代器主体尚未运行；第一次请求下一项才进入主体。消费者在收到第一项后 `break`，`await foreach` 会释放异步枚举器，迭代器作用域里的 `await using` 因而调用 `DisposeAsync`。这不等于“取得每一项都关闭资源”：资源通常跨多次枚举步骤持有，直到完成或退出。
+
+## 取消令牌必须抵达迭代器
+
+第二次枚举使用 `.WithCancellation(source.Token)`：它把令牌交给枚举器；参数上的 `[EnumeratorCancellation]` 告诉编译器把枚举器收到的令牌传入迭代器主体。例子在第一项后发出取消，下一次请求时显式 `ThrowIfCancellationRequested()`，因此只收到一项，随后抛 `OperationCanceledException` 并清理资源。
+
+取消是协作，不是强制中断。真实异步 I/O 要把令牌继续传给读取、请求等支持取消的 API；只在循环顶部检查一次，可能无法及时结束正在等待的操作。调用方也应在适当边界处理取消，不能把它静默当成“正常读取到文件末尾”。仅调用 `WithCancellation` 不代表任何不检查令牌的自定义数据源都会自动停止。
+
+异常往往在 `await foreach` 请求下一项时才出现，而不是在取得流对象时。`break`、异常或取消后的清理依赖枚举器释放；若手动调用 `GetAsyncEnumerator`，就要自己用 `await using` 或 `try/finally` 管理其生命周期。多次枚举同一个异步迭代器会重新执行主体，不能假设结果已缓存；对只能读取一次的网络响应或流，应在 API 契约中明确单次消费。
+
+## 面试自测与练习
+
+1. 例子为什么在创建 `pending` 后还没有 `"open"`？把 `break` 去掉，预测完整跟踪。
+2. 删除 `[EnumeratorCancellation]`，编译器会给出什么提示？`WithCancellation` 的令牌是否仍能按原意抵达方法主体？
+3. 把 `source.Cancel()` 改成第二项后执行；解释收到几项、何时抛异常、资源何时关闭。
+4. 若某分页接口每页一次 HTTP 请求，何时用 `Task<List<T>>`，何时用 `IAsyncEnumerable<T>`？出错页前已经交给调用方的项应如何处理？
+
+验收标准：能说清“创建序列 → 请求下一项 → 取消/完成 → 释放”的顺序，并把取消传至实际 I/O。仓库示例可用 `dotnet run --project examples/csharp-async-streams/AsyncStreamsReview.csproj` 运行；正文完整代码块由 `npm run test:csharp-articles` 单独编译。
+
+## 参考
+
+[Microsoft Learn：生成与消费异步流](https://learn.microsoft.com/en-us/dotnet/csharp/asynchronous-programming/generate-consume-asynchronous-stream) · [`await foreach` 语言参考](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/statements/iteration-statements) · [`EnumeratorCancellation` 属性](https://learn.microsoft.com/en-us/dotnet/api/system.runtime.compilerservices.enumeratorcancellationattribute)

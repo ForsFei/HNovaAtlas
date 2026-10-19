@@ -1,0 +1,87 @@
+---
+id: csharp-exceptions-disposal
+title: 异常、输入失败与资源释放
+description: 区分可预期的无效输入和真正异常，正确使用 try/catch、using 与异步释放。
+tags: [CSharp, 异常, IDisposable]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-linq]
+related: [csharp-async-await, csharp-managed-memory-disposal, csharp-exception-boundaries-filters]
+---
+
+## 不是所有失败都该抛异常
+
+用户把 `abc` 当温度输入，是可预期的无效输入，通常用 `TryParse` 返回失败并给出提示。文件不存在、权限不足、网络中断则可能由底层 API 抛异常；调用方应在能处理的边界捕获。不要用一个空的 `catch` 把所有问题吞掉，否则程序表面成功，数据却丢失。
+
+## 在合适边界处理异常
+
+下面完整示例读取用户指定的文本文件并统计有效行。每行预期是一个使用英文小数点的读数。文件级故障由外层捕获；无效行是业务数据问题，记录行号后继续。例子为入门展示，实际日志与错误呈现应符合应用环境。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+Console.Write("文件路径：");
+string? path = Console.ReadLine();
+if (string.IsNullOrWhiteSpace(path))
+{
+    Console.WriteLine("未输入路径");
+    return;
+}
+
+try
+{
+    int lineNumber = 0;
+    double sum = 0;
+    int count = 0;
+    foreach (string line in File.ReadLines(path))
+    {
+        lineNumber++;
+        if (!double.TryParse(line, NumberStyles.Float,
+                CultureInfo.InvariantCulture, out double value))
+        {
+            Console.WriteLine($"第 {lineNumber} 行无效：{line}");
+            continue;
+        }
+        sum += value;
+        count++;
+    }
+    Console.WriteLine(count == 0 ? "没有有效读数" : $"均值：{sum / count:F1}");
+}
+catch (IOException ex)
+{
+    Console.Error.WriteLine($"读取失败：{ex.Message}");
+}
+catch (UnauthorizedAccessException ex)
+{
+    Console.Error.WriteLine($"无权读取：{ex.Message}");
+}
+```
+
+只捕获你能合理响应的异常类型。若需要重新抛出当前异常，写 `throw;`，不要写 `throw ex;`，后者会改变堆栈信息。`finally` 无论正常或异常离开 `try` 都会执行，适合清理，但对实现了 `IDisposable` 的对象，更直接的做法是 `using`。
+
+## `using` 管理资源的生命周期
+
+文件流、网络流等会占用外部资源。`using` 保证离开作用域时调用 `Dispose`，即使中途抛异常也会释放；不是等待垃圾回收碰巧执行。下面的例子把整个文件写入当前目录，每次运行会覆盖同名文件，所以请在练习目录使用。
+
+```csharp filename="Program.cs"
+using StreamWriter writer = new("readings.txt");
+writer.WriteLine("72.5");
+writer.WriteLine("68.0");
+// 作用域结束时 writer.Dispose()；不要在这之后继续使用 writer
+```
+
+对于实现 `IAsyncDisposable` 的资源，异步方法里可用 `await using`，以异步方式完成释放。不是任何对象都应该 `using`：普通内存对象无需自行发明 `Dispose`；通常也不应在每次请求后释放由应用共享管理的 `HttpClient`。资源归属要明确：谁创建、谁负责释放，或由容器/调用方约定。
+
+## 动手练习
+
+1. 创建一个三行文本文件：`72.5`、`bad`、`68.1`。程序应报告第 2 行无效，均值为 70.3（显示一位小数）。
+2. 传入不存在的路径，确认错误信息进入标准错误输出，程序不出现未处理异常。
+3. 写一个 `TryReadTemperature(string? input, out double value)`，用返回值表达解析成功与否，不用异常处理正常的无效输入。
+
+验收标准：能说明「无效行」与「文件无法读取」为何采用不同路径，以及 `using` 的释放时机。
+
+## 参考
+
+[Microsoft Learn：异常处理](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/exceptions/) · [using 语句](https://learn.microsoft.com/dotnet/csharp/language-reference/statements/using) · [IDisposable](https://learn.microsoft.com/en-us/dotnet/standard/garbage-collection/using-objects)

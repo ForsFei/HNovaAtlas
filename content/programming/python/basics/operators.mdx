@@ -1,0 +1,111 @@
+---
+id: python-operators
+title: 运算符与表达式
+description: 学习算术、比较、逻辑三种运算符，理解优先级与简洁写法。
+tags: [Python, 运算符]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 30
+prerequisite: [python-variables-types]
+related: [python-conditionals, python-strings]
+---
+
+## 算术运算符
+
+```python filename="arithmetic.py"
+print(10 + 3)    # 13   加
+print(10 - 3)    # 7    减
+print(10 * 3)    # 30   乘
+print(10 / 3)    # 3.3333333333333335  除（结果一定是小数）
+print(10 // 3)   # 3    整除（舍去小数部分）
+print(10 % 3)    # 1    取余（10 除以 3 余 1）
+print(10 ** 3)   # 1000 幂（10 的 3 次方）
+```
+
+两个容易忽略的要点：
+
+- `/` 的结果**永远是 float**，`10 / 2` 得到 `5.0` 而不是 `5`。
+- `%` 取余非常实用：`n % 2 == 0` 判断偶数、`n % 10` 取个位数。
+
+## 比较运算符
+
+比较的结果是布尔值 `True` / `False`：
+
+```python filename="comparison.py"
+print(10 > 3)     # True
+print(10 <= 3)    # False
+print(10 == 10)   # True   判断相等用两个等号！
+print(10 != 3)    # True   不等于
+```
+
+<Callout type="danger" title="= 和 == 的区别">
+
+`=` 是赋值：把右边的值存进左边的变量。
+`==` 是判断：两边是否相等，结果是 True 或 False。
+初学者最常见的笔误就是在判断相等时写成一个等号。
+
+</Callout>
+
+比较还能连着写，这是 Python 特有的简洁写法：
+
+```python filename="chained.py"
+age = 15
+print(13 <= age < 18)   # True，等价于 age >= 13 and age < 18
+```
+
+## 逻辑运算符
+
+`and`、`or`、`not` 把多个条件组合起来：
+
+```python filename="logic.py"
+age = 15
+has_ticket = True
+
+print(age >= 13 and has_ticket)   # True：两个都成立
+print(age < 13 or has_ticket)     # True：只要有一个成立
+print(not has_ticket)             # False：取反
+```
+
+| 表达式 | 结果 |
+|--------|------|
+| `A and B` | A 和 B 都为 True 才是 True |
+| `A or B` | 至少一个为 True 就是 True |
+| `not A` | True 变 False，False 变 True |
+
+## 简洁写法：复合赋值
+
+`变量 自己运算 再存回去` 这个高频动作有简写形式：
+
+```python filename="augmented.py"
+count = 10
+count += 1    # 等价于 count = count + 1
+count -= 3    # 等价于 count = count - 3
+count *= 2    # 等价于 count = count * 2
+print(count)  # 16
+```
+
+## 优先级
+
+和数学一样，运算符有先后顺序：`**` 最高，其次 `*` `/` `//` `%`，再 `+` `-`，比较运算符更低，`not` → `and` → `or` 最低。拿不准就加括号——括号永远最优先，也让读代码的人一目了然：
+
+```python filename="precedence.py"
+print(2 + 3 * 4)        # 14，先乘后加
+print((2 + 3) * 4)      # 20，括号改变顺序
+print(5 > 3 and 2 < 1)  # False，先算比较，再做 and
+```
+
+<FlashCard front="10 % 3 的结果和用途？" back="结果是 1（10 除以 3 的余数）。取余常用于判断整除（如 n % 2 == 0 判断偶数）、取个位数（n % 10）等场景。" />
+
+## 动手试一试
+
+1. 一个三位数 `n = 789`，用整除和取余分别取出它的百位、十位和个位。
+2. 判断 `2026` 能否被 4 整除，输出布尔值。
+3. 不运行程序，先猜 `2 ** 3 ** 2` 的结果，再验证（提示：幂运算是从右往左算的）。
+
+<Quiz
+  question="print(17 // 5, 17 % 5) 输出什么？"
+  options={["3.4 2", "3 2", "3 2.0", "4 2"]}
+  answer={1}
+  explanation="17 // 5 是整除，舍去小数得 3；17 % 5 是余数，17 = 5×3 + 2，余 2。所以输出「3 2」。"
+/>

@@ -1,0 +1,65 @@
+---
+id: csharp-query-boundaries
+title: LINQ 查询边界：延迟、物化、IEnumerable 与 IQueryable
+description: 区分内存枚举与远端查询表达式，理解混合查询、分页、重复枚举和副作用。
+tags: [CSharp, LINQ, IQueryable, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 25
+prerequisite: [csharp-linq, csharp-yield-iterators]
+related: [csharp-linq-joins-key-semantics, csharp-collection-selection, csharp-database-access]
+---
+
+## “查询”并不总在同一地方执行
+
+对 `List<T>` 调用 LINQ，典型的是 LINQ to Objects：代码在进程内逐项枚举。`IQueryable<T>` 还携带表达式树与查询提供程序，提供程序可能把支持的表达式翻译成 SQL 等远端操作。`IQueryable` 不等于“任何 C# 代码都能在数据库运行”；能否翻译、何时发请求、分页在哪执行，取决于具体提供程序。
+
+先用纯内存示例观察物化边界，以下可直接运行：
+
+```csharp filename="Program.cs"
+List<int> values = [1, 2, 3];
+IEnumerable<int> query = values.Where(x => x > 1);
+int[] snapshot = query.ToArray();
+
+values.Add(4);
+Console.WriteLine(string.Join(",", query));    // 2,3,4
+Console.WriteLine(string.Join(",", snapshot)); // 2,3
+```
+
+`Where` 此时只描述筛选；`ToArray` 枚举一次并保存。再次枚举 `query` 会读取现有列表内容。如果数据源是数据库，重复枚举可能重复查询；如果是网络或文件，也可能重新访问外部资源。要在“需要稳定结果”之处物化，而非每一步都 `ToList()`。
+
+## 一些操作必须看完整序列
+
+`Where` 和 `Select` 往往可以逐项产生结果；排序、分组等操作通常需要先读取更多甚至全部输入，才能输出正确结果。`Take(10)` 也不是万能的限内存保险：若上游先 `OrderBy`，排序仍可能需要处理全部输入。对超大数据集，先确定过滤和分页是在数据库、文件流还是内存中发生，再评估成本。
+
+不要把带副作用的动作藏在查询选择器中。延迟执行意味着副作用可能执行零次、一次或多次，而且枚举顺序可能因操作符改变。日志、写文件、修改外部集合这类动作通常放在明确的 `foreach` 中更好理解。
+
+## `AsEnumerable` 与 `ToList` 不是同义词
+
+对可查询提供程序，`AsEnumerable()` 将后续调用改用 `Enumerable` 运算符，但它本身不等于立刻把所有数据搬到内存；后续枚举仍会拉取数据。`ToList()` 则立即枚举并保存。把 `AsEnumerable()` 放在过滤/分页之前，可能让后面的工作改在客户端逐行处理。下面是**概念示意**，需替换为真实 ORM 数据源，不能当作独立控制台示例运行：
+
+```csharp
+// db.Readings 是某个 ORM 提供的 IQueryable<Reading>
+var rows = db.Readings
+    .Where(r => r.Value >= 70)
+    .OrderBy(r => r.Id)
+    .Take(20)
+    .ToList(); // 在这里执行；实际翻译和性能由提供程序决定
+```
+
+这里不能从 C# 语法单独证明 SQL 一定带 `LIMIT` 或 `TOP`，应检查所用提供程序生成的 SQL 与数据库执行计划。ADO.NET 的 `DbDataReader` 是另一种前向流式读取方式，不等同于上述 ORM 查询；下一篇数据库文章会分别介绍。
+
+## 面试自测与练习
+
+1. 对上面的 `query` 再调用两次 `Count()`，是否等同于读缓存？用带计数的 `Where` 谓词验证。
+2. `Where(...).Take(10)` 与 `OrderBy(...).Take(10)` 对输入的读取量为何可能不同？
+3. 为什么 `IEnumerable<T>` 和 `IQueryable<T>` 的方法链外观相似，却不能断言执行位置相同？
+
+验收标准：讨论性能时先说出数据源、提供程序、执行时刻和物化点，再谈“LINQ 快不快”。
+
+## 参考
+
+[回看：LINQ 连接与键语义](/knowledge/programming/csharp/collections/linq-joins-and-key-semantics/)提供纯内存的 `Join` / `GroupJoin` / `LeftJoin` 反例；这里的查询提供程序边界同样适用于连接。
+
+[Microsoft Learn：LINQ 查询执行](https://learn.microsoft.com/en-us/dotnet/csharp/linq/get-started/introduction-to-linq-queries) · [IQueryable 接口](https://learn.microsoft.com/en-us/dotnet/api/system.linq.iqueryable-1)

@@ -1,0 +1,92 @@
+---
+id: csharp-concurrent-collections
+title: 并发集合与 Channel：安全更新和生产者背压
+description: 理解 ConcurrentDictionary、ConcurrentQueue 与有界 Channel 的用途及复合操作边界。
+tags: [CSharp, 并发集合, Channel, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-lock-shared-state, csharp-collections-generics]
+related: [csharp-channel-failure-cancellation, csharp-cancellation-throttling, csharp-async-await]
+---
+
+## 线程安全集合解决哪一层
+
+普通 `Dictionary<TKey,TValue>`、`List<T>` 不适合多个执行者无同步地同时修改。`System.Collections.Concurrent` 提供 `ConcurrentDictionary`、`ConcurrentQueue`、`ConcurrentStack` 等，保障集合提供的并发操作。但“集合内部操作线程安全”不等于“跨多个操作的业务流程自动原子”，也不让存放在集合里的可变对象自动线程安全。
+
+下面例子用 `AddOrUpdate` 统计同一设备的写入次数，可直接放在 `Program.cs`：
+
+```csharp filename="Program.cs"
+using System.Collections.Concurrent;
+
+var counts = new ConcurrentDictionary<string, int>(StringComparer.Ordinal);
+Task[] workers = Enumerable.Range(0, 4)
+    .Select(_ => Task.Run(() =>
+    {
+        for (int i = 0; i < 5_000; i++)
+            counts.AddOrUpdate("pump-A", 1, (_, old) => old + 1);
+    }))
+    .ToArray();
+
+await Task.WhenAll(workers);
+Console.WriteLine(counts["pump-A"]); // 20000
+```
+
+注意 `AddOrUpdate` 的更新委托可能被调用**多于实际成功更新次数**；运行时可能因竞争而重试。它应是无副作用的纯计算，不要在里面扣款、发邮件或追加日志。`GetOrAdd` 的工厂也可能被多次调用，最终只有一个值成为对应键的值。若要对一组相关记录做不可分割的业务变更，还需要更高层的锁或事务。
+
+## 队列与“消费一次”
+
+`ConcurrentQueue<T>.TryDequeue` 可让多个消费者竞争取走元素，适合进程内简易待办。它不提供持久化、跨进程交付、失败重试或“处理成功才确认”的完整消息语义。若消费者取出后崩溃，元素不会自动回来。需要可靠消息时，应选有持久化和确认机制的消息系统，而不是把进程内队列称作可靠队列。
+
+## 有界 Channel 管理生产速度
+
+`Channel<T>` 为生产者/消费者提供异步读写。无界通道可能在生产远快于消费时不断占内存；有界通道可在满时让 `WriteAsync` 等待，形成背压。下面可独立运行，容量是 2，消费者逐项处理：
+
+```csharp filename="Program.cs"
+using System.Threading.Channels;
+
+Channel<int> channel = Channel.CreateBounded<int>(new BoundedChannelOptions(2)
+{
+    FullMode = BoundedChannelFullMode.Wait
+});
+
+Task producer = ProduceAsync();
+await foreach (int item in channel.Reader.ReadAllAsync())
+{
+    Console.WriteLine($"处理 {item}");
+    await Task.Delay(30);
+}
+await producer;
+
+async Task ProduceAsync()
+{
+    try
+    {
+        for (int i = 1; i <= 5; i++)
+            await channel.Writer.WriteAsync(i);
+        channel.Writer.TryComplete();
+    }
+    catch (Exception ex)
+    {
+        channel.Writer.TryComplete(ex);
+        throw;
+    }
+}
+```
+
+写端完成后，读端才能自然结束；否则 `ReadAllAsync` 可能一直等。这个例子没有使用 `Task.Run`：异步写端在通道满时等待，读端继续推进即可。真实程序应传入取消令牌并在失败时决定如何关闭通道和处理未消费项。有界 Channel 仍在内存中，不提供数据库事务或断电恢复。
+
+进阶案例见[异步管线故障与取消](/knowledge/programming/csharp/concurrency/channel-failure-and-cancellation/)：它分别注入生产者故障和消费者取消，验证两端的结束协议。
+
+## 面试自测与练习
+
+1. `ConcurrentDictionary` 中的值若是 `List<int>`，多线程直接对同一个列表 `Add` 安全吗？
+2. 为什么 `GetOrAdd(key, _ => ChargeCustomer())` 即使只存入一项也不安全？
+3. 将 Channel 的 `FullMode` 改成 `DropOldest`，数据语义发生什么变化？何种业务绝不能这样丢数据？
+
+验收标准：能区分单次集合操作、跨操作业务事务、异步背压与持久化交付。
+
+## 参考
+
+[Microsoft Learn：线程安全集合](https://learn.microsoft.com/en-us/dotnet/standard/collections/thread-safe/) · [ConcurrentDictionary 更新边界](https://learn.microsoft.com/en-us/dotnet/standard/collections/thread-safe/how-to-add-and-remove-items) · [Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)

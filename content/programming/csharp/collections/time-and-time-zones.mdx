@@ -1,0 +1,100 @@
+---
+id: csharp-time-and-time-zones
+title: 时间点、偏移与时区：DateTimeOffset 和夏令时边界
+description: 区分时间点、本地钟面时间与时区规则，用固定时区复现无效和重复时间，并设计可往返的存储契约。
+tags: [CSharp, 日期时间, 时区, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 35
+prerequisite: [csharp-json-contracts, csharp-data-types-conversions]
+related: [csharp-xml-processing, csharp-database-access]
+---
+
+## 先问：这段数据表达什么？
+
+设备在 `2025-01-01T00:00:00+08:00` 采样，表示的时间点与 `2024-12-31T16:00:00+00:00` 相同。前者的 `+08:00` 是**那一刻与 UTC 的差值**，不是“亚洲某城市”的时区 ID；仅凭偏移不能推断未来日期的夏令时规则。把下面四种需求混成一个 `DateTime` 字段，往往是时间错误的源头。
+
+| 需求 | 合适的起点 | 还须约定 |
+| --- | --- | --- |
+| 日志、事件、设备采样的确定时间点 | `DateTimeOffset`，通常规范化为 UTC 存储 | 输入的偏移、精度和序列化格式 |
+| 日历日期，如生日、结算日 | `DateOnly` | 使用哪一地的业务日历 |
+| 每天 09:00 开门的钟面时间 | `TimeOnly` | 所在时区与节假日规则 |
+| 某地未来 09:00 的预约 | 本地日期/时间 + 时区 ID | 跳时缺口、回拨重叠的业务策略 |
+
+`TimeSpan` 是时间间隔，不是时区；`+08:00` 也不是永久有效的地区规则。`DateTime.Kind` 只有 `Utc`、`Local`、`Unspecified`，并不保存任意地区的时区 ID。一个 `Unspecified` 值可以用于描述尚未绑定时区的钟面时间，但不能未经解释就当成全球唯一的时间点。对于跨系统事件，优先保留明确的偏移或 UTC；对于未来某地定时事件，同时保留地区时区标识。
+
+## 用固定规则亲手复现两种夏令时陷阱
+
+下方是完整 `Program.cs`。教学时区只定义 **2025 年**：标准偏移 `-05:00`，3 月 9 日 02:00 跳到 03:00，11 月 2 日从夏令时 02:00 回到标准时 01:00。它**不是**真实地区的历史或未来规则，因此示例无需读取操作系统时区库，输出也不受电脑所在地区影响。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+
+var captured = new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.FromHours(8));
+var utc = captured.ToUniversalTime();
+Check(utc == new DateTimeOffset(2024, 12, 31, 16, 0, 0, TimeSpan.Zero), "UTC instant");
+Check(captured == utc && captured.Offset != utc.Offset, "same instant, different offsets");
+
+string wire = captured.ToString("O", CultureInfo.InvariantCulture);
+var restored = DateTimeOffset.ParseExact(wire, "O", CultureInfo.InvariantCulture, DateTimeStyles.None);
+Check(restored.EqualsExact(captured), "round-trip keeps wall time and offset");
+
+var starts = TimeZoneInfo.TransitionTime.CreateFixedDateRule(
+    new DateTime(1, 1, 1, 2, 0, 0), 3, 9);
+var ends = TimeZoneInfo.TransitionTime.CreateFixedDateRule(
+    new DateTime(1, 1, 1, 2, 0, 0), 11, 2);
+var rule = TimeZoneInfo.AdjustmentRule.CreateAdjustmentRule(
+    new DateTime(2025, 1, 1), new DateTime(2025, 12, 31),
+    TimeSpan.FromHours(1), starts, ends);
+var zone = TimeZoneInfo.CreateCustomTimeZone(
+    "Training/Eastern-2025", TimeSpan.FromHours(-5),
+    "Training zone", "Standard", "Daylight", [rule]);
+
+var missing = new DateTime(2025, 3, 9, 2, 30, 0, DateTimeKind.Unspecified);
+var repeated = new DateTime(2025, 11, 2, 1, 30, 0, DateTimeKind.Unspecified);
+Check(zone.IsInvalidTime(missing), "spring gap");
+Check(zone.IsAmbiguousTime(repeated), "fall overlap");
+
+TimeSpan[] offsets = zone.GetAmbiguousTimeOffsets(repeated);
+Check(offsets.Contains(TimeSpan.FromHours(-4)) && offsets.Contains(TimeSpan.FromHours(-5)),
+    "two possible offsets");
+var firstOccurrence = new DateTimeOffset(repeated, TimeSpan.FromHours(-4));
+var secondOccurrence = new DateTimeOffset(repeated, TimeSpan.FromHours(-5));
+Check(secondOccurrence - firstOccurrence == TimeSpan.FromHours(1), "two distinct instants");
+
+var beforeJump = new DateTimeOffset(2025, 3, 9, 1, 30, 0, TimeSpan.FromHours(-5));
+var afterElapsedHour = TimeZoneInfo.ConvertTime(beforeJump.AddHours(1), zone);
+Check(afterElapsedHour.Hour == 3 && afterElapsedHour.Offset == TimeSpan.FromHours(-4),
+    "elapsed hour crosses the gap");
+
+Console.WriteLine("时间点、往返格式与夏令时边界断言全部通过");
+
+static void Check(bool condition, string name)
+{
+    if (!condition) throw new Exception($"断言失败：{name}");
+}
+```
+
+从第一组断言看：`DateTimeOffset` 的常规相等比较按同一 UTC 时间点判断，因此偏移不同仍可能相等；需要同时比较钟面时间与偏移时，可用 `EqualsExact`。`O` 往返格式保留原始偏移，适合明确的文本协议。业务若统一存 UTC，可在边界调用 `ToUniversalTime()`，但不要误以为“只存 UTC”就能重建用户原先选择的地区时区。
+
+第二组断言看的是**本地钟面时间到时间点的映射**：春季的 02:30 根本不存在；秋季的 01:30 出现两次，对应 `-04:00` 与 `-05:00` 两个不同时间点。不能悄悄选一个偏移。预约系统应明确是拒绝缺口、顺延，还是要求用户重选；重叠时要明确选第一次、第二次，或要求确认。这是业务策略，不是 `TimeZoneInfo` 替你做的产品决定。
+
+## “过一小时”与“明天同一钟点”不同
+
+示例从 01:30 `-05:00` 开始，给确定时间点加一个真实经过的小时，再转换回教学时区，钟面显示 03:30 `-04:00`。`DateTimeOffset.AddHours` 操作的是带偏移的值，**不会自动更新所属地区的时区规则**；因此先计算经过时间，再 `TimeZoneInfo.ConvertTime` 回目标时区。若需求是“明天当地 09:00 再执行”，则应按该地区的日期和钟面时间求下一次，再处理可能的缺口/重叠，不能简单把上一次时间点加 24 小时。
+
+生产系统选时区 ID 时，应规定标识体系、部署平台可用性和规则更新策略；不要把这里的 `Training/Eastern-2025` 当真实地区 ID。存储模型可以同时保留事件发生的 UTC 时间点和原始偏移；未来排程还要保留业务时区 ID、当地日期时间及已选的歧义处理策略。展示给用户时，按目标时区转换后再格式化，不依赖服务器的“本地时区”。
+
+## 面试自测与练习
+
+1. `2025-01-01T00:00:00+08:00` 和 `2024-12-31T16:00:00Z` 是否为同一时间点？它们是否具有相同的钟面时间和偏移？
+2. 为什么只保存 `-05:00` 不能保证明年同一天 09:00 的正确执行时间？
+3. 把示例的 `missing` 改成 03:30、`repeated` 改成 02:30，预测两个判断结果，再运行。
+4. 设计设备读数 JSON 的 `sampledAt` 契约：输入允许哪些格式？存储是否归一 UTC？原偏移和设备所在时区是否另存？
+
+验收标准：能分别解释**时间点、偏移、地区时区、钟面时间、经过时长**；能为缺口和重叠时间写出显式业务处理策略。仓库断言可用 `dotnet run --project examples/csharp-time-zones/TimeZonesReview.csproj` 运行；正文完整代码块由 `npm run test:csharp-articles` 单独编译。
+
+## 参考
+
+[Microsoft Learn：日期时间类型选择](https://learn.microsoft.com/en-us/dotnet/standard/datetime/choosing-between-datetime) · [标准日期时间格式](https://learn.microsoft.com/en-us/dotnet/standard/base-types/standard-date-and-time-format-strings) · [无效本地时间](https://learn.microsoft.com/en-us/dotnet/api/system.timezoneinfo.isinvalidtime) · [歧义本地时间](https://learn.microsoft.com/en-us/dotnet/api/system.timezoneinfo.isambiguoustime) · [时区中的时间运算](https://learn.microsoft.com/en-us/dotnet/standard/datetime/use-time-zones-in-arithmetic)

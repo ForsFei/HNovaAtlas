@@ -1,0 +1,146 @@
+---
+id: csharp-visibility-atomicity
+title: 内存可见性与原子操作：Interlocked、Volatile 和一致快照
+description: 区分单次读写、读改写、发布与多字段不变量；用确定性示例理解 CAS 重试和并发测试边界。
+tags: [CSharp, 多线程, Interlocked, Volatile, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 25
+prerequisite: [csharp-lock-shared-state]
+related: [csharp-controlled-concurrency-tests, csharp-concurrent-collections, csharp-threads-threadpool-tasks]
+---
+
+## 先把三个问题拆开
+
+多个线程共享状态时，至少要分别问：
+
+| 问题 | 具体含义 | 常见选择 |
+| --- | --- | --- |
+| 原子性 | 其他线程会不会看到操作进行到一半？ | 单字段读改写用 `Interlocked`；复合不变量用 `lock` 或所有权隔离 |
+| 可见性与顺序 | 一个线程写入后，另一个线程按什么同步协议观察？ | `lock`、`Interlocked`、`Volatile.Read/Write` 等 |
+| 一致性 | 一次读取的几个字段是否属于同一版本？ | 同一把锁内读写，或一次发布不可变快照 |
+
+`count++` 即便作用于一个整数，也仍是“读出 → 加一 → 写回”，不是一个不可分割的更新。单次读或写的原子性、一次完整读改写的原子性，以及多个字段共同满足业务规则，是三层不同承诺。先读[共享状态与 lock](/knowledge/programming/csharp/concurrency/lock-and-shared-state/)中的丢失更新，再继续本篇。
+
+## 单字段计数：`Interlocked` 管更新，读也遵守协议
+
+```csharp
+public sealed class AtomicCounter
+{
+    private int _value;
+
+    public int Increment() => Interlocked.Increment(ref _value);
+    public int Value => Volatile.Read(ref _value);
+}
+```
+
+`Interlocked.Increment` 把该字段的加一与写回合成原子操作，并返回更新后的值。`Value` 使用显式同步读法，不在另一个入口随手读 `_value`。这里没有要求“计数值与另一个字段一起改变”，因此单字段协议足够；若有此要求，就不能简单地对两个字段各调用一次 `Interlocked` 后宣称整体原子。
+
+`volatile` 字段或 `Volatile.Read/Write` 对特定读写提供可见性/排序约束，但不会让 `_value++` 成为原子读改写，也不保证“每次读取都得到所有处理器上绝对最新的值”。直接使用 `volatile` 字段还受可标注类型限制。除非确实在设计低层同步协议，一般先选 `Interlocked`、`lock` 或更高层并发集合。
+
+## 有条件更新：理解 CAS 重试
+
+“当前值未达到上限才加一”不是先 `if (count < limit)` 再 `Interlocked.Increment`：多个线程都可能通过检查，最后越过上限。`CompareExchange(ref location, newValue, expected)` 只在当前值仍等于 `expected` 时交换，并返回交换前的值。失败时重新读并重算：
+
+```csharp
+public bool TryIncrement()
+{
+    while (true)
+    {
+        int observed = Volatile.Read(ref _value);
+        if (observed >= _limit) return false;
+
+        if (Interlocked.CompareExchange(ref _value, observed + 1, observed) == observed)
+            return true;
+    }
+}
+```
+
+这段是下方完整类中的方法。重试循环中的计算可能执行多次；不要把发送消息、扣款、写文件等不可重复的副作用塞进去。CAS 也不自动变成“无等待”或“性能一定更好”：竞争大时可能反复失败；复杂业务状态通常用锁、事务、不可变数据或单一所有者更清晰。
+
+## 一致快照：一次发布一个版本
+
+如果读者需要同时看到 `Success`、`Failure`、`Total`，分别对三个整数做原子读写仍可能拼出跨版本组合。下面每次先构造一个不会再修改的 `Metrics` 对象，再发布**一个引用**；读者也只读取一次引用，随后访问该对象的字段。`Volatile.Write` 的 release 与 `Volatile.Read` 的 acquire 配对，为发布前的初始化与读者的后续读取建立必要的顺序。
+
+这不保证读者看到每个中间版本，也不合并多个写者的更新。若多个写者同时根据旧快照计算下一版，仍可能相互覆盖；这时要对写入加锁或对整个快照引用执行 CAS。
+
+## 完整可运行例子
+
+将下方整段放进 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+using System.Threading;
+
+var counter = new AtomicCounter();
+Task[] workers = Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+{
+    for (int i = 0; i < 5_000; i++) counter.Increment();
+})).ToArray();
+await Task.WhenAll(workers);
+Console.WriteLine(counter.Value); // 20000
+
+var capped = new CappedCounter(7);
+Task<bool>[] attempts = Enumerable.Range(0, 100)
+    .Select(_ => Task.Run(capped.TryIncrement)).ToArray();
+bool[] accepted = await Task.WhenAll(attempts);
+Console.WriteLine($"{accepted.Count(x => x)}, {capped.Value}"); // 7, 7
+
+var store = new MetricsStore();
+store.Publish(8, 2);
+Metrics snapshot = store.Current; // 只取一次引用
+Console.WriteLine($"{snapshot.Success}+{snapshot.Failure}={snapshot.Total}"); // 8+2=10
+
+public sealed class AtomicCounter
+{
+    private int _value;
+    public int Increment() => Interlocked.Increment(ref _value);
+    public int Value => Volatile.Read(ref _value);
+}
+
+public sealed class CappedCounter(int limit)
+{
+    private int _value;
+    private readonly int _limit = limit > 0 ? limit : throw new ArgumentOutOfRangeException(nameof(limit));
+
+    public int Value => Volatile.Read(ref _value);
+
+    public bool TryIncrement()
+    {
+        while (true)
+        {
+            int observed = Volatile.Read(ref _value);
+            if (observed >= _limit) return false;
+            if (Interlocked.CompareExchange(ref _value, observed + 1, observed) == observed)
+                return true;
+        }
+    }
+}
+
+public sealed record Metrics(int Success, int Failure, int Total);
+
+public sealed class MetricsStore
+{
+    private Metrics _current = new(0, 0, 0);
+    public Metrics Current => Volatile.Read(ref _current);
+
+    // 此简化示例假设只有一个发布者，且发布后不修改 Metrics。
+    public void Publish(int success, int failure) =>
+        Volatile.Write(ref _current, new Metrics(success, failure, checked(success + failure)));
+}
+```
+
+仓库的断言版在 `examples/csharp-atomicity`：运行 `dotnet run --project examples/csharp-atomicity/AtomicityReview.csproj`。正文完整代码块也由 `npm run test:csharp-articles` 单独编译。
+
+## 如何验证，而不是碰运气
+
+断言并发计数最终值、上限不被突破、每个快照自身的 `Total == Success + Failure`，比打印几次“看起来正常”更有价值。但压力运行**只能发现**一些错误，不能证明所有线程交错都正确。不要用 `Thread.Sleep` 猜测任务已结束；保存并等待任务、设置必要的超时，并针对不变量写断言。下一篇[受控并发测试](/knowledge/programming/csharp/concurrency/controlled-concurrency-tests/)用同步点稳定复现“检查后再写”的竞态，再讨论修复版与测试边界。
+
+## 自测与面试追问
+
+1. `Volatile.Read(ref count)` 配合普通的 `count++`，为什么仍可能丢失更新？
+2. 已经对 `Success`、`Failure` 分别使用 `Interlocked`，为什么读取它们仍未必得到同一业务版本？
+3. `CompareExchange` 返回的是新值还是旧值？重试逻辑里能否发送一次性通知？
+4. 多个发布者同时调用上面的 `MetricsStore.Publish`，会不会自动累加他们的结果？
+
+参考：[Microsoft Learn：Interlocked](https://learn.microsoft.com/en-us/dotnet/api/system.threading.interlocked)、[CompareExchange](https://learn.microsoft.com/en-us/dotnet/api/system.threading.interlocked.compareexchange)、[Volatile](https://learn.microsoft.com/en-us/dotnet/api/system.threading.volatile)、[`volatile` 关键字](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/volatile)。

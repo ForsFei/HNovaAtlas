@@ -1,0 +1,81 @@
+---
+id: csharp-json-contracts
+title: JSON：序列化契约、缺失字段与版本兼容
+description: 使用 System.Text.Json 读写设备读数，区分 required、null、未知字段和业务验证。
+tags: [CSharp, JSON, 序列化, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-classes-interfaces, csharp-exceptions-disposal]
+related: [csharp-time-and-time-zones, csharp-xml-processing, csharp-database-access, csharp-json-polymorphism-discriminators]
+---
+
+## JSON 是外部输入，不是可信对象
+
+`System.Text.Json` 可把 JSON 文本映射到 .NET 类型，也能反向序列化。但“能解析”和“业务有效”不同：设备 ID 可能是空白、温度可能不在允许范围、时间可能缺少业务要求的信息。反序列化边界负责格式与契约，领域模型或验证过程负责业务规则。
+
+下面例子可直接放进控制台项目的 `Program.cs`。`required` 要求 JSON 出现对应属性；`[JsonPropertyName]` 固定线上字段名，不受 C# 属性重命名影响。示例仍显式检查 `null` 和业务值。
+
+```csharp filename="Program.cs"
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+string json = """{"deviceId":"pump-A","value":72.5}""";
+var options = new JsonSerializerOptions
+{
+    PropertyNameCaseInsensitive = false,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow
+};
+
+try
+{
+    ReadingDto? dto = JsonSerializer.Deserialize<ReadingDto>(json, options);
+    if (dto is null || string.IsNullOrWhiteSpace(dto.DeviceId) || !double.IsFinite(dto.Value))
+        throw new InvalidDataException("读数内容无效");
+
+    Console.WriteLine($"{dto.DeviceId}: {dto.Value}");
+    Console.WriteLine(JsonSerializer.Serialize(dto, options));
+}
+catch (JsonException ex)
+{
+    Console.Error.WriteLine($"JSON 契约不符：{ex.Message}");
+}
+
+public sealed class ReadingDto
+{
+    [JsonPropertyName("deviceId")]
+    public required string DeviceId { get; init; }
+
+    [JsonPropertyName("value")]
+    public required double Value { get; init; }
+}
+```
+
+这里 `UnmappedMemberHandling.Disallow` 表示遇到 DTO 未声明的 JSON 字段就报错。它适合严格入口；面向前后版本并存的公开接口时，忽略新增字段可能更容易兼容。`PropertyNameCaseInsensitive`、命名策略、字段映射在控制台默认选项和 ASP.NET Core 的 Web 默认选项之间可能不同，所以跨系统协议要显式规定，不依赖环境默认值。
+
+## 缺失、null、未知字段是三个问题
+
+缺少一个 `required` 属性会在反序列化时报 `JsonException`。但“属性存在且值为 `null`”与“属性完全缺失”是不同情况；普通 C# 非空引用类型标注主要是编译期分析，不应当作所有运行时输入验证。`RespectNullableAnnotations` 等选项可在支持的运行时提供部分额外检查，但其覆盖范围有限。示例保留手动验证，就是要把契约检查与业务检查写清楚。
+
+反序列化整个 JSON 文本会把数据装入内存；大文件或持续数据流应考虑流 API、限制输入大小、逐条处理以及取消。不要把任意来源的类型名当作创建对象的依据；对外协议应有明确允许的 DTO 与版本策略。
+
+若同一入口确实需要接收多种消息，再读[JSON 多态契约与类型辨别符](/knowledge/programming/csharp/collections/json-polymorphism-and-discriminators/)：用显式派生类型映射处理已知种类，并分别测试未知种类、缺字段与业务校验。
+
+## 时间、数字与版本
+
+JSON 没有 C# `DateTime`、`decimal` 这样的独立类型声明，格式要靠协议约定。金额优先考虑 `decimal` 及精度/舍入规则；设备采样时间建议明确 UTC 偏移或统一 UTC 存储。新增字段时区分“可选且有默认语义”和“必需、缺失即错误”；改名/删字段可能破坏老客户端，必要时显式版本化或迁移。
+
+时间字段的后续设计见[时间点、偏移与时区](/knowledge/programming/csharp/collections/time-and-time-zones/)：偏移能确定采样时间点，却不能代替设备所在地区的时区规则。
+
+## 面试自测与练习
+
+1. 把 `deviceId` 改成 `deviceID`，在当前大小写敏感选项下会怎样？改为不区分大小写又如何？
+2. 给 JSON 加 `"unit":"C"`，为什么当前代码会报错？如果接口需要向前兼容，应做什么选择？
+3. 分别测试缺少 `deviceId`、`deviceId:null` 和 `deviceId:" "`。它们在哪一层失败？
+
+验收标准：能把格式错误、契约错误、业务错误与版本兼容四类问题分开处理。
+
+## 参考
+
+[Microsoft Learn：JSON 反序列化](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/deserialization) · [必需属性](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/required-properties) · [未知字段](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/missing-members)

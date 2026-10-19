@@ -1,0 +1,101 @@
+---
+id: csharp-classes-interfaces
+title: 类、记录与接口：为问题建立模型
+description: 用构造函数、属性、封装、record 和接口表达设备读数与告警规则。
+tags: [CSharp, OOP, 接口]
+difficulty: beginner
+status: published
+updated: "2026-10-12"
+order: 10
+prerequisite: [csharp-control-flow-methods]
+related: [csharp-constructors-invariants, csharp-abstract-interfaces, csharp-value-equality]
+---
+
+## 什么时候需要对象
+
+当设备 ID、读数和采样时间总是一起出现，继续传三个平行数组很容易把索引弄错。一个类型可以把这些信息组织成一个有意义的整体。面向对象的重点不是把每一行代码都塞进类，而是让数据的约束和行为有明确归属。
+
+## `record` 保存一条数据
+
+下面是一份完整的 `Program.cs`。`record` 适合主要表达数据、希望按值比较内容的场景；构造参数会生成可读取的属性。`DateTimeOffset` 带有 UTC 偏移量，通常比裸 `DateTime` 更适合跨时区记录时间；它仍不包含时区规则本身。
+
+```csharp filename="Program.cs"
+var reading = new Reading("pump-A", 72.5, DateTimeOffset.UtcNow);
+Console.WriteLine($"{reading.DeviceId}: {reading.Value:F1}");
+
+public record Reading(string DeviceId, double Value, DateTimeOffset CapturedAt);
+```
+
+`record` 并不意味着内部所有成员都深度不可变。如果属性里放可变列表，两个记录可能仍共享同一个列表。需要约束时，应由构造过程和公开 API 明确保证。
+
+## 用类封装会变化的状态
+
+一个设备配置的阈值可能随业务操作改变。类更适合拥有身份和状态的对象。下面属性的 `private set` 不让外部随便赋值；构造函数和方法负责验证不变量。
+
+```csharp filename="Program.cs"
+var monitor = new TemperatureMonitor("pump-A", 70);
+Console.WriteLine(monitor.IsAlarm(72.5)); // True
+monitor.ChangeLimit(75);
+Console.WriteLine(monitor.IsAlarm(72.5)); // False
+
+public sealed class TemperatureMonitor
+{
+    public string DeviceId { get; }
+    public double Limit { get; private set; }
+
+    public TemperatureMonitor(string deviceId, double limit)
+    {
+        if (string.IsNullOrWhiteSpace(deviceId))
+            throw new ArgumentException("设备 ID 不能为空", nameof(deviceId));
+        if (!double.IsFinite(limit))
+            throw new ArgumentOutOfRangeException(nameof(limit));
+
+        DeviceId = deviceId;
+        Limit = limit;
+    }
+
+    public bool IsAlarm(double value) => value >= Limit;
+
+    public void ChangeLimit(double value)
+    {
+        if (!double.IsFinite(value))
+            throw new ArgumentOutOfRangeException(nameof(value));
+        Limit = value;
+    }
+}
+```
+
+外部不能直接写 `monitor.Limit = -1`，但能通过验证后的 `ChangeLimit` 修改。`sealed` 表示此类不作为继承基类；这里无需设计复杂继承层次。字段通常作为实现细节，属性作为对外契约；不是每个字段都要机械地包成可写属性。
+
+## 接口定义可替换的能力
+
+当「阈值告警」之外还可能有「范围告警」时，可以抽出规则接口，而不是在一个类里不断加状态开关。调用方只关心是否告警。
+
+```csharp filename="Program.cs"
+IAlarmRule rule = new HighLimitRule(70);
+Console.WriteLine(rule.IsAlarm(72.5));
+
+public interface IAlarmRule
+{
+    bool IsAlarm(double value);
+}
+
+public sealed class HighLimitRule(double limit) : IAlarmRule
+{
+    public bool IsAlarm(double value) => value >= limit;
+}
+```
+
+接口描述能力，不自动提供对象状态。只有出现真实的第二种实现或清晰的替换边界时再抽接口；为每个类先造一个同名接口会增加认知负担。优先通过组合使用规则对象，继承留给真正的「是一个」关系。
+
+## 动手练习
+
+1. 给 `Reading` 增加单位字段；思考空单位是否允许，并写下约束。
+2. 实现 `RangeRule`：低于下限或高于上限才告警，构造时检查下限小于上限。
+3. 创建两个内容相同的 `Reading`，比较 `==`；再创建两个内容相同的普通类实例，观察默认比较语义。
+
+验收标准：阈值对象无法在构造或修改后处于无效状态；可以解释为什么记录和类的选择不同。
+
+## 参考
+
+[Microsoft Learn：类](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/classes) · [记录](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/records) · [接口](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/types/interfaces)

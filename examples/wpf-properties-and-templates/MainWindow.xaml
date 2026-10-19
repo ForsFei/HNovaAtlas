@@ -1,0 +1,85 @@
+<Window x:Class="WpfPropertiesAndTemplates.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:WpfPropertiesAndTemplates"
+        Title="WPF 属性与外观对照" Width="680" Height="590"
+        MinWidth="540" MinHeight="460">
+    <Window.Resources>
+        <SolidColorBrush x:Key="AccentBrush" Color="#DCEBFF" />
+
+        <Style x:Key="ActionStyle" TargetType="Button">
+            <Setter Property="Background" Value="{StaticResource AccentBrush}" />
+            <Setter Property="BorderBrush" Value="#4C6FA9" />
+            <Setter Property="Padding" Value="12,8" />
+            <Setter Property="Margin" Value="0,0,8,0" />
+        </Style>
+
+        <ControlTemplate x:Key="CompactButtonTemplate" TargetType="Button">
+            <Border Background="{TemplateBinding Background}"
+                    BorderBrush="{TemplateBinding BorderBrush}"
+                    BorderThickness="1" CornerRadius="9"
+                    Padding="{TemplateBinding Padding}">
+                <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center" />
+            </Border>
+            <ControlTemplate.Triggers>
+                <Trigger Property="IsEnabled" Value="False">
+                    <Setter Property="Opacity" Value="0.5" />
+                </Trigger>
+            </ControlTemplate.Triggers>
+        </ControlTemplate>
+
+        <ControlTemplate x:Key="BadgeTemplate" TargetType="{x:Type local:StatusBadge}">
+            <Border Background="{TemplateBinding Background}"
+                    CornerRadius="10" Padding="12,6">
+                <TextBlock Text="{TemplateBinding StatusText}" FontWeight="SemiBold" />
+            </Border>
+        </ControlTemplate>
+
+        <DataTemplate x:Key="ReadingTemplate">
+            <Grid Margin="4,3">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Text="{Binding Device}" />
+                <TextBlock Grid.Column="1" Text="{Binding Temperature, StringFormat={}{0} °C}" />
+            </Grid>
+        </DataTemplate>
+    </Window.Resources>
+
+    <Grid Margin="24">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="属性值从哪里来？" FontSize="24" FontWeight="SemiBold" />
+
+        <StackPanel Grid.Row="1" Margin="0,18,0,0">
+            <TextBlock Text="自定义依赖属性：模板读取 StatusText" />
+            <local:StatusBadge StatusText="运行中" Background="#DDF5E8"
+                               Template="{StaticResource BadgeTemplate}"
+                               HorizontalAlignment="Left" Margin="0,8,0,0" />
+        </StackPanel>
+
+        <StackPanel Grid.Row="2" Margin="0,22,0,0">
+            <TextBlock Text="样式 setter、本地值和控件模板" />
+            <StackPanel x:Name="Actions" Orientation="Horizontal" Margin="0,8,0,0">
+                <Button Content="仅样式" Style="{StaticResource ActionStyle}" />
+                <Button Content="本地背景覆盖" Style="{StaticResource ActionStyle}"
+                        Background="#FFD6B6" />
+                <Button Content="更换控件模板" Style="{StaticResource ActionStyle}"
+                        Template="{StaticResource CompactButtonTemplate}" />
+            </StackPanel>
+            <TextBlock x:Name="RouteText" Text="点击任一按钮，观察父容器收到 Click。"
+                       Margin="0,8,0,0" />
+        </StackPanel>
+
+        <TextBlock Grid.Row="3" Text="数据模板：同一列表项的呈现" Margin="0,22,0,8" />
+        <ListBox x:Name="ReadingsList" Grid.Row="4"
+                 ItemTemplate="{StaticResource ReadingTemplate}" />
+    </Grid>
+</Window>

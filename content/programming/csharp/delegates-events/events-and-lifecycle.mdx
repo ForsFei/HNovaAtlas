@@ -1,0 +1,102 @@
+---
+id: csharp-events-lifecycle
+title: event 与订阅生命周期：谁能触发，谁负责退出
+description: 以设备告警实现 EventHandler，解释发布者权限、多播异常、退订和长期引用。
+tags: [CSharp, 事件, EventHandler, 生命周期, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 30
+prerequisite: [csharp-delegates-func-action, csharp-lambda-closures, csharp-classes-interfaces]
+related: [csharp-exceptions-disposal, csharp-async-await]
+---
+
+## 为什么不直接公开委托字段
+
+若一个类公开 `public Action? Alarm;`，外部代码既能 `+=`，也能把它设成 `null`、覆盖所有处理器或主动调用它。`public event EventHandler<AlarmEventArgs>? AlarmRaised;` 对外只开放订阅与退订；何时触发由声明事件的发布者控制。这是权限和所有权边界，不只是语法糖。
+
+下面完整示例可作为 `Program.cs` 运行。短命的显示对象订阅长命的监视器，停止显示时主动退订：
+
+```csharp filename="Program.cs"
+var monitor = new TemperatureMonitor(70);
+var display = new AlarmDisplay(monitor);
+
+monitor.Check("pump-A", 72.5);
+Console.WriteLine(display.Count); // 1
+
+display.Dispose();
+monitor.Check("pump-A", 75);
+Console.WriteLine(display.Count); // 仍为 1
+
+public sealed class AlarmEventArgs(string deviceId, double value) : EventArgs
+{
+    public string DeviceId { get; } = deviceId;
+    public double Value { get; } = value;
+}
+
+public sealed class TemperatureMonitor(double limit)
+{
+    public event EventHandler<AlarmEventArgs>? AlarmRaised;
+
+    public void Check(string deviceId, double value)
+    {
+        if (value >= limit)
+            AlarmRaised?.Invoke(this, new AlarmEventArgs(deviceId, value));
+    }
+}
+
+public sealed class AlarmDisplay : IDisposable
+{
+    private readonly TemperatureMonitor _monitor;
+    public int Count { get; private set; }
+
+    public AlarmDisplay(TemperatureMonitor monitor)
+    {
+        _monitor = monitor;
+        _monitor.AlarmRaised += OnAlarm;
+    }
+
+    private void OnAlarm(object? sender, AlarmEventArgs args)
+    {
+        Count++;
+        Console.WriteLine($"{args.DeviceId}: {args.Value}");
+    }
+
+    public void Dispose() => _monitor.AlarmRaised -= OnAlarm;
+}
+```
+
+`EventHandler<TEventArgs>` 的两个参数分别是 `sender` 和事件数据。此处 `Dispose` 仅表示订阅生命周期结束；不是说 `AlarmDisplay` 本身拥有文件或非托管资源。真实组件应明确它能否重复订阅、是否允许多次 `Dispose`，以及事件从哪条线程发出。示例为了聚焦事件，不处理多线程同时更新 `Count`；若发布者可并发触发，订阅者也要同步自己的状态。
+
+## 为什么长期订阅可能保留对象
+
+发布者保存的委托通常会引用订阅者实例。只要长寿命发布者仍可到达，短寿命订阅者即使不再显示，也可能因订阅关系不能被回收。两者一同结束时通常没有这个问题；不要简单断言“所有事件订阅都会泄漏”。长寿命服务、静态事件、全局总线尤其要明确退订时机。
+
+若使用匿名 Lambda，退订必须使用**原来的同一个委托实例**：
+
+```csharp filename="Program.cs"
+EventHandler<AlarmEventArgs> handler = (_, args) => Console.WriteLine(args.DeviceId);
+monitor.AlarmRaised += handler;
+// 停止观察时：
+monitor.AlarmRaised -= handler;
+```
+
+这段是接在上一份示例的顶级代码中使用的片段；单独复制需要先声明 `monitor` 与 `AlarmEventArgs`。重新写一个外观相同的 Lambda 不等于保存了原来的订阅对象，不能依赖它成功退订。
+
+## 同步通知、异常与异步工作
+
+默认事件处理器按调用列表同步执行。一个处理器抛出未捕获异常会中断后续调用并传播给触发者；发布者和订阅者要约定失败策略。`?.Invoke` 仅处理“没有订阅者”，不是异常隔离。若在一个线程触发事件、另一个线程退订，退订也不能保证已经开始的处理器不会执行。
+
+标准 `EventHandler` 返回 `void`，若写 `async` 处理器便是 `async void` 路径，调用者无法正常 `await` 其完成。若业务必须等待所有处理完成、汇总错误或取消，应设计返回 `Task` 的明确异步回调契约或消息处理流程，不把重要事务藏在普通事件中。
+
+## 面试自测与练习
+
+1. 外部为什么可以 `monitor.AlarmRaised += handler`，却不能 `monitor.AlarmRaised?.Invoke(...)`？
+2. 订阅者何时需要退订？只有发布者和订阅者都不再被引用时，还一定会泄漏吗？
+3. 若第一个处理器抛异常，第二个是否自动继续？若必须继续，应由发布者如何明确设计？
+
+验收标准：能说清事件触发权限、订阅责任、引用链与同步调用边界。
+
+## 参考
+
+[Microsoft Learn：事件](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/events/) · [event 关键字](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/event) · [订阅与退订](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/events/how-to-subscribe-to-and-unsubscribe-from-events)

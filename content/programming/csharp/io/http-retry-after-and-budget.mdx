@@ -1,0 +1,203 @@
+---
+id: csharp-io-http-retry-after-budget
+title: HTTP Retry-After 与预算：等多久，何时停止
+description: 用可控时间和响应验证 503/429 的等待提示、剩余预算与取消，不把有限示例误当完整生产策略。
+tags: [CSharp, HttpClient, HTTP, Retry-After, 取消, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-14"
+order: 48
+prerequisite: [csharp-io-http-retry-idempotency]
+related: [csharp-cancellation-throttling, csharp-task-composition-faults-timeouts, csharp-io-testable-http-download]
+---
+
+## 能重试之后，还要决定能否等
+
+上一篇[HTTP 重试与幂等](/knowledge/programming/csharp/io/http-retry-and-idempotency/)只示范 GET 收到 503 后有限次数地立即再发。真实服务可能用 `Retry-After` 表示稍后再试。它可以是**秒数**，也可以是 **HTTP 日期**；503 常用它提示服务预计不可用的时长，429 限流响应也可能携带该提示。不能把“收到提示”理解成客户端必须无限等待：调用方仍拥有自己的截止时间、取消请求与重试次数上限。
+
+这篇延续**仅 GET、只处理 503/429、最多三次发送**的教学范围。用注入的时间与等待函数代替真实睡眠，验证：服务端提示被采用；提示超过剩余五秒预算时停止，而不是擅自缩短后提前发送；等待期间取消会阻止下一次请求。
+
+以下完整 `Program.cs` 可运行：`dotnet run --project examples/csharp-http-retry-budget/HttpRetryBudgetReview.csproj`。
+
+```csharp filename="Program.cs"
+using System.Net;
+using System.Net.Http.Headers;
+
+Uri address = new("https://example.invalid/readings");
+
+var deltaClock = new ManualClock();
+using (var handler = new SequenceHandler(
+    new(HttpStatusCode.ServiceUnavailable, new(TimeSpan.FromSeconds(2))),
+    new(HttpStatusCode.OK)))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    var waits = new List<TimeSpan>();
+    string body = await GetWithinBudgetAsync(client, address, deltaClock,
+        (time, token) => AdvanceAsync(deltaClock, waits, time, token), CancellationToken.None);
+    Check(body == "ok" && handler.Calls == 2 && waits.SequenceEqual([TimeSpan.FromSeconds(2)]),
+        "503 delta is honored before the second send");
+}
+
+var dateClock = new ManualClock();
+using (var handler = new SequenceHandler(
+    new(HttpStatusCode.TooManyRequests,
+        new RetryConditionHeaderValue(dateClock.GetUtcNow().AddSeconds(3))),
+    new(HttpStatusCode.OK)))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    var waits = new List<TimeSpan>();
+    await GetWithinBudgetAsync(client, address, dateClock,
+        (time, token) => AdvanceAsync(dateClock, waits, time, token), CancellationToken.None);
+    Check(handler.Calls == 2 && waits.SequenceEqual([TimeSpan.FromSeconds(3)]),
+        "429 HTTP-date is converted using the injected clock");
+}
+
+var shortClock = new ManualClock();
+using (var handler = new SequenceHandler(
+    new ResponsePlan(HttpStatusCode.ServiceUnavailable, new(TimeSpan.FromSeconds(8)))))
+using (var client = new HttpClient(handler, disposeHandler: false))
+{
+    var waits = new List<TimeSpan>();
+    await ExpectAsync<TimeoutException>(() => GetWithinBudgetAsync(client, address,
+        shortClock, (time, token) => AdvanceAsync(shortClock, waits, time, token),
+        CancellationToken.None));
+    Check(handler.Calls == 1 && waits.Count == 0,
+        "a hint beyond the remaining five-second budget is not shortened or sent");
+}
+
+var cancelClock = new ManualClock();
+using (var handler = new SequenceHandler(
+    new(HttpStatusCode.ServiceUnavailable, new(TimeSpan.FromSeconds(1))),
+    new(HttpStatusCode.OK)))
+using (var client = new HttpClient(handler, disposeHandler: false))
+using (var stop = new CancellationTokenSource())
+{
+    await ExpectAsync<OperationCanceledException>(() => GetWithinBudgetAsync(client,
+        address, cancelClock, (_, token) =>
+        {
+            stop.Cancel();
+            token.ThrowIfCancellationRequested();
+            return Task.CompletedTask;
+        }, stop.Token));
+    Check(handler.Calls == 1, "cancellation during wait prevents the second send");
+}
+
+Console.WriteLine("Retry-After、剩余预算与等待取消断言全部通过。");
+
+static async Task<string> GetWithinBudgetAsync(HttpClient client, Uri address,
+    TimeProvider clock, Func<TimeSpan, CancellationToken, Task> delay,
+    CancellationToken token)
+{
+    TimeSpan budget = TimeSpan.FromSeconds(5);
+    long started = clock.GetTimestamp();
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        token.ThrowIfCancellationRequested();
+        if (clock.GetElapsedTime(started) >= budget) throw new TimeoutException("总预算已用尽");
+
+        TimeSpan wait;
+        using (var request = new HttpRequestMessage(HttpMethod.Get, address))
+        using (HttpResponseMessage response = await client.SendAsync(request,
+            HttpCompletionOption.ResponseHeadersRead, token))
+        {
+            if (response.IsSuccessStatusCode)
+                return await response.Content.ReadAsStringAsync(token);
+            if (attempt == 3 || response.StatusCode is not
+                (HttpStatusCode.ServiceUnavailable or HttpStatusCode.TooManyRequests))
+                response.EnsureSuccessStatusCode();
+
+            RetryConditionHeaderValue? hint = response.Headers.RetryAfter;
+            wait = hint?.Delta ?? (hint?.Date - clock.GetUtcNow())
+                ?? TimeSpan.FromSeconds(1);
+            if (wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+        }
+
+        TimeSpan remaining = budget - clock.GetElapsedTime(started);
+        if (wait >= remaining) throw new TimeoutException("等待提示超出剩余预算");
+        await delay(wait, token);
+    }
+    throw new InvalidOperationException("Unreachable retry state.");
+}
+
+static Task AdvanceAsync(ManualClock clock, List<TimeSpan> waits,
+    TimeSpan time, CancellationToken token)
+{
+    token.ThrowIfCancellationRequested();
+    waits.Add(time);
+    clock.Advance(time);
+    return Task.CompletedTask;
+}
+
+static async Task ExpectAsync<T>(Func<Task> action) where T : Exception
+{
+    try { await action(); }
+    catch (T) { return; }
+    throw new InvalidOperationException($"预期 {typeof(T).Name}");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+sealed class ManualClock : TimeProvider
+{
+    private long _ticks;
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+    public override long GetTimestamp() => _ticks;
+    public override DateTimeOffset GetUtcNow() =>
+        new DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero).AddTicks(_ticks);
+    public void Advance(TimeSpan time) => _ticks += time.Ticks;
+}
+
+sealed record ResponsePlan(HttpStatusCode Status, RetryConditionHeaderValue? RetryAfter = null);
+
+sealed class SequenceHandler(params ResponsePlan[] plans) : HttpMessageHandler
+{
+    public int Calls { get; private set; }
+
+    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request,
+        CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        if (request.Method != HttpMethod.Get) throw new InvalidOperationException("GET only");
+        ResponsePlan plan = plans[Math.Min(Calls, plans.Length - 1)];
+        Calls++;
+        var response = new HttpResponseMessage(plan.Status)
+        {
+            Content = new StringContent("ok")
+        };
+        response.Headers.RetryAfter = plan.RetryAfter;
+        return Task.FromResult(response);
+    }
+}
+```
+
+## 日期与经过时间，分别回答不同问题
+
+`RetryConditionHeaderValue` 把响应头解析成 `Delta` 或 `Date`。秒数可直接当等待时长；日期则要和当前 UTC 时间比较。示例用可控 `GetUtcNow()` 做日期转换，日期已过去时归零，不制造负等待。默认没有提示时，本教学策略等待一秒；生产系统应按协议与负载选择有上限的退避和抖动，不把固定一秒当通用建议。
+
+**整体预算**不能只用墙上时钟的日期相减：系统时钟可能调整。这里用 `TimeProvider.GetTimestamp()` 和 `GetElapsedTime()` 算已耗时；每次发送前检查预算，等待前比较“提示时长 < 剩余预算”。等于剩余预算也停止，因为等完已无下一次请求的时间。服务端提示长于客户端预算时，本例选择失败，不提前于提示再发请求。
+
+失败响应在进入等待前由 `using` 释放；每次发送新建请求对象。测试等待函数仅推进模拟时钟，没有真实延时；真实实现可注入 `(time, token) => Task.Delay(time, token)`。取消令牌同时交给发送、正文读取和等待，测试故意在等待中取消，确认没有第二次发送。
+
+## 这个预算门槛还不是完整的截止时间
+
+注意示例只在**发送前和等待前**检查经过时间；一次在途 `SendAsync` 或正文读取本身仍可能跨越五秒。因此它验证的是“是否启动下一步”的预算门槛，**不是**完整的端到端超时实现。生产策略还应把调用方取消与总截止时间链接成令牌，并让该令牌覆盖每次请求、读取与等待；还需处理单次操作超时、连接耗尽和最终失败的观测。`HttpClient.Timeout`、外层取消与弹性库策略同时存在时，责任边界要明确，避免多个计时器给出含糊结果。
+
+下一篇[HTTP 端到端截止时间与取消](/knowledge/programming/csharp/io/http-end-to-end-deadline-and-cancellation/)用一个单次 GET 例子实际验证在途发送和正文读取如何响应同一个链接令牌。
+
+本例仍只重试 GET 的 503/429，不将 POST、所有网络异常或所有 5xx 自动纳入。429 是限流信号，长提示可能意味着本次调用应直接返回给上层稍后处理，而不是让一批客户端同时占着任务等待。`Retry-After` 是等待建议，不是成功保证；上层还要限制尝试次数与并发量。对于大响应体，`ReadAsStringAsync` 也不是安全的无限大小读取方案，应回到[可测试 HTTP 下载](/knowledge/programming/csharp/io/testable-http-download/)的字节上限。
+
+## 面试自测与练习
+
+1. 503 携带 `Retry-After: 8`，调用方只剩五秒；为什么不能把等待截成五秒后继续发？
+2. HTTP 日期已经过去，等待时长如何处理？若设备系统时钟不准，会影响日期提示还是单调预算，或两者？
+3. 令牌在等待中取消后，示例为什么不发第二次？如果忘给 `Task.Delay` 传令牌会发生什么？
+4. 方法在 `SendAsync` 开始前还有四秒预算，但服务器十秒后才响应。当前教学代码能否保证五秒截止？完整实现还缺哪一层？
+
+验收标准：能分别说清“可重试性”“等待提示”“尝试上限”“剩余预算门槛”和“在途截止时间”的责任，且不把它们当作同一个开关。
+
+## 参考
+
+[RFC 9110：Retry-After](https://www.rfc-editor.org/rfc/rfc9110.html#section-10.2.3) · [RFC 6585：429](https://www.rfc-editor.org/rfc/rfc6585.html#section-4) · [Microsoft Learn：RetryAfter](https://learn.microsoft.com/en-us/dotnet/api/system.net.http.headers.httpresponseheaders.retryafter) · [TimeProvider](https://learn.microsoft.com/en-us/dotnet/standard/datetime/timeprovider-overview)

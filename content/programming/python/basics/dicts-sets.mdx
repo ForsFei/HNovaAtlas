@@ -1,0 +1,112 @@
+---
+id: python-dicts-sets
+title: 字典、元组与集合
+description: 认识按名字存取的字典、不可修改的元组和去重的集合。
+tags: [Python, 字典, dict, 元组, 集合]
+difficulty: beginner
+status: draft
+updated: "2026-10-10"
+order: 70
+prerequisite: [python-lists]
+related: [python-functions]
+---
+
+## 字典：按名字存取
+
+列表用位置（下标）找数据，**字典**（dict）用自己起的名字（键）找数据，像一本真正的字典：查"拼音"得到"解释"。用花括号书写，键和值之间是冒号：
+
+```python filename="dict-basic.py"
+student = {
+    "name": "小明",
+    "age": 12,
+    "city": "北京",
+}
+print(student["name"])     # 小明
+print(student["age"])      # 12
+student["age"] = 13        # 修改
+student["grade"] = "初一"  # 新增键值对
+del student["city"]        # 删除
+```
+
+取一个不存在的键会报错，用 `get` 更安全：
+
+```python filename="dict-get.py"
+student = {"name": "小明"}
+print(student.get("phone"))          # None，不报错
+print(student.get("phone", "未填写")) # 未填写，给个默认值
+```
+
+## 遍历字典
+
+```python filename="for-dict.py"
+student = {"name": "小明", "age": 12}
+
+for key, value in student.items():
+    print(f"{key}: {value}")
+# name: 小明
+# age: 12
+```
+
+字典极其实用：配置信息、计数器、查找表……凡是"名字 → 内容"的数据都适合用字典。
+
+```python filename="count.py"
+text = "banana"
+counter = {}
+for ch in text:
+    counter[ch] = counter.get(ch, 0) + 1
+print(counter)   # {'b': 1, 'a': 3, 'n': 2}
+```
+
+## 元组：不能改的序列
+
+**元组**（tuple）和列表几乎一样，用圆括号书写，区别是创建后**不能修改**：
+
+```python filename="tuple.py"
+point = (3, 5)
+x, y = point          # 解包：一次性拆给两个变量
+print(x, y)           # 3 5
+# point[0] = 9        # 报错！元组不可修改
+```
+
+不可变是它的优点：坐标、颜色、配置这类"不该被改动"的数据，用元组更安全。
+
+## 集合：自动去重
+
+**集合**（set）里没有重复元素，也**没有顺序**：
+
+```python filename="set.py"
+nums = [1, 2, 2, 3, 3, 3]
+unique = set(nums)
+print(unique)          # {1, 2, 3}
+print(len(unique))     # 3
+
+unique.add(4)
+unique.discard(1)
+print(2 in unique)     # True，成员判断非常快
+```
+
+集合还擅长数学运算：`a & b` 交集、`a | b` 并集、`a - b` 差集。
+
+## 四种容器怎么选
+
+| 容器 | 语法 | 可变 | 适合场景 |
+|------|------|------|----------|
+| 列表 list | `[1, 2, 3]` | 是 | 有顺序的一串数据 |
+| 元组 tuple | `(1, 2, 3)` | 否 | 固定不变的组合数据 |
+| 字典 dict | `{"k": v}` | 是 | 按名字查找的数据 |
+| 集合 set | `{1, 2, 3}` | 是 | 去重、成员判断 |
+
+<FlashCard front="字典用 get 取值比方括号好在哪？" back="方括号取不存在的键会报 KeyError；get 可以返回默认值（不传则返回 None），程序不会中断，适合处理「可能没有」的数据。" />
+
+## 动手试一试
+
+1. 用字典描述一部手机（品牌、价格、颜色），改价格后再新增一个"内存"键。
+2. 统计句子 `"the quick brown fox jumps over the lazy dog"` 中每个单词出现的次数。
+3. 两个班级名单（有重复名字），用集合算出：总共有多少个不同的名字。
+
+<Quiz
+  question="d = {'a': 1, 'b': 2}，执行 d['c'] 会发生什么？"
+  options={["返回 None", "返回 0", "报 KeyError 错误", "自动创建 d['c']"]}
+  answer={2}
+  explanation="直接用方括号访问不存在的键会抛出 KeyError。安全的写法是 d.get('c')，得到 None 或指定的默认值。"
+/>

@@ -1,0 +1,127 @@
+---
+id: csharp-composition-dependency-injection
+title: 组合与依赖注入：装配、替身测试和生命周期
+description: 用告警规则与通知出口理解构造函数注入、手动装配、接口边界、容器生命周期及资源所有权。
+tags: [CSharp, OOP, 依赖注入, 测试, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 55
+prerequisite: [csharp-abstract-interfaces, csharp-constructors-invariants]
+related: [csharp-inheritance-polymorphism, csharp-exceptions-disposal, csharp-unit-tests-boundaries]
+---
+
+## 组合回答“这个对象需要谁”
+
+[抽象类与接口](/knowledge/programming/csharp/object-oriented/abstract-classes-and-interfaces/)篇已经用 `AnyRule` 组合规则；本篇进一步处理业务服务与外部依赖的连接。假设 `AlarmMonitor` 判断读数是否超限，并把告警送往控制台、邮件或其他出口。若它内部直接 `new ConsoleAlertSink()`，规则判断与输出方式绑在一起；测试只好拦截控制台，换通知方式也要改业务类。
+
+把依赖作为构造函数参数传入，叫**构造函数注入**。`AlarmMonitor` 只声明自己需要 `IAlarmRule` 与 `IAlertSink`，应用入口负责选择具体实现。这是对象**组合**与控制权的安排；即使完全不用 DI 容器，也已经是依赖注入。容器只是大型应用中帮助注册、创建和管理对象的工具，不是设计本身。
+
+## 接口放在有意义的替换边界
+
+规则可能有阈值、区间等实现；通知出口连接控制台、网络或数据库，还可能需要测试替身。这两个边界用接口有实际价值。相反，纯粹做一次计算、没有替换需要的小类，不必机械生成一个 `I同名类`。为了测试而把所有方法都做成接口，会让依赖图比业务本身更难理解。
+
+构造函数拒绝空依赖，让对象一创建就拥有运行所需的协作者。业务方法不在内部偷偷创建依赖，也不在每次调用时从全局 `IServiceProvider` 取对象；后者会隐藏真实依赖，令测试与生命周期追踪更困难。一次“装配”应集中在应用入口（composition root），业务对象只使用已传入的协作者。
+
+## 完整可运行例子
+
+示例先手动装配真实控制台出口，再以 `RecordingAlertSink` 替换出口验证告警数量与内容，不需要外部测试框架或容器包。以下整段可作为 .NET 10 控制台项目的 `Program.cs`：
+
+```csharp filename="Program.cs"
+var rule = new HighLimitRule(70);
+var production = new AlarmMonitor(rule, new ConsoleAlertSink());
+production.Observe(new Reading("pump-A", 72));
+
+var recorder = new RecordingAlertSink();
+var tested = new AlarmMonitor(rule, recorder);
+tested.Observe(new Reading("pump-B", 65));
+tested.Observe(new Reading("pump-B", 75));
+Require(recorder.Events.SequenceEqual([new Alert("pump-B", 75)]),
+    "只对超限读数通知一次");
+
+var stricter = new AlarmMonitor(new HighLimitRule(80), recorder);
+stricter.Observe(new Reading("pump-B", 75));
+Require(recorder.Events.Count == 1, "替换规则无需修改 AlarmMonitor");
+
+Console.WriteLine("组合与依赖替换断言通过。");
+
+static void Require(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+public sealed record Reading(string DeviceId, double Value);
+public sealed record Alert(string DeviceId, double Value);
+
+public interface IAlarmRule
+{
+    bool IsAlarm(double value);
+}
+
+public sealed class HighLimitRule(double limit) : IAlarmRule
+{
+    public bool IsAlarm(double value) => value >= limit;
+}
+
+public interface IAlertSink
+{
+    void Send(Alert alert);
+}
+
+public sealed class ConsoleAlertSink : IAlertSink
+{
+    public void Send(Alert alert) =>
+        Console.WriteLine($"告警：{alert.DeviceId} = {alert.Value}");
+}
+
+public sealed class RecordingAlertSink : IAlertSink
+{
+    public List<Alert> Events { get; } = [];
+    public void Send(Alert alert) => Events.Add(alert);
+}
+
+public sealed class AlarmMonitor
+{
+    private readonly IAlarmRule _rule;
+    private readonly IAlertSink _sink;
+
+    public AlarmMonitor(IAlarmRule rule, IAlertSink sink)
+    {
+        _rule = rule ?? throw new ArgumentNullException(nameof(rule));
+        _sink = sink ?? throw new ArgumentNullException(nameof(sink));
+    }
+
+    public void Observe(Reading reading)
+    {
+        ArgumentNullException.ThrowIfNull(reading);
+        if (_rule.IsAlarm(reading.Value))
+            _sink.Send(new Alert(reading.DeviceId, reading.Value));
+    }
+}
+```
+
+仓库项目可用 `dotnet run --project examples/csharp-composition-di/CompositionReview.csproj` 运行，正文完整代码块由 `npm run test:csharp-articles` 单独编译。示例刻意使用同步 `Send` 与控制台输出，突出依赖关系；真实邮件/网络发送通常应设计异步接口、取消与失败策略，并在输入边界验证设备 ID 和数值。[异常与资源释放](/knowledge/programming/csharp/reliability/exceptions-and-disposal/)篇可接着复习清理规则。
+
+## 手动装配与 DI 容器
+
+上面 `new AlarmMonitor(rule, sink)` 是最透明的装配方式。应用规模变大、依赖图复杂时，可在入口使用 .NET 的服务容器：把 `IAlarmRule`、`IAlertSink` 注册为具体实现，再让容器构造 `AlarmMonitor`。业务类本身不需要知道容器。容器还处理对象生命周期，但注册时必须说明：
+
+| 生命周期 | 大意 | 常见警惕 |
+| --- | --- | --- |
+| Transient | 每次解析创建新实例 | 频繁分配；可释放对象的实际释放时机仍由作用域决定 |
+| Scoped | 同一作用域内复用 | 不要从根容器解析，也不要注入单例使其被长期持有 |
+| Singleton | 整个容器期间复用 | 内部可变状态须考虑线程安全，不能持有短生命周期依赖 |
+
+“作用域”不是所有应用都有 HTTP 请求：在 Web 应用通常与请求关联，后台服务或桌面应用要自行建立合适边界。典型错误是把 scoped 的数据库上下文注入 singleton 告警服务；较长寿命对象会把短命依赖“俘获”到不合适的生命周期。容器创建的 `IDisposable`/`IAsyncDisposable` 服务由容器按生命周期清理；收到依赖的业务类通常不应擅自 `Dispose` 它。手动装配则由创建者明确负责清理。
+
+没有必要为这个小例子安装一个容器包。先画出依赖方向、测试接缝与所有权，再决定是否使用注册框架。若使用容器，开发时开启作用域验证，并用实际启动/集成测试检查注册遗漏；单元替身测试不能替代装配测试。
+
+## 自测与面试追问
+
+1. `AlarmMonitor` 直接在 `Observe` 里 `new ConsoleAlertSink()`，为什么会让测试和替换更难？
+2. 构造函数注入与 DI 容器是否是同一概念？上面不用容器仍算注入吗？
+3. 若 `IAlertSink` 是一个需要释放的网络连接，谁创建、谁释放？容器创建与手动创建有何差别？
+4. 为什么 singleton 持有 scoped 依赖有风险？在后台服务中怎样建立作用域？
+5. 为什么不必为每个无状态小类都创建同名接口？你会如何判断真实替换边界？
+
+参考：[Microsoft Learn：使用依赖注入](https://learn.microsoft.com/en-us/dotnet/core/extensions/dependency-injection/usage)、[DI 设计与释放指南](https://learn.microsoft.com/en-us/dotnet/core/extensions/dependency-injection-guidelines)、[服务生命周期](https://learn.microsoft.com/en-us/dotnet/core/extensions/dependency-injection/service-lifetimes)。

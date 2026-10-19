@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="..\wpf-async-readings\IReadingSource.cs" Link="IReadingSource.cs" />
+    <Compile Include="..\wpf-async-readings\ReadingSession.cs" Link="ReadingSession.cs" />
+    <Compile Include="..\wpf-async-readings\SimulatedReadingSource.cs" Link="SimulatedReadingSource.cs" />
+  </ItemGroup>
+</Project>

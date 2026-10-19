@@ -1,0 +1,92 @@
+---
+id: csharp-constructors-invariants
+title: 构造函数与对象不变量：从出生时就有效
+description: 理解构造重载、this/base 链、属性初始化与 required 的边界，用温度区间对象练习约束设计。
+tags: [CSharp, OOP, 构造函数, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-12"
+order: 20
+prerequisite: [csharp-classes-interfaces]
+related: [csharp-access-const-readonly, csharp-abstract-interfaces, csharp-nullable-contracts-flow]
+---
+
+## 构造函数解决什么问题
+
+对象不变量是“只要对象可被正常使用，就必须成立”的条件。例如告警区间必须满足下限小于上限。构造函数把必需数据和验证放在创建边界；把属性全部公开为 `set`，再依赖调用方记得调用 `Validate()`，会留下无效状态窗口。
+
+下面整段可作为 `Program.cs` 运行：
+
+```csharp filename="Program.cs"
+var range = new AlarmRange(10, 80);
+var defaultRange = new AlarmRange();
+Console.WriteLine(range.Contains(50));        // True
+Console.WriteLine(defaultRange.Contains(50)); // True
+
+public sealed class AlarmRange
+{
+    public double Minimum { get; }
+    public double Maximum { get; }
+
+    public AlarmRange() : this(0, 100) { }
+
+    public AlarmRange(double minimum, double maximum)
+    {
+        if (!double.IsFinite(minimum) || !double.IsFinite(maximum) || minimum >= maximum)
+            throw new ArgumentException("区间必须由两个有限值组成，且下限小于上限");
+
+        Minimum = minimum;
+        Maximum = maximum;
+    }
+
+    public bool Contains(double value) => value >= Minimum && value <= Maximum;
+}
+```
+
+`this(0, 100)` 让两个重载复用同一验证逻辑，避免默认构造函数忘记规则。为类显式声明有参构造函数后，编译器不会再自动补一个可用的无参构造函数；需要时像示例一样写出来。`get` 属性只能在构造阶段（或属性初始化器）赋值，调用者不能把已建立的区间改坏。
+
+## 继承链上的 `base(...)`
+
+派生类必须先让基类完成自身初始化。基类没有可访问无参构造函数时，派生构造函数需要显式指定 `base(...)`：
+
+```csharp filename="Program.cs"
+var rule = new HighAlarmRule("pump-A", 80);
+Console.WriteLine(rule.IsTriggered(85)); // True
+
+public abstract class DeviceRule
+{
+    protected DeviceRule(string deviceId)
+    {
+        DeviceId = !string.IsNullOrWhiteSpace(deviceId)
+            ? deviceId
+            : throw new ArgumentException("设备 ID 不能为空", nameof(deviceId));
+    }
+
+    public string DeviceId { get; }
+}
+
+public sealed class HighAlarmRule(string deviceId, double limit) : DeviceRule(deviceId)
+{
+    public bool IsTriggered(double value) => value >= limit;
+}
+```
+
+示例使用主构造函数语法；它不是省略基类初始化，而是把 `base(deviceId)` 写在类型声明处。真实业务还应检查 `limit` 是否为有限值。不要在基类构造函数中调用可重写的虚方法：派生类自己的初始化可能尚未完成。
+
+## `required` 与 `init` 能替代验证吗
+
+`required` 要求初始化器或带有相应契约的构造路径提供成员；`init` 限制赋值时机。它们适合表达“必须填”和“创建后不能直接再赋值”，但不能自动检查诸如 `Minimum < Maximum` 这样的跨字段关系。属性初始化器适合稳定默认值；需要共同验证多个值时，用构造函数或明确的工厂方法更直观。
+
+`static` 构造函数针对**类型**做一次性初始化，没有访问修饰符和参数，不负责每个对象的有效性。不要把 I/O 和难以恢复的副作用随意放在这里。
+
+## 面试自测与练习
+
+1. 为什么示例的无参构造函数委托给 `this(0, 100)`，而不是直接设置两个属性？
+2. 若 `DeviceRule` 只有 `DeviceRule(string)`，派生类省去 `base(deviceId)` 会怎样？
+3. 给 `AlarmRange` 增加 `ChangeLimits`，要求修改时同样保持不变量；解释为何分别公开两个 setter 不安全。
+
+验收标准：能画出基类与派生类初始化责任，并保证公开 API 不会产生半有效对象。
+
+## 参考
+
+[Microsoft Learn：构造函数](https://learn.microsoft.com/en-us/dotnet/csharp/programming-guide/classes-and-structs/constructors) · [required 修饰符](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/keywords/required)

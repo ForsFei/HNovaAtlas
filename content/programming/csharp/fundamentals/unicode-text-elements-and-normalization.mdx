@@ -1,0 +1,94 @@
+---
+id: csharp-unicode-text-elements-normalization
+title: Unicode 文本：char、Rune、文本元素与规范化
+description: 用补充平面字符和组合音调解释三种字符计数、切片边界及规范等价文本的比较契约。
+tags: [CSharp, Unicode, string, Rune, 文本, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 27
+prerequisite: [csharp-arrays-strings]
+related: [csharp-io-encoding-paths, csharp-collection-selection, csharp-numeric-parsing-rounding]
+---
+
+## “一个字符”至少可能指三件事
+
+[数组与字符串](/knowledge/programming/csharp/fundamentals/arrays-and-strings/)已经提醒：`string.Length` 统计的是 UTF-16 **代码单元**，不是用户眼中的字符数。C# 的 `char` 表示一个 16 位代码单元；一个超出基本多文种平面的 Unicode 标量值需要两个 `char`（一对代理项）。`Rune` 表示一个 Unicode 标量值，但“一个标量值”仍不等于“一个用户可见的文本元素”：基础字母和组合音调可以共同形成一个扩展字素簇。
+
+| 观察对象 | .NET 常用入口 | 例子中的差别 |
+| --- | --- | --- |
+| UTF-16 代码单元 | `string.Length`、`value[index]` | 🌹 占两个 `char` |
+| Unicode 标量值 | `Rune`、`EnumerateRunes()` | 🌹 是一个标量值；`e` 加组合音调是两个 |
+| 文本元素/扩展字素簇 | `StringInfo` | `e` 加组合音调是一个文本元素 |
+
+这些单位服务不同操作：协议按字节限额时要先确定编码；解析 Unicode 标量可用 `Rune`；向用户截取一段可见文本可考虑文本元素边界。**文本元素数也不等于显示宽度**：字体、排版和终端渲染另有规则。不要让一个叫 `characterCount` 的变量同时承担三种含义。
+
+## 可运行反例：切半代理对、拆开组合符
+
+下面是完整 `Program.cs`，仓库在 `examples/csharp-unicode-text` 提供相同示例。玫瑰字符用固定的 `\U0001F339` 写法，组合音调用 `\u0301`，因此断言不取决于源文件字体或当前区域性。示例只检验这些固定文本，不把任意输入的合法性、显示宽度或复杂 emoji 分段当作已解决问题。
+
+```csharp filename="Program.cs"
+using System.Globalization;
+using System.Text;
+
+string rose = "\U0001F339";
+Check(rose.Length == 2 && char.IsHighSurrogate(rose[0]) && char.IsLowSurrogate(rose[1]),
+    "a supplementary scalar uses two UTF-16 code units");
+Check(CountRunes(rose) == 1, "the rose is one Unicode scalar value");
+Check(new StringInfo(rose).LengthInTextElements == 1, "the rose is one text element");
+Check(char.IsHighSurrogate(rose[..1][0]), "cutting at one char leaves half a surrogate pair");
+
+string decomposed = "e\u0301";
+string composed = "\u00E9";
+Check(decomposed.Length == 2 && CountRunes(decomposed) == 2,
+    "base letter and combining mark are separate scalars");
+var text = new StringInfo(decomposed);
+Check(text.LengthInTextElements == 1 && text.SubstringByTextElements(0, 1) == decomposed,
+    "the base letter and mark form one text element");
+Check(!string.Equals(composed, decomposed, StringComparison.Ordinal),
+    "ordinal equality does not normalize different representations");
+Check(string.Equals(composed.Normalize(NormalizationForm.FormC),
+    decomposed.Normalize(NormalizationForm.FormC), StringComparison.Ordinal),
+    "Form C gives these canonically equivalent values the same representation");
+
+var keys = new HashSet<string>(StringComparer.Ordinal);
+Check(keys.Add(composed.Normalize(NormalizationForm.FormC)), "first normalized key is new");
+Check(!keys.Add(decomposed.Normalize(NormalizationForm.FormC)), "second normalized key matches");
+
+Console.WriteLine("UTF-16、Rune、文本元素与规范化断言全部通过。");
+
+static int CountRunes(string value)
+{
+    int count = 0;
+    foreach (Rune _ in value.EnumerateRunes()) count++;
+    return count;
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+```
+
+`rose[..1]` 是**错误截取方式的演示**：它按代码单元切出高代理项，得到不完整的文本；代码只检查该事实，不把残片送进编码或显示流程。对组合音调，按两个 `Rune` 处理虽然不拆坏 UTF-16，却仍可能把一个文本元素切开。`StringInfo.SubstringByTextElements` 在这里按文本元素提取完整的 `e` 加音调；这也说明“用 Rune 切片”不自动等于“用户可见字符切片”。
+
+## 规范等价、大小写与标识符是不同契约
+
+`"\u00E9"` 与 `"e\u0301"` 可以呈现为相同的字母，却是不同的代码单元序列，所以 `StringComparison.Ordinal` 判它们不相等。若业务规定规范等价文本视为同一标识，可在**输入边界**统一 `Normalize(NormalizationForm.FormC)`，存储和查询都按同一规则进行，再用 `StringComparer.Ordinal` 比较。示例的 `HashSet` 表明这种一致性，而不是要求所有字符串都先规范化。
+
+Unicode 规范化不是大小写折叠，也不会把所有外观相似的字形变成同一个值；更不能代替用户名防混淆、路径授权或安全审查。机器协议的 ID 可能恰恰要求逐字节/逐代码单元精确匹配，此时擅自规范化会改变协议语义。设计键时应先写明允许的字符集、大小写规则、是否规范化、版本迁移方式，再让输入、持久化与查询使用同一约定。跨运行时或 Unicode 数据版本的长期一致性也需要做兼容验证。
+
+文本编码是另一层：内存中的 `string` 单元数不能直接推出 UTF-8 文件长度。要将文本变成字节或处理非法编码输入，接着读[文本编码与路径](/knowledge/programming/csharp/io/encoding-and-paths/)；要将键放入字典，还要按[集合选型与相等性](/knowledge/programming/csharp/collections/collection-selection-and-equality/)选对 comparer 并保持键稳定。
+
+## 面试自测与练习
+
+1. 为什么 `"\U0001F339".Length` 是 2，而 `EnumerateRunes()` 只得到一个标量值？
+2. 为什么按 Rune 切片仍可能把 `"e\u0301"` 这个文本元素拆开？
+3. 两个看起来一样的用户名按 ordinal 不相等时，你会在什么边界决定是否规范化？为什么不能只在查询时做？
+4. 用 `StringInfo` 对固定短文本截取前一个文本元素；再试一个含多个 emoji 的字符串，并查证当前运行时的分段结果，不把一次观察推广成“所有字体下占一个格”。
+
+验收标准：能明确说出 `char`、`Rune`、文本元素和编码字节分别表示什么，运行 `dotnet run --project examples/csharp-unicode-text/UnicodeTextReview.csproj` 并解释每条断言。正文完整代码块由 `npm run test:csharp-articles` 单独编译。
+
+## 参考
+
+[Microsoft Learn：.NET 字符编码介绍](https://learn.microsoft.com/en-us/dotnet/standard/base-types/character-encoding-introduction) · [`StringInfo`](https://learn.microsoft.com/en-us/dotnet/api/system.globalization.stringinfo) · [`String.Normalize`](https://learn.microsoft.com/en-us/dotnet/api/system.string.normalize) · [字符串比较最佳实践](https://learn.microsoft.com/en-us/dotnet/standard/base-types/string-comparison-net-5-plus)

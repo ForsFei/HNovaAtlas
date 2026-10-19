@@ -1,0 +1,125 @@
+---
+id: csharp-nullable-contracts-flow
+title: 可空引用契约：让编译器理解你的校验
+description: 从分支流分析深入到 NotNullWhen、MemberNotNull 和运行时边界，避免用感叹号掩盖不变量。
+tags: [CSharp, 可空引用类型, 空值安全, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-13"
+order: 23
+prerequisite: [csharp-types-nullability]
+related: [csharp-constructors-invariants, csharp-json-contracts, csharp-exception-boundaries-filters]
+---
+
+## `string?` 是契约，不是运行时护身符
+
+[类型与空值安全](/knowledge/programming/csharp/fundamentals/types-and-nullability/)已解释 `string?`、`??`、`?.` 和 `!`。进一步写 API 时，关键不是把问号加满文件，而是明确**哪里允许缺失、校验成功后谁能保证非空**。启用 `<Nullable>enable</Nullable>` 后，编译器按控制流跟踪表达式是“已知非空”还是“可能为空”；它发出的是警告，标注并不会把 `string?` 变成另一个运行时类型，也不会自动检查从 JSON、数据库或反射进入的值。
+
+```csharp filename="FlowExample.cs"
+string? deviceId = Console.ReadLine();
+if (string.IsNullOrWhiteSpace(deviceId))
+    return;
+
+Console.WriteLine(deviceId.Trim()); // 经过检查，编译器知道这里非 null
+```
+
+如果把检查抽到自己的 `HasText` 方法里，普通 `bool` 返回值未必足以让调用者的流分析理解“返回 `true` 时参数非空”。这时用 `System.Diagnostics.CodeAnalysis` 中的属性声明**真实满足的后置条件**；不要用 `!` 单方面要求编译器闭嘴。
+
+## 条件后置条件：`NotNullWhen`
+
+`[NotNullWhen(true)]` 告诉编译器：方法返回 `true` 后，被标注的参数不是 null。它适合 `IsValid` 或 `TryXxx` 风格的方法。属性不是验证器——方法实现若错误地在输入为 null 时返回 `true`，运行时照样会出错。只在你能证明该条件始终成立时才标注。
+
+```csharp filename="TextRules.cs"
+using System.Diagnostics.CodeAnalysis;
+
+public static class TextRules
+{
+    public static bool HasText([NotNullWhen(true)] string? text) =>
+        !string.IsNullOrWhiteSpace(text);
+}
+```
+
+`NotNullWhen` 只说明非 null，不说明字符串已经去掉空格，也不保证符合设备 ID 的全部业务规则。因此调用方需要时仍要 `Trim` 和执行自己的格式验证。类似地，`[MaybeNullWhen(false)]` 常用于泛型 Try 模式的失败分支；这些标注描述返回值和参数之间的关系，不改变 CLR 对象模型。
+
+## 构造辅助方法：`MemberNotNull`
+
+构造函数里直接给非空字段赋值，编译器通常能看见；若赋值藏在自定义辅助方法中，编译器未必能推断该方法**正常返回后**字段已赋值。`[MemberNotNull(nameof(_deviceId))]` 向编译器表达这一保证。它仍不替代运行时守卫：若原始输入不合格，辅助方法必须抛异常或采取其他不会正常返回的路径。
+
+下面完整 `Program.cs` 同时验证条件检查、构造成功和运行时拒绝非法输入。仓库项目可用 `dotnet run --project examples/csharp-nullable-contracts/NullableContractsReview.csproj` 运行；项目把编译器警告当错误，因此属性用法也经过编译校验。
+
+```csharp filename="Program.cs"
+using System.Diagnostics.CodeAnalysis;
+
+string? candidate = " pump-A ";
+if (TextRules.HasText(candidate))
+    Check(candidate.Trim() == "pump-A", "成功检查后可安全访问");
+
+Check(!TextRules.HasText(null), "null 应检查失败");
+Check(!TextRules.HasText("   "), "空白应检查失败");
+
+var session = new DeviceSession(" pump-A ");
+Check(session.DeviceId == "pump-A", "构造时完成规范化");
+
+try
+{
+    _ = new DeviceSession(null);
+    throw new Exception("空值应在运行时被拒绝");
+}
+catch (ArgumentException ex) when (ex.ParamName == "raw") { }
+Console.WriteLine("可空契约断言通过");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new Exception(message);
+}
+
+public static class TextRules
+{
+    public static bool HasText([NotNullWhen(true)] string? text) =>
+        !string.IsNullOrWhiteSpace(text);
+}
+
+public sealed class DeviceSession
+{
+    private string _deviceId;
+
+    public DeviceSession(string? raw) => Initialize(raw);
+
+    public string DeviceId => _deviceId;
+
+    [MemberNotNull(nameof(_deviceId))]
+    private void Initialize(string? raw)
+    {
+        if (!TextRules.HasText(raw))
+            throw new ArgumentException("设备 ID 不能为空或空白。", nameof(raw));
+
+        _deviceId = raw.Trim();
+    }
+}
+```
+
+`MemberNotNull` 只保证方法**正常返回后**字段非空；抛异常的路径根本没有构造出可用对象。如果方法在某条正常返回路径忘了赋值，却照样标注，编译器会给出相应警告；即使能靠其他手段压掉警告，也会让调用方误信错误契约。简单构造函数优先直接赋值，不要为了展示属性而引入辅助方法。
+
+## `!`、`required` 与外部数据分别解决什么
+
+`value!.Length` 的后缀 `!` **只影响编译器分析**，不会插入 `if (value is null)`；判断错了仍会抛 `NullReferenceException`。它适合测试故意违反非空契约等极少数场景，不适合作为日常修复警告的通用按钮。
+
+```csharp filename="Counterexample.cs"
+string? missing = null;
+Console.WriteLine(missing!.Length); // 能压掉空值警告，运行时仍会抛异常
+```
+
+`required` 主要表达“创建对象时必须提供这个成员”，并不等同于“值非 null 且符合业务规则”。[JSON 契约与兼容](/knowledge/programming/csharp/collections/json-contracts/)已区分**属性缺失**、**显式 null**和**空白字符串**；`System.Text.Json` 可配置有限的非空标注运行时校验，但缺失与 null 是独立维度，业务上的非空白、长度或范围仍需验证。把“编译器已不警告”误读成“所有反序列化数据都安全”是常见面试误区。
+
+## 高频追问与练习
+
+1. `string?` 与 `string` 在运行时是否是不同 CLR 类型？为什么外部 JSON 仍能破坏你的预期？
+2. `HasText` 返回 `true` 后编译器为何允许访问 `candidate.Trim()`？若实现永远返回 `true`，属性会自动阻止 null 吗？
+3. `MemberNotNull` 标注的是方法返回前还是返回后？构造失败路径需要给 `_deviceId` 一个假值吗？
+4. `required string DeviceId`、`string? DeviceId`、`DeviceId!` 分别表达什么，哪个会做实际非空白校验？
+
+验收标准：能在启用 Nullable 且警告视为错误的项目中写出一个安全的校验辅助方法，并指出静态契约和运行时守卫各自负责哪一层。
+
+## 参考
+
+[Microsoft Learn：可空引用类型](https://learn.microsoft.com/en-us/dotnet/csharp/nullable-references) · [可空分析属性](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/attributes/nullable-analysis) · [空值运算符](https://learn.microsoft.com/en-us/dotnet/csharp/fundamentals/null-safety/null-operators) · [JSON 非空标注选项与限制](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/nullable-annotations)

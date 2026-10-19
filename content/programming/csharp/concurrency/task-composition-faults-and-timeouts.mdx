@@ -1,0 +1,106 @@
+---
+id: csharp-task-composition-faults-timeouts
+title: Task 组合：WhenAll、WhenAny 的故障与超时
+description: 用受控任务验证组合状态、多个异常、先完成任务与落败者、WaitAsync 超时后的原任务责任。
+tags: [CSharp, Task, WhenAll, WhenAny, 异步, 面试]
+difficulty: advanced
+status: published
+updated: "2026-10-13"
+order: 14
+prerequisite: [csharp-async-await]
+related: [csharp-task-vs-valuetask, csharp-cancellation-throttling, csharp-channel-failure-cancellation]
+---
+
+## 组合的是完成状态，不是任务所有权
+
+在 [`async / await` 入门](/knowledge/programming/csharp/concurrency/async-await/)中，我们先启动两个读取并使用 `Task.WhenAll` 等待。多任务组合的难处通常不是语法，而是一个任务失败、取消或超时后，**其余任务由谁继续管理**。`WhenAll`、`WhenAny` 和 `WaitAsync` 都不会替你设计兄弟任务的取消、清理或业务补偿。
+
+| 操作 | 等待何时结束 | 返回/抛出什么 | 其他原任务 |
+| --- | --- | --- | --- |
+| `WhenAll(tasks)` | 全部任务结束 | 全成功则给结果；有故障则故障；无故障但有取消则取消 | 不自动取消 |
+| `WhenAny(tasks)` | 任一任务结束 | 返回先完成的 **Task**，不直接展开其结果或异常 | 继续运行 |
+| `task.WaitAsync(timeout)` | 原任务结束或等待期限先到 | 原结果/故障，或等待层抛 `TimeoutException` | 超时后仍可运行 |
+
+这里“完成”包括成功、失败和取消。`WhenAll` 在首个故障出现后也要等其余任务终结；若其中某个任务永不结束，组合任务同样不会结束。多个输入任务失败时，组合任务的 `Exception.InnerExceptions` 包含聚合后的异常；但 `await` 抛出的通常只是其中一个异常，**不要**据此推断只有一个源失败。若既有故障又有取消，最终状态为故障；只有在无故障且至少一个取消时，组合状态才是取消。
+
+## 可重复运行的状态实验
+
+以下是完整 `Program.cs`，与 `examples/csharp-task-composition` 相同。`TaskCompletionSource<int>` 人工控制任务先后，不靠 `Task.Delay`、线程调度或计时推断结果。最后的 `TimeSpan.Zero` 只让一个尚未完成任务的等待层立即超时，专门验证原任务仍未被取消。
+
+```csharp filename="Program.cs"
+var first = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+var second = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+Task<int[]> all = Task.WhenAll(first.Task, second.Task);
+var firstError = new InvalidOperationException("source A failed");
+var secondError = new ApplicationException("source B failed");
+first.SetException(firstError);
+Check(!all.IsCompleted, "WhenAll waits for every task, even after a fault");
+second.SetException(secondError);
+try { await all; throw new Exception("expected a fault"); }
+catch (Exception error) when (ReferenceEquals(error, firstError) || ReferenceEquals(error, secondError)) { }
+if (!all.IsFaulted || all.Exception is not { InnerExceptions.Count: 2 } aggregate)
+    throw new InvalidOperationException("both faults are retained");
+Check(aggregate.InnerExceptions.Contains(firstError) && aggregate.InnerExceptions.Contains(secondError),
+    "the combined task exposes both source errors");
+
+using var canceledSource = new CancellationTokenSource();
+canceledSource.Cancel();
+Task<int> canceled = Task.FromCanceled<int>(canceledSource.Token);
+Task<int[]> canceledAll = Task.WhenAll(Task.FromResult(1), canceled);
+try { await canceledAll; throw new Exception("expected cancellation"); }
+catch (OperationCanceledException) { }
+Check(canceledAll.IsCanceled, "cancellation wins when there are no faults");
+Task<int[]> faultWins = Task.WhenAll(canceled, Task.FromException<int>(firstError));
+try { await faultWins; throw new Exception("expected a fault"); }
+catch (InvalidOperationException error) when (ReferenceEquals(error, firstError)) { }
+Check(faultWins.IsFaulted, "a fault takes precedence over cancellation");
+
+var winnerSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+var loserSource = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+Task<Task<int>> race = Task.WhenAny(winnerSource.Task, loserSource.Task);
+winnerSource.SetException(secondError);
+Task<int> winner = await race;
+Check(ReferenceEquals(winner, winnerSource.Task) && !loserSource.Task.IsCompleted,
+    "WhenAny returns the completed task and leaves the loser running");
+try { await winner; throw new Exception("expected winner fault"); }
+catch (ApplicationException error) when (ReferenceEquals(error, secondError)) { }
+loserSource.SetResult(8);
+Check(await loserSource.Task == 8, "the loser still needs an owner and observation");
+
+var slow = new TaskCompletionSource<int>(TaskCreationOptions.RunContinuationsAsynchronously);
+try { await slow.Task.WaitAsync(TimeSpan.Zero); throw new Exception("expected timeout"); }
+catch (TimeoutException) { }
+Check(!slow.Task.IsCompleted, "WaitAsync timeout does not stop the original task");
+slow.SetResult(9);
+Check(await slow.Task == 9, "the original task can still complete afterward");
+
+Console.WriteLine("WhenAll、WhenAny 与 WaitAsync 的状态断言全部通过。");
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+```
+
+第一组在 A 故障而 B 未结束时断言 `WhenAll` 仍未完成；B 也故障后，再检查组合任务中保留了两条异常。异常对象按身份比较，不依赖 `await` 选择抛出哪一条。取消组分别覆盖“无故障但有取消”和“故障与取消并存”的状态优先级。`Task.FromCanceled` 需要已取消的令牌，示例先调用了 `Cancel()`。
+
+`WhenAny` 的两层类型尤其容易看错：`await Task.WhenAny(Task<int>, Task<int>)` 得到的是 **`Task<int>`**，不是 `int`。外层成功完成只表示“找到赢家”；赢家本身可能故障或取消，仍须再 `await winner`。示例还显式完成并观察落败任务。在真实程序里，落败者可能正在访问网络或写文件；若决定不再需要它，必须按 API 契约请求取消、等待收尾并处理其结果，不能只丢掉引用。
+
+## 等待超时不等于操作取消
+
+`WaitAsync(TimeSpan)` 为**等待**加期限，不会自动给原任务发送取消请求。示例的 `slow.Task` 超时后仍处于未完成状态，稍后还能成功完成。若业务要求停止下载、数据库查询或后台处理，应把 `CancellationToken` 传给真正执行操作的 API，并明确超时后谁负责观察结束和清理。即便已请求取消，下游也可能不支持或未及时响应；不得仅因等待超时就宣布外部副作用不存在。
+
+多任务故障处理也要分层：调用方可在一个边界用 `WhenAll` 等全部结束，再检查组合状态与各源任务、记录必要的错误；不要用空 `catch` 把失败伪装成成功。示例中的空 `catch` 仅为断言预期异常，随后立即检查状态。若任务可能无限等待，先设计真正可执行的取消/完成协议；只在外面再套一个 `WaitAsync`，不会替它结束。
+
+## 面试自测与练习
+
+1. A 已故障、B 仍未完成时，`WhenAll(A, B)` 是否完成？B 后来取消时，组合状态是什么？
+2. `await Task.WhenAny(a, b)` 已返回，为什么仍需再 `await` 返回的任务？未返回的任务怎么办？
+3. `WaitAsync` 抛 `TimeoutException` 后，能否断定原任务已停止？如要停止真实 I/O，需要什么额外契约？
+4. 把示例中落败任务改为 `SetException`，请在退出前观察该异常；不要靠进程结束“清理”。
+
+验收标准：能画出三个 API 的等待层与原任务层，运行 `dotnet run --project examples/csharp-task-composition/TaskCompositionReview.csproj` 并解释每组状态断言。正文完整代码块由 `npm run test:csharp-articles` 单独编译。
+
+## 参考
+
+[Microsoft Learn：Task.WhenAll](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenall) · [Task.WhenAny](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenany) · [Task.WaitAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.waitasync)

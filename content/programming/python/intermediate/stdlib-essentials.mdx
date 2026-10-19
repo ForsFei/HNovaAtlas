@@ -1,0 +1,149 @@
+---
+id: python-stdlib-essentials
+title: 常用标准库实战
+description: 实战 pathlib、datetime、random、json 四个最常用的标准库模块。
+tags: [Python, 标准库, pathlib, json]
+difficulty: beginner
+status: draft
+updated: "2026-10-13"
+order: 40
+prerequisite: [python-oop-basics]
+---
+
+## 四个高频模块
+
+标准库几百个模块不用都学。日常脚本里出场率最高的四个：`pathlib`（路径）、`datetime`（时间）、`random`（随机）、`json`（数据交换）。这一篇用真实场景把每个都过一遍。
+
+## pathlib：现代路径处理
+
+字符串拼接路径麻烦又容易错（Windows 反斜杠、跨平台问题），`pathlib` 用对象的方式处理一切：
+
+```python filename="pathlib.py"
+from pathlib import Path
+
+# 当前目录下的 data 文件夹
+folder = Path("data")
+print(folder.exists())          # 目录是否存在
+folder.mkdir(exist_ok=True)     # 创建目录（已存在也不报错）
+
+file = folder / "notes.txt"     # 用 / 拼路径，跨平台安全
+print(file.name)                # notes.txt
+print(file.stem)                # notes（不带扩展名）
+print(file.suffix)              # .txt
+
+# pathlib 也能直接读写文件，with 都省了
+file.write_text("pathlib 写入的内容", encoding="utf-8")
+print(file.read_text(encoding="utf-8"))
+```
+
+<Callout type="tip" title="path 的选择">
+
+新代码一律用 `pathlib`。老代码里会遇到 `os.path.join()`、`os.listdir()`，读得懂即可。列出目录内容用 `Path("某目录").glob("*.txt")`，得到所有 txt 文件。
+
+</Callout>
+
+## datetime：日期与时间
+
+```python filename="datetime.py"
+from datetime import datetime, timedelta
+
+now = datetime.now()
+print(now)                      # 2026-10-13 14:30:00.123456
+print(now.year, now.month, now.day)
+
+# 格式化输出：%Y 年 %m 月 %d 日 %H 时 %M 分
+print(now.strftime("%Y-%m-%d"))      # 2026-10-13
+print(now.strftime("%H:%M"))         # 14:30
+
+# 把字符串解析成时间对象
+birthday = datetime.strptime("2010-05-01", "%Y-%m-%d")
+days = (now - birthday).days
+print(f"出生已经 {days} 天")
+
+# 时间加减
+later = now + timedelta(days=7)
+print(later.strftime("%Y-%m-%d"))    # 一周后
+```
+
+`strftime`（格式化输出）和 `strptime`（解析输入）是两个最常查的方法，用几次就记住了。
+
+## random：随机数
+
+```python filename="random.py"
+import random
+
+print(random.randint(1, 100))            # 随机整数（含两端）
+print(random.choice(["剪刀", "石头", "布"]))  # 随机选一个
+
+deck = list(range(1, 53))
+random.shuffle(deck)                     # 原地打乱列表（洗牌）
+print(deck[:5])                          # 抽五张
+
+print(random.sample(deck, 3))            # 不重复抽样三个
+```
+
+## json：结构化数据的通用语言
+
+JSON 是程序之间交换数据的事实标准（网页接口、配置文件都用它）。Python 的字典和 JSON 几乎一一对应：
+
+```python filename="json-basic.py"
+import json
+
+config = {"theme": "dark", "font_size": 14, "tags": ["python", "学习"]}
+
+# 字典 -> JSON 字符串（写入文件）
+text = json.dumps(config, ensure_ascii=False, indent=2)
+print(text)
+
+with open("config.json", "w", encoding="utf-8") as f:
+    json.dump(config, f, ensure_ascii=False, indent=2)
+
+# JSON 字符串/文件 -> 字典（读回来）
+with open("config.json", "r", encoding="utf-8") as f:
+    loaded = json.load(f)
+print(loaded["font_size"])       # 14
+```
+
+- `dumps` / `loads` 处理**字符串**（结尾的 s）
+- `dump` / `load` 直接读写**文件**
+- `ensure_ascii=False` 让中文原样保存而不是变成 `\uXXXX` 编码
+
+<FlashCard front="json.dump 和 json.dumps 的区别？" back="dumps 把字典转成 JSON 字符串（s 指 string）；dump 直接把字典写入打开的文件对象。读取方向对应 load / loads。" />
+
+## 综合小例子
+
+四个模块组合起来，就是一个能留下记录的小工具：
+
+```python filename="diary.py"
+from datetime import datetime
+from pathlib import Path
+import json
+
+log_file = Path("diary.json")
+
+entries = []
+if log_file.exists():                       # 有旧记录就先读回来
+    entries = json.loads(log_file.read_text(encoding="utf-8"))
+
+entries.append({"time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "text": "今天学会了 pathlib"})
+
+log_file.write_text(json.dumps(entries, ensure_ascii=False, indent=2),
+                    encoding="utf-8")
+print(f"已记录，共 {len(entries)} 条")
+```
+
+每次运行追加一条带时间戳的记录——变量消失、数据永存，这就是文件的意义。
+
+## 动手试一试
+
+1. 用 pathlib 列出某个文件夹里的所有 `.txt` 文件名。
+2. 计算距离今年结束还有多少天（提示：`timedelta` 与两个 `datetime` 相减）。
+3. 把第 5 阶段"待办清单"程序的数据改用 json 文件保存，让程序重启后清单还在。
+
+<Quiz
+  question="现在知道 json 里的键是「font_size」，哪个写法能正确读出配置文件里的值？"
+  options={["json.load(f)[「font_size」]", "json.loads(f)[「font_size」]", "json.load(f).font_size", "load(f)[font_size]"]}
+  answer={0}
+  explanation="load 读文件对象返回字典，再用方括号按键取值；loads 处理的是字符串而非文件；字典取值用方括号不能用点号。"
+/>

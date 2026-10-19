@@ -1,0 +1,46 @@
+---
+id: csharp-learning-path
+title: C# 系统学习路线
+description: 从第一个控制台程序走到类型、面向对象、集合、LINQ 与异步，按顺序学习并完成一个小项目。
+tags: [CSharp, .NET, 学习路线]
+difficulty: beginner
+status: published
+updated: "2026-10-13"
+order: 1
+related: [csharp-first-program, csharp-async-await]
+---
+
+## 这套课程适合谁
+
+如果你能使用文件夹和终端，但还没有系统写过 C#，从这里开始。课程默认使用现代 .NET SDK 的控制台项目，不要求先学 ASP.NET、Unity 或桌面 UI。已有其他语言经验的读者可以跳读语法，但建议亲手完成每章练习，因为 C# 的空值分析、接口、延迟查询和异步边界常与其他语言不同。
+
+目标不是背完语法，而是能独立写一个小型「设备读数分析器」：读取或构造数据、验证输入、按设备分组统计、妥善处理失败，并在需要 I/O 时使用异步。每章都用这个领域的简化片段；示例彼此独立，不需要先复制上一章代码才能运行。
+
+## 准备环境与学习方式
+
+安装 [.NET SDK](https://dotnet.microsoft.com/download)，在终端执行 `dotnet --version` 确认命令可用。教程示例使用通用 C# 语法；若 SDK/模板版本不同，生成的 `Program.cs` 可能多出或少了 `using`，不影响核心概念。每章的完整示例放进新建控制台项目的 `Program.cs`，运行后再改动输入观察结果。
+
+```text
+dotnet new console -n AtlasCSharp
+cd AtlasCSharp
+dotnet run
+```
+
+建议每章按「先预测输出 → 运行 → 改一个条件 → 做练习 → 用自己的话解释误区」走一遍。章节末尾的练习只给验收条件，不靠点亮进度条代替理解。
+
+## 推荐阅读顺序
+
+| 阶段 | 章节 | 学完能做什么 |
+| --- | --- | --- |
+| 1 基础 | [第一个程序](/knowledge/programming/csharp/fundamentals/first-program/) → [类型与空值](/knowledge/programming/csharp/fundamentals/types-and-nullability/) → [流程与方法](/knowledge/programming/csharp/fundamentals/control-flow-and-methods/) | 编译运行、选择合适类型、验证输入并拆分逻辑 |
+| 2 建模 | [类、记录与接口](/knowledge/programming/csharp/object-oriented/classes-and-interfaces/) | 把读数和规则表达为清晰的对象模型 |
+| 3 数据 | [集合与泛型](/knowledge/programming/csharp/collections/collections-and-generics/) → [LINQ](/knowledge/programming/csharp/collections/linq/) | 存放、查找、过滤、分组和汇总数据 |
+| 4 可靠性 | [异常与资源管理](/knowledge/programming/csharp/reliability/exceptions-and-disposal/) → [async / await](/knowledge/programming/csharp/concurrency/async-await/) | 区分预期失败与异常，安全释放资源，处理 I/O 等待 |
+
+仓库还附有一个可运行的设备读数分析示例：在项目根目录执行 `dotnet run --project examples/csharp-reading-analyzer/ReadingAnalyzer.csproj` 即可。它把解析、集合、LINQ 和错误报告串在一起；建议先自己实现，再对照代码。全部练习做完后，可尝试将内存数组改为文本文件：每行包含设备 ID、时间、数值；坏行要报告行号而非让整个程序悄悄退出。这是综合练习，不是进入下一章的前提。
+
+## 官方参考与延伸
+
+正文是为本站编写的原创教程，事实性规则以 [Microsoft Learn 的 C# 文档](https://learn.microsoft.com/en-us/dotnet/csharp/)为准；遇到编译器警告时，优先查该文档和错误编号。想要更系统地理解语言设计，可把 Jon Skeet 的 [《C# in Depth》第 4 版（出版社页面）](https://www.manning.com/books/c-sharp-in-depth-fourth-edition)作为进阶读物；该版出版较早，不能代替当前版本语言手册。初学阶段先完成本路线和官方练习，比同时堆积多本书更有效。
+
+完成第一遍学习后，转到[C# 复习章节总纲](/knowledge/programming/csharp/chapters/)：它按技术章节组织基础、进阶和面试追问。若在第一遍就想补足数组、字符串、模式匹配或表达式求值，可分别插读[数组与字符串](/knowledge/programming/csharp/fundamentals/arrays-and-strings/)、[模式匹配](/knowledge/programming/csharp/fundamentals/pattern-matching/)和[运算符与表达式求值](/knowledge/programming/csharp/fundamentals/operators-and-evaluation/)。

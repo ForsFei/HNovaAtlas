@@ -1,0 +1,115 @@
+---
+id: csharp-json-polymorphism-discriminators
+title: JSON 多态契约：类型辨别符与已知消息允许列表
+description: 用 System.Text.Json 显式登记两种设备消息，验证往返、未知类型、缺失字段与业务无效值。
+tags: [CSharp, JSON, 多态, 序列化, 面试]
+difficulty: intermediate
+status: published
+updated: "2026-10-14"
+order: 35
+prerequisite: [csharp-json-contracts, csharp-inheritance-polymorphism]
+related: [csharp-attributes-metadata, csharp-pattern-matching, csharp-exceptions-disposal]
+---
+
+## 同一个消息入口，不等于接受任意 .NET 类型
+
+设备接口可能在同一个 JSON 入口收到“温度读数”或“心跳”。只反序列化为一个基类，会丢失消息分支的明确契约；让外部 JSON 直接提供 .NET 类名并动态加载，又把类型选择交给了不可信输入。更稳妥的是**显式登记**允许的派生类型与稳定的线上辨别符：`temperature` 对应 `TemperatureMessage`，`heartbeat` 对应 `HeartbeatMessage`。辨别符是协议值，不是 C# 类名。
+
+下方完整 `Program.cs` 可运行：`dotnet run --project examples/csharp-json-polymorphism/JsonPolymorphismReview.csproj`。它断言两类消息、未知辨别符、缺少必需属性及业务无效值。
+
+```csharp filename="Program.cs"
+using System.Text.Json;
+using System.Text.Json.Serialization;
+
+DeviceMessage sent = new TemperatureMessage { DeviceId = "pump-A", Celsius = 72.5m };
+string json = JsonSerializer.Serialize<DeviceMessage>(sent);
+using (JsonDocument document = JsonDocument.Parse(json))
+    Check(document.RootElement.GetProperty("$kind").GetString() == "temperature",
+        "wire format has an explicit discriminator");
+
+DeviceMessage received = ReadAndValidate(json);
+Check(received is TemperatureMessage { DeviceId: "pump-A", Celsius: 72.5m },
+    "known kind round-trips to the declared subtype");
+
+DeviceMessage heartbeat = ReadAndValidate(
+    """{"$kind":"heartbeat","DeviceId":"pump-B","Sequence":3}""");
+Check(heartbeat is HeartbeatMessage { Sequence: 3 }, "second kind is selected");
+
+Expect<JsonException>(() => ReadAndValidate(
+    """{"$kind":"remote.type.Name","DeviceId":"pump-A"}"""));
+Expect<JsonException>(() => ReadAndValidate(
+    """{"$kind":"temperature","DeviceId":"pump-A"}"""));
+Expect<InvalidDataException>(() => ReadAndValidate(
+    """{"$kind":"temperature","DeviceId":" ","Celsius":72.5}"""));
+Console.WriteLine("JSON 类型允许列表、契约错误与业务校验断言全部通过。");
+
+static DeviceMessage ReadAndValidate(string json)
+{
+    DeviceMessage message = JsonSerializer.Deserialize<DeviceMessage>(json)
+        ?? throw new InvalidDataException("消息不能为 null");
+    return message switch
+    {
+        TemperatureMessage t when !string.IsNullOrWhiteSpace(t.DeviceId)
+            && t.Celsius is >= -100m and <= 200m => t,
+        HeartbeatMessage h when !string.IsNullOrWhiteSpace(h.DeviceId)
+            && h.Sequence >= 0 => h,
+        _ => throw new InvalidDataException("消息业务值无效")
+    };
+}
+
+static void Expect<TException>(Action action) where TException : Exception
+{
+    try { action(); }
+    catch (TException) { return; }
+    throw new InvalidOperationException($"预期 {typeof(TException).Name}");
+}
+
+static void Check(bool condition, string message)
+{
+    if (!condition) throw new InvalidOperationException(message);
+}
+
+[JsonPolymorphic(TypeDiscriminatorPropertyName = "$kind")]
+[JsonDerivedType(typeof(TemperatureMessage), "temperature")]
+[JsonDerivedType(typeof(HeartbeatMessage), "heartbeat")]
+public abstract record DeviceMessage;
+
+public sealed record TemperatureMessage : DeviceMessage
+{
+    public required string DeviceId { get; init; }
+    public required decimal Celsius { get; init; }
+}
+
+public sealed record HeartbeatMessage : DeviceMessage
+{
+    public required string DeviceId { get; init; }
+    public required int Sequence { get; init; }
+}
+```
+
+## 分清三层判断
+
+第一层是**派生类型选择**。`[JsonDerivedType]` 是允许列表；`$kind` 只可选到配置过的类型，`remote.type.Name` 在本例报 `JsonException`，不会据字符串去加载某个类。序列化根值时显式用 `Serialize<DeviceMessage>`，让基类的多态配置参与协议输出。不同静态类型的序列化调用可能不走同一个契约，协议测试必须覆盖真实的调用入口。
+
+第二层是**格式和字段契约**。`required` 使缺少 `Celsius` 的温度消息报错，但 `DeviceId` 属性出现且为 `null` 或空白，并不因此自动满足业务要求。反序列化返回 `null`（如顶层 JSON 为 `null`）也要单独处理。
+
+第三层是**业务校验**。`ReadAndValidate` 按实际派生类型检查设备 ID、温度范围和心跳序号，再把有效消息交给后续业务。是否接受 -100～200°C 是示例协议，不是所有设备的通用事实；真实范围应由设备和产品规则决定。类型允许列表限制了对象形状，但不是身份认证、授权、内容长度限制或业务安全审查。
+
+## 版本演进与边界
+
+添加第三种消息时，需要同步约定新辨别符，并考虑旧客户端看到它时是拒绝、降级还是由上层转发。直接重命名 `temperature` 会破坏既有线上数据，即使 C# 类名没有变化。默认情况下，辨别符等元数据应放在 JSON 对象开头；若外部协议不能保证顺序，可使用相应选项允许乱序，但流式读取大对象可能需要额外缓冲，不能不经评估就打开。
+
+若消息量大，还要在读取层限制总字节数与深度，防止“类型合法”却消耗过多资源。本例用内存字符串聚焦多态映射，不是完整的不可信网络输入处理器。序列化能往返也不代表双向版本兼容：新旧版本必须分别测试必需字段、未知种类和业务默认值。
+
+## 面试自测与练习
+
+1. `JsonSerializer.Deserialize<DeviceMessage>` 为什么能得到 `TemperatureMessage`？若移除它的 `[JsonDerivedType]` 映射会怎样？
+2. 把 JSON 的 `Celsius` 删除，与保留 `Celsius` 但把 `DeviceId` 改为空白，分别在哪一层失败？
+3. 为什么不能把 `$kind` 直接当 `Type.GetType(...)` 的输入？显式映射之外还缺哪些输入控制？
+4. 服务端加入 `battery` 新种类后，旧客户端收到它应该如何处理？这项行为应由哪份协议明确？
+
+验收标准：能分清辨别符映射、字段契约、业务校验和授权；能为未知消息种类设计可测试的版本策略。
+
+## 参考
+
+[Microsoft Learn：System.Text.Json 多态序列化](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json-polymorphism) · [必需属性](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/required-properties)
