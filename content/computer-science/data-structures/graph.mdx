@@ -1,0 +1,129 @@
+---
+id: ds-graph
+title: 图
+description: 用社交网络和地铁图理解"多对多"的关系网，学会广度优先与深度优先两把万能钥匙。
+tags: [数据结构, 图, BFS, DFS]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 60
+prerequisite: [ds-tree]
+related: [ds-summary, co-overview]
+---
+
+## 当关系不再有上下级
+
+树管层级（一父多子），但现实里大量关系是**多对多**的：
+
+- 社交网络：你和我互关，我和他还互关，没有谁是谁的上级
+- 地铁图：站点两两相连，线路交错成网
+- 朋友圈：你认识的人，可能恰好也认识另一个你认识的人
+
+这种"随便谁都能和谁有联系"的网状关系，用**图**（graph）表达：节点代表事物，边代表联系。
+
+```mermaid
+flowchart LR
+  A["你"] --- B["小明"]
+  A --- C["小红"]
+  B --- D["小刚"]
+  C --- D
+  D --- E["陌生人"]
+```
+
+两个小变化就能表达更多含义：边加箭头 = **有向图**（关注是单向的，"我关注他"不代表反向）；边标数字 = **带权图**（地铁两站之间的时间、城市间的距离）。
+
+## 怎么存一张图
+
+最常用的两种存法（Python 直觉版）：
+
+```python filename="represent.py"
+# 存法一：邻接表 —— 每个人记自己的好友名单（省空间，最常用）
+friends = {
+    "你": ["小明", "小红"],
+    "小明": ["你", "小刚"],
+    "小红": ["你", "小刚"],
+    "小刚": ["小明", "小红", "陌生人"],
+    "陌生人": ["小刚"],
+}
+
+# 存法二：邻接矩阵 —— 大表格记录两两之间有没有边（查"直连吗"快，但费空间）
+```
+
+选哪个的直觉：社交网络人很多但好友相对少，用邻接表；两两关系密集的小网络，矩阵也行。
+
+## BFS：一圈圈扩散找最近
+
+问题："你"和"陌生人"之间最少经过几个人？
+
+**广度优先搜索**（BFS）的思路是涟漪：先查所有一度好友（最近的），再查二度（好友的好友），一圈一圈往外扩——**第一次碰到目标时的圈数，就是最短距离**。
+
+```python filename="bfs.py"
+from collections import deque
+
+def shortest_steps(friends, start, target):
+    queue = deque([(start, 0)])        # (人, 距离)
+    visited = {start}                  # 查过的人不再查
+    while queue:
+        person, dist = queue.popleft() # 队列：先查近的
+        if person == target:
+            return dist
+        for friend in friends[person]:
+            if friend not in visited:
+                visited.add(friend)
+                queue.append((friend, dist + 1))
+    return -1                          # 整个网络都不通
+
+print(shortest_steps(friends, "你", "陌生人"))    # 3
+```
+
+三个前几篇的主角在这里会师：
+
+- **队列**驱动 BFS——先入队的先处理，保证按圈扩散（栈队列篇）
+- **哈希集合**记录访问过的人，O(1) 去重，防止在环里绕死（哈希表篇）
+- 每个人只进队一次，所以总步数正比于人数加边数
+
+## DFS：一条道走到黑
+
+**深度优先搜索**（DFS）是另一种遍历法：沿着一条路一直走到底，撞墙退回来换条路。用栈（或函数递归）实现：
+
+```python filename="dfs.py"
+def dfs_all(friends, start):
+    visited = set()
+    def visit(person):
+        visited.add(person)
+        for friend in friends[person]:
+            if friend not in visited:
+                visit(friend)
+    visit(start)
+    return visited
+
+print(len(dfs_all(friends, "你")))    # 5，全网络都可达
+```
+
+| | BFS | DFS |
+|---|-----|-----|
+| 用什么驱动 | 队列 | 栈 / 递归 |
+| 走法 | 一圈圈扩散 | 一条道走到黑 |
+| 找"最少步数" | ✔ 天生擅长 | ✘ 不保证 |
+| 典型任务 | 最短路径、层级遍历 | 找所有连通处、迷宫探路、走迷宫 |
+
+<Callout type="tip" title="两把钥匙，开遍天下">
+
+地图导航找最快路线、社交软件推"可能认识的人"、爬虫按层抓取、编译器分析代码依赖——底层全是 BFS/DFS 的变体。图遍历是算法世界里性价比最高的投入之一：学会这两把钥匙，一大片问题从"无从下手"变成"套模板"。
+
+</Callout>
+
+<FlashCard front="BFS 为什么能保证找到最短路径？" back="它用队列按距离从近到远逐层扩散，第一次碰到目标时走的圈数一定最少。用栈驱动的 DFS 走法是随机的深度优先，不保证短。" />
+
+## 动手试一试
+
+1. 给上面的 `friends` 图加一条"你"→"小刚"的边，再跑 `shortest_steps`，看看最短距离怎么变。
+2. 用 BFS 在图里数一数"你"的三度好友以内一共多少人。
+3. 思考：地铁 App 的"换乘最少"和"站数最少"分别适合怎么给边设权？
+
+<Quiz
+  question="BFS 里如果忘了维护 visited 集合，会发生什么？"
+  options={["只会变慢一点", "在环形的图里永远绕圈，程序停不下来", "自动跳过重复节点", "结果不变，只是慢"]}
+  answer={1}
+  explanation="图里有环（你→小明→小刚→你），不记录访问过的节点就会无限重访。visited 是图遍历的刹车，树不需要它（树没有环），图必须有。"
+/>

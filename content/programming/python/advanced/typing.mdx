@@ -1,0 +1,125 @@
+---
+id: python-typing
+title: 类型注解
+description: 用类型注解写出自解释的函数签名，配合编辑器提前发现错误。
+tags: [Python, 类型注解, typing]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 50
+prerequisite: [python-functions-advanced]
+related: [python-testing, python-venv-projects]
+---
+
+## 给代码加上"说明书"
+
+函数没人记得住细节：
+
+```python filename="mystery.py"
+def process(data, mode):      # data 是什么类型？mode 有哪些值？
+    ...
+```
+
+**类型注解**（type hints）把答案写在签名里：
+
+```python filename="annotated.py"
+def process(data: list[str], mode: str = "upper") -> list[str]:
+    return [item.upper() for item in data] if mode == "upper" else data
+```
+
+读法：接收字符串列表和一个字符串参数，返回字符串列表。
+
+<Callout type="info" title="注解不是强制检查">
+
+Python 运行时**不会**因为类型不符而报错——注解是写给人、编辑器和检查工具看的。它的价值在于：编辑器自动补全、传错参数立刻画波浪线、团队协作时接口不言自明。现代 Python 项目（尤其配合 mypy / pyright）几乎都在用。
+
+</Callout>
+
+## 基础注解语法
+
+变量、参数、返回值都可以注解：
+
+```python filename="basics.py"
+name: str = "小明"
+age: int = 12
+scores: list[float] = [92.5, 88.0]
+info: dict[str, int] = {"数学": 92, "英语": 88}
+unique: set[str] = {"a", "b"}
+
+def greet(name: str) -> str:
+    return f"你好，{name}"
+```
+
+内置容器直接写 `list[str]`、`dict[str, int]`（Python 3.9+ 语法），不需要从 typing 导入。
+
+## 组合类型：Optional 与 Union
+
+"可能没有"和"多选一"用 `|` 表达：
+
+```python filename="union.py"
+def find_user(user_id: int) -> dict | None:      # 找得到返回字典，找不到返回 None
+    ...
+
+def parse(value: str | int) -> int:              # 接受字符串或整数
+    return int(value)
+
+# 默认值与 None 的组合最常见
+def load_config(path: str, fallback: dict | None = None) -> dict:
+    ...
+```
+
+`dict | None` 旧写法是 `Optional[dict]`，读老代码要认识，新代码一律用 `|`。
+
+## 给类和复杂结构注解
+
+自定义类的实例就写类名；固定结构的字典用 `TypedDict` 描述：
+
+```python filename="classes.py"
+class Student:
+    def __init__(self, name: str, score: float) -> None:
+        self.name = name
+        self.score = score
+
+    def passed(self) -> bool:
+        return self.score >= 60
+
+def best(students: list[Student]) -> Student | None:
+    return max(students, key=lambda s: s.score) if students else None
+```
+
+返回 `None` 的函数注解 `-> None`——它声明"这个函数没有产出"，正是零基础系列里 print 与 return 之辨的正式表达。
+
+## 编辑器的即时反馈
+
+注解配现代编辑器（VS Code + Pylance），错误在保存前就暴露：
+
+```python filename="mistake.py"
+def add(a: int, b: int) -> int:
+    return a + b
+
+add("3", 4)        # 编辑器立刻标红：str 不能传给 int 参数
+result: int = add(1, 2)
+result.upper()     # 编辑器标红：int 没有 upper 方法
+```
+
+想全项目强制检查，安装静态检查器跑一遍（CI 里也常见）：
+
+```bash filename="命令行"
+pip install mypy
+mypy your_project/
+```
+
+<FlashCard front="def f(x) -> None 声明了什么？" back="函数没有返回值（没有 return 或只写 return）。-> None 是给调用者的承诺：别指望接住结果。" />
+
+## 动手试一试
+
+1. 给零基础系列写的 `safe_divide(a, b)` 加上完整注解（注意除零返回 None 的情况，返回类型怎么写？）。
+2. 写函数 `word_counts(text: str) -> dict[str, int]`，实现后加注解，故意传个 list 看编辑器反应。
+3. 给自己的 todo-cli 项目里的函数批量补上注解，感受代码"自动生成说明书"的过程。
+
+<Quiz
+  question="def parse(value: str | int) -> int 中 | 的含义是？"
+  options={["按位或运算", "类型联合：可以是 str 或 int", "返回值默认值", "旧版 Python 语法"]}
+  answer={1}
+  explanation="| 在类型注解里表示联合类型（Python 3.10+），value 可以是 str 或 int，最终都返回 int。旧写法 Union[str, int]。"
+/>

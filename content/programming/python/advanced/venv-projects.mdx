@@ -1,0 +1,127 @@
+---
+id: python-venv-projects
+title: 虚拟环境与项目工程化
+description: 学会用 venv 隔离项目依赖，组织规范的目录结构，写出可交付的 Python 项目。
+tags: [Python, venv, 虚拟环境, 项目结构]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 60
+prerequisite: [python-typing]
+related: [python-testing, python-data-pandas]
+---
+
+## 为什么需要虚拟环境
+
+你已经装过 `pip install requests`。问题来了：项目 A 要 `requests 2.31`，项目 B 只兼容 `requests 2.25`——都装进全局环境必然打架。**虚拟环境**（venv）给每个项目一个独立、隔离的依赖空间，互不干扰。
+
+这是从"写脚本"到"做项目"的分水岭：**依赖跟着项目走，而不是跟着机器走**。
+
+## 创建与使用 venv
+
+```bash filename="命令行"
+cd my-project
+python -m venv .venv          # 在项目里创建虚拟环境（目录名习惯 .venv）
+```
+
+激活它——之后 `python` 和 `pip` 都指向这个隔离环境：
+
+```bash filename="PowerShell（Windows）"
+.venv\Scripts\Activate.ps1
+```
+
+```bash filename="bash（macOS / Linux）"
+source .venv/bin/activate
+```
+
+激活成功后命令行前面会出现 `(.venv)` 标记。然后正常安装依赖：
+
+```bash filename="命令行"
+(.venv) pip install requests
+(.venv) pip list              # 只看到这个环境里的包
+deactivate                    # 退出虚拟环境
+```
+
+<Callout type="warning" title="三个常见坑">
+
+1. **没激活就 pip install**：包装进了全局环境，等于白隔离。
+2. **PowerShell 激活脚本报错**：执行策略限制，管理员身份运行 `Set-ExecutionPolicy RemoteSigned CurrentUser` 一次即可。
+3. **.venv 提交进 Git**：它体积大且与机器绑定，必须写进 `.gitignore`。
+
+</Callout>
+
+## requirements.txt：依赖清单
+
+把环境"配方"导出成文件，别人（或三个月后的你）一条命令复原：
+
+```bash filename="命令行"
+(.venv) pip freeze > requirements.txt        # 导出当前依赖及版本
+```
+
+```text filename="requirements.txt"
+requests==2.32.3
+pandas==2.2.2
+```
+
+```bash filename="命令行"
+python -m venv .venv                          # 新机器上：建环境
+.venv\Scripts\Activate.ps1                    # 激活
+pip install -r requirements.txt               # 一条命令复原全部依赖
+```
+
+## 规范的项目结构
+
+一个可交付的小项目长这样：
+
+```text
+todo-app/
+├── .venv/               # 虚拟环境（不进 Git）
+├── src/
+│   └── todo/
+│       ├── __init__.py
+│       ├── storage.py   # 存储层
+│       └── cli.py       # 命令行入口
+├── tests/
+│   └── test_storage.py  # 测试
+├── requirements.txt     # 依赖清单
+├── .gitignore           # 忽略 .venv、__pycache__ 等
+└── README.md            # 怎么安装、怎么运行
+```
+
+几条心法：
+
+- **源码放 `src/`，测试放 `tests/`**，不混在一起
+- `__init__.py` 让目录成为包，`from todo.storage import load_tasks` 这样跨文件导入
+- `.gitignore` 至少包含 `.venv/`、`__pycache__/`、`.pytest_cache/`
+
+<Callout type="tip" title="零基础系列的 todo-cli 就是练习对象">
+
+把待办清单项目按这个结构重组：storage 函数独立成模块、加 requirements.txt、写 README。做完你会对"项目"二字有实感。
+
+</Callout>
+
+## uv：更快的新工具（了解即可）
+
+社区正在拥抱更快的包管理工具 `uv`：创建环境、装依赖、锁版本一条龙，速度比 pip 快一个量级：
+
+```bash filename="命令行"
+uv venv                       # 建环境
+uv pip install requests       # 装依赖
+```
+
+初学阶段先用 venv + pip 打牢概念，uv 的命令一看就懂，随时可切换。
+
+<FlashCard front="虚拟环境解决什么问题？" back="让每个项目拥有独立、互不冲突的依赖集合，并且通过 requirements.txt 把依赖清单随项目分享，任何机器都能复原同样的环境。" />
+
+## 动手试一试
+
+1. 给 todo-cli 建虚拟环境，把用到的标准库以外依赖（如果暂时没有就装 requests 练手）导出成 requirements.txt。
+2. 按 src/ + tests/ 结构重组项目，确认 `python -m todo.cli` 能跑。
+3. 写一个最简 `.gitignore` 和 README（安装三步走），把项目交给一个月后的自己。
+
+<Quiz
+  question="把 .venv 目录提交到 Git 会有什么问题？"
+  options={["没有问题，更完整", "体积巨大且包含机器相关路径，别人无法直接使用", "Git 会自动忽略它", "只会拖慢 clone，无其他影响"]}
+  answer={1}
+  explanation=".venv 是本机生成的二进制依赖集合，几百 MB 起步、含绝对路径。正确做法是提交 requirements.txt，让每个人自己创建环境安装。"
+/>

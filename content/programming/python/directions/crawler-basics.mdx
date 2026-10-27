@@ -1,0 +1,154 @@
+---
+id: python-crawler-basics
+title: 爬虫入门
+description: 用 requests 获取网页数据，理解 HTTP 响应、JSON 接口与采集的合规边界。
+tags: [Python, 爬虫, requests, HTTP]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 20
+prerequisite: [python-directions-roadmap]
+related: [python-generators, python-data-pandas]
+---
+
+## 爬虫在做什么
+
+浏览器打开网页时做的事：向服务器发一个 **HTTP 请求**，拿到 HTML/JSON，渲染出来。爬虫就是用代码做前两步——**发请求、取数据**，跳过渲染，把关心的内容提取出来。
+
+## requests：发请求
+
+```bash filename="命令行"
+pip install requests
+```
+
+```python filename="get.py"
+import requests
+
+response = requests.get("https://httpbin.org/get", timeout=10)
+print(response.status_code)     # 200 表示成功
+print(response.headers["content-type"])
+print(response.text[:200])      # 响应正文（前 200 字符）
+```
+
+三件事必看：**状态码**（200 成功、404 没这页、403 拒绝访问、429 请求太频繁）、**类型**（HTML 还是 JSON）、**正文**。
+
+`timeout=10` 是纪律：不给超时的网络程序，迟早卡死。
+
+## 带 URL 参数与请求头
+
+查询参数不必手工拼进网址，用 `params` 传：
+
+```python filename="params.py"
+import requests
+
+response = requests.get(
+    "https://httpbin.org/get",
+    params={"q": "python", "page": 1},     # 变成 ?q=python&page=1
+    timeout=10,
+)
+print(response.url)
+```
+
+很多网站会给"浏览器"正常响应、给"裸脚本"吃闭门羹——通过**请求头**声明自己的身份：
+
+```python filename="headers.py"
+import requests
+
+headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+response = requests.get("https://httpbin.org/user-agent", headers=headers, timeout=10)
+```
+
+<Callout type="info" title="USER-AGENT 的分寸">
+
+设置正常的 User-Agent 是合理做法（很多网站默认屏蔽非常见标识）。但**伪造登录态、绕过验证码、破解付费墙**是另一回事——那是入侵，不是爬虫。
+
+</Callout>
+
+## 解析 HTML
+
+HTML 是结构化文本，用 BeautifulSoup 提取内容：
+
+```bash filename="命令行"
+pip install beautifulsoup4
+```
+
+```python filename="parse.py"
+import requests
+from bs4 import BeautifulSoup
+
+response = requests.get("https://example.com", timeout=10)
+soup = BeautifulSoup(response.text, "html.parser")
+
+print(soup.title.string)             # 页面标题
+heading = soup.find("h1")            # 第一个 h1 标签
+print(heading.text)
+
+# 所有链接
+for link in soup.find_all("a")[:3]:
+    print(link.get("href"))
+```
+
+`find` / `find_all` 按**标签名**、**class**、**id** 定位元素，配合 CSS 选择器（`soup.select("div.content a")`）能覆盖绝大多数提取需求。
+
+## 优先找 JSON 接口
+
+现代网站的页面数据往往来自**接口**（返回 JSON 的地址），比解析 HTML 干净得多。在浏览器按 F12 打开开发者工具 → Network（网络）标签 → 刷新页面，观察 XHR/Fetch 请求，常能直接找到数据源：
+
+```python filename="api.py"
+import requests
+
+response = requests.get(
+    "https://api.github.com/repos/python/cpython",
+    timeout=10,
+)
+data = response.json()               # JSON 直接变字典
+print(data["stargazers_count"])      # star 数
+```
+
+`response.json()` 是 requests 的内置 JSON 解析。能用接口就别解析 HTML——稳定且不怕页面改版。
+
+## 分页与礼貌采集
+
+翻页通常是 `params` 里改 `page`：
+
+```python filename="pages.py"
+import requests
+import time
+
+all_items = []
+for page in range(1, 4):
+    response = requests.get(
+        "https://api.github.com/search/repositories",
+        params={"q": "python", "page": page, "per_page": 30},
+        timeout=10,
+    )
+    all_items.extend(response.json()["items"])
+    time.sleep(1)                    # 每页之间歇一秒
+print(len(all_items))
+```
+
+<Callout type="danger" title="采集的合规边界">
+
+1. **先看 robots.txt**（如 `example.com/robots.txt`）：网站声明了哪些路径欢迎/禁止爬取，遵守它。
+2. **控制频率**：加 `time.sleep`，别把别人的服务器当自家缓存打（429 就是警告）。
+3. **只采公开数据**：需要登录才能看的、明确禁止采集的，不碰。
+4. **尊重版权与隐私**：收集来的数据用途要正当，个人隐私信息不存储不传播。
+
+合法合规的爬虫是效率工具；越界的爬虫是法律风险。
+
+</Callout>
+
+<FlashCard front="403 和 429 状态码分别意味着什么？" back="403 Forbidden：服务器拒绝访问，常见于缺少合理请求头或该路径禁止访问；429 Too Many Requests：请求太频繁被限流，应降低频率并稍后重试。" />
+
+## 动手试一试
+
+1. 请求 `https://api.github.com/search/repositories?q=python`，打印前五个仓库的名字和 star 数。
+2. 抓取一个允许采集的网页（如 example.com），用 BeautifulSoup 列出所有标题。
+3. 给第 1 题加上分页（3 页）和每页 1 秒间隔，感受"礼貌采集"的节奏。
+
+<Quiz
+  question="response.json() 抛出 JSONDecodeError，最可能的原因是？"
+  options={["网络超时", "响应不是 JSON（可能是 HTML 错误页）", "状态码是 200", "没设 User-Agent"]}
+  answer={1}
+  explanation="json() 只能解析 JSON 正文。接口报错时常返回 HTML 错误页，所以稳妥写法是先检查 status_code == 200 和 content-type 再解析。"
+/>

@@ -1,0 +1,169 @@
+---
+id: python-functions-advanced
+title: 函数进阶
+description: 掌握可变参数、关键字参数、lambda 与作用域规则，写出接口更灵活的函数。
+tags: [Python, 函数, lambda, 作用域]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 20
+prerequisite: [python-comprehensions]
+related: [python-decorators, python-typing]
+---
+
+## 参数的完整形态
+
+零基础阶段学的参数是"按位置传、可给默认值"。真实的标准库函数远比这灵活——`print("a", "b", "c", sep="-")` 能接受任意多个位置参数，还有可选的关键字配置。本篇补齐这套语法。
+
+## *args：任意多个位置参数
+
+参数名前加 `*`，多余的**位置参数**会打包成一个元组：
+
+```python filename="args.py"
+def total(*numbers):
+    print(numbers)                # 元组
+    return sum(numbers)
+
+print(total(1, 2))                # (1, 2)  -> 3
+print(total(1, 2, 3, 4, 5))       # (1, 2, 3, 4, 5) -> 15
+```
+
+名字 `numbers` 随便起，`*` 才是语法。典型用途：`max(*values)`、日志格式化等"数量不定"的场景。
+
+## **kwargs：任意多个关键字参数
+
+参数名前加 `**`，多余的**关键字参数**打包成字典：
+
+```python filename="kwargs.py"
+def describe(**info):
+    for key, value in info.items():
+        print(f"{key}: {value}")
+
+describe(name="小明", age=12, city="北京")
+# name: 小明
+# age: 12
+# city: 北京
+```
+
+两者可以组合，习惯顺序是：普通参数、`*args`、关键字参数、`**kwargs`：
+
+```python filename="full-form.py"
+def report(title, *tags, level="info", **extra):
+    print(title, tags, level, extra)
+
+report("部署完成", "web", "prod", level="warning", duration=32)
+# 部署完成 ('web', 'prod') warning {'duration': 32}
+```
+
+<Callout type="info" title="解包：反向操作">
+
+`*` 和 `**` 也能在**调用时**用，把序列/字典拆开塞进参数：
+
+```python
+def point(x, y, z): ...
+coords = [1, 2, 3]
+point(*coords)          # 等价于 point(1, 2, 3)
+
+settings = {"level": "info"}
+report("标题", **settings)   # 等价于 report("标题", level="info")
+```
+
+这招在"参数存在列表/字典里"时非常好用。
+
+</Callout>
+
+## lambda：一行的小函数
+
+`lambda 参数: 表达式` 定义一个没有名字的即时小函数，专为"当参数传"而生：
+
+```python filename="lambda.py"
+people = [("小明", 92), ("小红", 85), ("小刚", 77)]
+
+by_score = sorted(people, key=lambda p: p[1], reverse=True)
+print(by_score)
+# [('小明', 92), ('小红', 85), ('小刚', 77)]，按分数排序
+```
+
+`sorted` 的 `key` 参数接收一个函数，对每个元素算出"排序依据"。这里逻辑太短，不值得 def 一个正式函数，lambda 恰到好处。`key` 还可以接 `str.lower`、`len` 等现成函数：
+
+```python filename="key.py"
+words = ["banana", "fig", "cherry"]
+print(sorted(words, key=len))        # 按长度
+print(sorted(words, key=str.lower))  # 忽略大小写
+```
+
+<Callout type="warning" title="lambda 只能写一个表达式">
+
+不能有语句、不能多行、返回值就是表达式的结果。逻辑需要两步以上，就老老实实 def 一个函数并给它起个好名字——可读性优先。
+
+</Callout>
+
+## 作用域：LEGB 规则
+
+变量名查找的顺序：**L**ocal（函数内）→ **E**nclosing（外层函数）→ **G**lobal（模块）→ **B**uilt-in（内置）。由内向外，找到即停：
+
+```python filename="legb.py"
+name = "全局"                     # G
+
+def outer():
+    name = "外层"                 # E
+    def inner():
+        print(name)               # L 没有，找到 E 的"外层"
+    inner()
+
+outer()                           # 外层
+```
+
+函数内**赋值**会创建局部变量，即使外面有同名变量——想修改外层/全局变量需用 `nonlocal` / `global` 声明：
+
+```python filename="nonlocal.py"
+def counter():
+    count = 0
+    def step():
+        nonlocal count
+        count += 1
+        return count
+    return step
+
+timer = counter()
+print(timer())   # 1
+print(timer())   # 2
+```
+
+`global` 少用——函数偷偷改全局状态是 bug 温床；`nonlocal` 主要用于上面这种"闭包计数器"，下一篇装饰器正是它的主场。
+
+## 可变默认值的陷阱
+
+```python filename="mutable-default.py"
+def add_item(item, items=[]):      # 危险！
+    items.append(item)
+    return items
+
+print(add_item("a"))    # ['a']
+print(add_item("b"))    # ['a', 'b']  ？！默认列表被共享了
+```
+
+默认值在**函数定义时只创建一次**，所有调用共享同一个列表。正确写法：默认 `None`，函数内再建：
+
+```python filename="safe-default.py"
+def add_item(item, items=None):
+    if items is None:
+        items = []
+    items.append(item)
+    return items
+```
+
+<FlashCard front="*args 和 **kwargs 分别接收什么？" back="*args 把多余的位置参数收进元组；**kwargs 把多余的关键字参数收进字典。调用时反过来用 * 和 ** 可以把序列/字典解包成参数。" />
+
+## 动手试一试
+
+1. 写 `def summary(title, *values, precision=2, **meta)`，打印标题、数值的平均值（保留 precision 位）和额外信息。
+2. 有 `[("apple", 3), ("fig", 12), ("pear", 7)]`，用 `sorted` + `lambda` 按第二项降序排列。
+3. 故意写一个可变默认值函数，连续调用三次观察共享现象，再改成安全版本。
+
+<Quiz
+  question="def f(a, b=1, *args, c, **kwargs) 调用 f(1, 2, 3, c=4, d=5) 后，args 和 kwargs 分别是？"
+  options={["(2, 3) 和 {'d': 5}", "(3,) 和 {'d': 5}", "(1, 2, 3) 和 {'c': 4, 'd': 5}", "(2, 3) 和 {'c': 4, 'd': 5}"]}
+  answer={1}
+  explanation="a=1、b=2 按位置就位；剩余位置参数 3 进 args 即 (3,)；c 是仅限关键字参数由 c=4 提供；d=5 落入 kwargs 即 {'d': 5}。"
+/>

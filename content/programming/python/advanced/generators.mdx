@@ -1,0 +1,159 @@
+---
+id: python-generators
+title: 迭代器与生成器
+description: 理解 for 循环的底层机制，学会用 yield 写惰性求值的生成器处理大数据。
+tags: [Python, 生成器, 迭代器, yield]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 40
+prerequisite: [python-comprehensions]
+related: [python-decorators, python-crawler-basics]
+---
+
+## for 循环背后发生了什么
+
+`for x in 列表` 之所以能用，是因为列表实现了**迭代协议**：提供 `iter()` 得到一个"取数器"，反复 `next()` 逐个产出元素，耗尽时抛 `StopIteration`。for 循环就是这套动作的语法糖：
+
+```python filename="iter-protocol.py"
+numbers = [10, 20, 30]
+it = iter(numbers)      # 取数器（迭代器）
+
+print(next(it))   # 10
+print(next(it))   # 20
+print(next(it))   # 30
+print(next(it))   # StopIteration 异常
+
+# for 循环做了同样的事，只是替你接住了 StopIteration
+for n in numbers:
+    print(n)
+```
+
+字符串、字典、文件对象都能这样迭代——凡是能用 for 遍历的，都叫**可迭代对象**。
+
+## yield：会暂停的函数
+
+包含 `yield` 的函数是**生成器函数**。调用它不执行函数体，而是返回一个生成器；每次 `next()` 执行到下一个 yield 处暂停，把值交出去，下次从暂停处继续：
+
+```python filename="generator.py"
+def countdown(n):
+    while n > 0:
+        yield n          # 交出一个值，暂停在这里
+        n -= 1
+
+gen = countdown(3)
+print(next(gen))   # 3
+print(next(gen))   # 2
+print(next(gen))   # 1
+print(next(gen))   # StopIteration
+
+for n in countdown(3):    # 生成器也能直接 for
+    print(n)
+```
+
+和返回完整列表相比，生成器**要一个算一个**：函数的执行状态（局部变量、执行位置）都保存在生成器对象里，而不是一次算完所有结果。
+
+## 为什么生成器重要：省内存
+
+生成一千万个平方数，两种方式的内存差距是数量级的：
+
+```python filename="memory.py"
+import sys
+
+as_list = [n * n for n in range(10_000_000)]
+as_gen = (n * n for n in range(10_000_000))    # 生成器表达式
+
+print(sys.getsizeof(as_list))   # 约 89 MB 级别
+print(sys.getsizeof(as_gen))    # 约 200 字节——它只是个"配方"
+```
+
+列表把所有结果**摊在内存里**；生成器只存"怎么算"，用的时候才算。处理大文件、网络流、无限序列时，这是唯一可行的姿势：
+
+```python filename="bigfile.py"
+def read_large(path):
+    with open(path, encoding="utf-8") as f:
+        for line in f:              # 文件对象本身就是惰性逐行的
+            yield line.strip()
+
+# 无论文件多大，内存里始终只有一行
+for line in read_large("huge.log"):
+    if "ERROR" in line:
+        print(line)
+```
+
+## 无限序列与 itertools
+
+生成器可以是**无限的**，反正按需取用：
+
+```python filename="infinite.py"
+def naturals():
+    n = 1
+    while True:          # 不怕死循环，因为每次 next 只走一步
+        yield n
+        n += 1
+
+gen = naturals()
+print(next(gen))   # 1
+print(next(gen))   # 2
+```
+
+标准库 `itertools` 把常用迭代模式做成了现成积木：
+
+```python filename="itertools.py"
+import itertools
+
+for value in itertools.islice(naturals(), 5):   # 取前 5 个
+    print(value, end=" ")       # 1 2 3 4 5
+
+print(list(itertools.batched(["a","b","c","d","e"], 2)))   # 分批
+# [('a', 'b'), ('c', 'd'), ('e',)]
+```
+
+<Callout type="info" title="生成器是一次性的">
+
+生成器耗尽就空了，不能像列表那样反复遍历。需要多次使用，先 `list(gen)` 落盘成列表，或者每次重新生成。
+
+</Callout>
+
+## 生成器管道
+
+生成器的真正威力在于**串联**：每个环节惰性产出，数据像流水线一样一节节流过去，全程不落大盘：
+
+```python filename="pipeline.py"
+def read_lines(path):
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            yield line.strip()
+
+def only_errors(lines):
+    for line in lines:
+        if "ERROR" in line:
+            yield line
+
+def short_lines(lines, limit=80):
+    for line in lines:
+        if len(line) <= limit:
+            yield line
+
+# 三段管道串起来：读 -> 过滤 -> 截短，内存占用恒定
+log_stream = short_lines(only_errors(read_lines("app.log")))
+for line in log_stream:
+    print(line)
+```
+
+这个"读一步、处理一步"的模型，正是爬虫、ETL 数据处理的标准写法。
+
+<FlashCard front="yield 和 return 的区别？" back="return 终止函数并交出全部结果；yield 交出一个值后暂停，保留函数状态，下次 next 从暂停处继续。含 yield 的函数调用后返回生成器而不是直接执行。" />
+
+## 动手试一试
+
+1. 写生成器 `fibonacci()`：无限产出斐波那契数列，用 `itertools.islice` 取前 10 项。
+2. 写生成器 `chunked(iterable, size)`：把任意序列按 size 分批产出（如 `[1,2,3,4,5]`, size=2 → `[1,2] [3,4] [5]`）。
+3. 用两个生成器串成管道：第一个产出 1-100 的数，第二个只留回文数，打印结果。
+
+<Quiz
+  question="gen = (x for x in range(3))，执行 list(gen) 得到 [0,1,2] 后，再执行 list(gen) 会得到什么？"
+  options={["[0, 1, 2]", "[], 生成器已耗尽", "重新开始产出", "报错"]}
+  answer={1}
+  explanation="生成器只能向前走，耗尽后再次遍历得到空结果。要重复使用就 list() 存下来或重新创建生成器。"
+/>

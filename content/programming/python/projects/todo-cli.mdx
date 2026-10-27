@@ -1,0 +1,161 @@
+---
+id: python-todo-cli
+title: 项目二：命令行待办清单
+description: 用列表、字典和 JSON 文件做一个能保存数据的待办清单程序。
+tags: [Python, 项目, json, pathlib]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 20
+prerequisite: [python-guess-number]
+related: [python-rename-files]
+---
+
+## 这次要让数据留下来
+
+猜数字游戏关掉就没了——它不需要记住任何东西。待办清单的核心诉求恰恰相反：**这会儿添加的任务，下次打开还在**。所以这个项目的关键新东西是：用 JSON 文件持久化数据。
+
+## 程序长什么样
+
+```text
+===== 待办清单 =====
+1. [未完成] 买牛奶
+2. [已完成] 交作业
+--------------------
+命令：add 添加 / done 完成 / del 删除 / quit 退出
+> add 复习 Python 循环
+已添加：复习 Python 循环
+```
+
+程序运行时循环等待命令，按命令操作列表，退出时把数据写进文件。
+
+## 数据结构设计
+
+每条任务用一个字典，所有任务放进列表，整个列表存成一个 JSON 文件：
+
+```python filename="storage.py"
+from pathlib import Path
+import json
+
+DATA_FILE = Path("todos.json")
+
+def load_tasks():
+    if DATA_FILE.exists():
+        return json.loads(DATA_FILE.read_text(encoding="utf-8"))
+    return []
+
+def save_tasks(tasks):
+    DATA_FILE.write_text(
+        json.dumps(tasks, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+```
+
+一个任务长这样：`{"text": "买牛奶", "done": False}`。
+
+<Callout type="tip" title="先定数据结构，再写功能">
+
+`[{"text": ..., "done": ...}]` 这一行决定了后面所有代码的形状。动手写大段逻辑之前，先用一句话说清"数据长什么样、存在哪"，能省掉一半的返工。
+
+</Callout>
+
+## 显示与操作
+
+```python filename="show.py"
+def show_tasks(tasks):
+    if not tasks:
+        print("清单是空的")
+        return
+    for index, task in enumerate(tasks, start=1):
+        mark = "已完成" if task["done"] else "未完成"
+        print(f"{index}. [{mark}] {task['text']}")
+```
+
+`enumerate(tasks, start=1)` 让编号从 1 开始，显示时更符合直觉。
+
+增删改三个操作：
+
+```python filename="actions.py"
+def add_task(tasks, text):
+    tasks.append({"text": text, "done": False})
+    print(f"已添加：{text}")
+
+def complete_task(tasks, number):
+    try:
+        tasks[number - 1]["done"] = True
+        print(f"已完成：{tasks[number - 1]['text']}")
+    except IndexError:
+        print("没有这个编号")
+
+def delete_task(tasks, number):
+    try:
+        removed = tasks.pop(number - 1)
+        print(f"已删除：{removed['text']}")
+    except IndexError:
+        print("没有这个编号")
+```
+
+注意编号和下标差 1：用户看到的 1 号任务是 `tasks[0]`。
+
+## 主循环：把一切串起来
+
+```python filename="todo.py"
+def main():
+    tasks = load_tasks()
+    print("===== 待办清单 =====  (add / done / del / quit)")
+
+    while True:
+        command = input("> ").strip()
+
+        if command == "quit":
+            save_tasks(tasks)
+            print("已保存，再见")
+            break
+        elif command == "add":
+            text = input("任务内容：").strip()
+            if text:
+                add_task(tasks, text)
+        elif command == "done":
+            show_tasks(tasks)
+            number = input("完成第几项：")
+            if number.isdigit():
+                complete_task(tasks, int(number))
+        elif command == "del":
+            show_tasks(tasks)
+            number = input("删除第几项：")
+            if number.isdigit():
+                delete_task(tasks, int(number))
+        elif command == "list":
+            show_tasks(tasks)
+        else:
+            print("命令：add / done / del / list / quit")
+
+        save_tasks(tasks)     # 每次操作后都保存，不怕意外退出
+
+main()
+```
+
+<Callout type="warning" title="一个可以改进的隐患">
+
+每次操作后全量保存对几十条任务毫无压力；但如果是十万条数据，就该考虑别的方案了（比如 SQLite）。**先做对，再做好**——初学阶段，清晰的 JSON 远比"看起来专业"的数据库合适。
+
+</Callout>
+
+## 你刚完成的里程碑
+
+这个不到一百行的程序，是第一个**有状态、可反复使用**的工具：函数分了层（存储 / 显示 / 操作 / 主循环），异常有兜底，数据能持久。它就是你以后写任何命令行工具的模板。
+
+## 动手试一试（继续迭代）
+
+1. 加 `clear` 命令：删除所有已完成的任务。
+2. 给任务加优先级字段（高/中/低），显示时高优先级排前面。
+3. 加 `edit` 命令修改任务文字，注意修改后也要保存。
+
+<Quiz
+  question="用户输入编号 2，为什么代码里写 tasks[number - 1]？"
+  options={["随机习惯", "Python 列表下标从 0 开始，显示编号从 1 开始", "int() 会自动减一", "tasks[2] 会越界报错"]}
+  answer={1}
+  explanation="用户眼中的第 1 项存储在下标 0。人机界面差一的错位非常常见，处理办法就是统一在一处（编号转下标）做减一，别处一律用下标思考。"
+/>
+
+<FlashCard front="这个程序为什么要「每次操作后保存」？" back="防止意外退出丢失刚做的修改（比如直接关窗口）。保存成本低时，宁可多存也别丢数据；这是对「持久化时机」最朴素的取舍。" />

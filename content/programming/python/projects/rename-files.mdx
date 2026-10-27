@@ -1,0 +1,144 @@
+---
+id: python-rename-files
+title: 项目三：批量重命名文件
+description: 用 pathlib 和循环批量整理文件，体验自动化办公的威力。
+tags: [Python, 项目, pathlib, 自动化]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 30
+prerequisite: [python-todo-cli]
+related: [python-stdlib-essentials]
+---
+
+## 自动化的第一个真实战果
+
+手工给几十个文件改名：重复、无聊、容易漏。这正是程序最擅长的事。本项目做完，你就拥有了《Automate the Boring Stuff》所说的那种能力——**把一小时的手工活变成一秒钟**。
+
+## 目标
+
+把一个文件夹里的照片从相机默认名整理成规范名：
+
+```text
+改名前                      改名后
+IMG_0001.jpg      →    旅行-2026-01.jpg
+IMG_0002.jpg      →    旅行-2026-02.jpg
+IMG_0003.jpg      →    旅行-2026-03.jpg
+```
+
+## 先侦察，后动手
+
+**批量操作文件前，永远先只读不改**。用 pathlib 把目录扫一遍看看：
+
+```python filename="inspect.py"
+from pathlib import Path
+
+folder = Path("照片")
+for file in folder.iterdir():          # 列出目录内容
+    print(file.name, file.suffix)
+```
+
+`iterdir()` 返回目录里的每一项；`file.name` 是文件名，`file.suffix` 是扩展名。只想处理 jpg，加个过滤：
+
+```python filename="inspect2.py"
+for file in folder.glob("*.jpg"):      # 只匹配 jpg
+    print(file.name)
+```
+
+<Callout type="danger" title="三条安全纪律">
+
+1. **先打印，后改名**：脚本第一版只 `print` 出"将要做什么"，确认无误再真改。
+2. **先在副本目录上测试**：复制一小份文件到测试文件夹，跑通了再对原件动手。
+3. **`rename()` 目标名已存在时会报错**（FileExistsError），这其实是保护，别绕过它。
+
+</Callout>
+
+## 第一版：统一加前缀和编号
+
+```python filename="rename-v1.py"
+from pathlib import Path
+
+folder = Path("照片")
+prefix = "旅行-2026"
+
+for index, file in enumerate(folder.glob("*.jpg"), start=1):
+    new_name = f"{prefix}-{index:02d}{file.suffix}"    # 旅行-2026-01.jpg
+    print(f"{file.name}  ->  {new_name}")              # 第一版：只看不改
+```
+
+`{index:02d}` 表示两位数、不足补零——这样 2 号和 10 号排序才正确（`02` < `10`，而 `2` > `10`）。
+
+确认打印结果没问题后，把 `print` 换成真正的改名：
+
+```python filename="rename-v2.py"
+from pathlib import Path
+
+folder = Path("照片")
+prefix = "旅行-2026"
+
+for index, file in enumerate(folder.glob("*.jpg"), start=1):
+    new_name = f"{prefix}-{index:02d}{file.suffix}"
+    file.rename(file.with_name(new_name))    # 同目录下改名
+    print(f"{file.name}  ->  {new_name}")
+```
+
+`with_name()` 生成"同目录、新名字"的路径对象——比手工拼字符串可靠。
+
+## 处理意外：目标名已存在
+
+目录里可能已经有 `旅行-2026-01.jpg`，`rename` 会抛 FileExistsError。接住并跳过：
+
+```python filename="rename-safe.py"
+from pathlib import Path
+
+folder = Path("照片")
+prefix = "旅行-2026"
+
+for index, file in enumerate(folder.glob("*.jpg"), start=1):
+    new_name = f"{prefix}-{index:02d}{file.suffix}"
+    target = file.with_name(new_name)
+    try:
+        file.rename(target)
+        print(f"已改名：{file.name} -> {new_name}")
+    except FileExistsError:
+        print(f"跳过：{new_name} 已存在")
+```
+
+## 举一反三
+
+改掉中间一段逻辑，同一个脚本骨架能干很多活：
+
+| 需求 | 改哪里 |
+|------|--------|
+| 全部改成小写扩展名 | `new_name = file.stem + file.suffix.lower()` |
+| 在名字前后加日期 | `f"{now:%Y%m%d}-{file.name}"` |
+| 按扩展名分类到子文件夹 | `file.rename(子目录 / file.name)` |
+| 删掉文件名里的空格 | `new_name = file.name.replace(" ", "")` |
+
+```python filename="sort-by-ext.py"
+from pathlib import Path
+
+folder = Path("下载")
+for file in folder.iterdir():
+    if file.is_file():                     # 跳过子目录
+        target_dir = folder / file.suffix[1:].upper()   # JPG / PDF / ZIP
+        target_dir.mkdir(exist_ok=True)
+        file.rename(target_dir / file.name)
+```
+
+十几行，就把"下载文件夹"按类型整理干净——这就是学编程最直接的回报。
+
+<FlashCard front="批量改文件名前必须做哪三件事？" back="①第一版只打印「将要改名」的结果，人工确认；②先在副本目录测试；③用 try/except 处理目标名冲突（FileExistsError），不静默覆盖。" />
+
+## 动手试一试
+
+1. 建一个测试文件夹，放几个假文件，跑通第一版脚本（先打印后改名）。
+2. 把某个文件夹里的 `.jpeg` 全部改成 `.jpg`。
+3. 挑一个你自己的真实痛点（下载目录、照片目录），改造脚本解决它。
+
+<Quiz
+  question="为什么编号要用 {index:02d} 补零？"
+  options={["纯美观", "补零后字符串排序和数字排序一致，文件不会乱序", "renamed() 要求两位数", "节省空间"]}
+  answer={1}
+  explanation="不加补零时，10 在字典序里排在 2 前面（字符 1 小于 2），文件管理器里就会乱序。补零后 02 < 10，排序正常。这是文件命名里最常见的坑之一。"
+/>

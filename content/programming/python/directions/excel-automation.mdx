@@ -1,0 +1,135 @@
+---
+id: python-excel-automation
+title: 自动化办公：处理 Excel
+description: 用 openpyxl 批量读写 Excel，把每周的重复劳动交给脚本。
+tags: [Python, openpyxl, Excel, 自动化]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 40
+prerequisite: [python-directions-roadmap]
+related: [python-data-pandas, python-rename-files]
+---
+
+## 最快见效的方向
+
+自动化办公是四个方向里"今天学、明天就能用"的一个：批量合并报表、填模板、改格式——每个办公室都有一堆这样的活。本篇以 Excel 为例走通全流程，PDF、Word、邮件同理可举一反三。
+
+```bash filename="命令行"
+pip install openpyxl
+```
+
+<Callout type="info" title="openpyxl 还是 pandas？">
+
+**读数、算数、汇总**用 pandas（上一篇）；**动格式**（样式、公式、合并单元格、多个工作表的版式）用 openpyxl。两者能配合：pandas 读写 `read_excel` / `to_excel`，需要精修版式时 openpyxl 上场。
+
+</Callout>
+
+## 读取工作簿
+
+```python filename="read.py"
+from openpyxl import load_workbook
+
+wb = load_workbook("销售表.xlsx")      # 整个工作簿
+print(wb.sheetnames)                   # 所有工作表名
+
+ws = wb["一月"]                        # 按名字取工作表
+print(ws.max_row, ws.max_column)       # 数据范围
+
+# 两种取值方式
+print(ws["B2"].value)                  # 按坐标
+print(ws.cell(row=2, column=3).value)  # 按行列号
+```
+
+坐标从 **1** 开始（不是 0），`A1` 就是第 1 行第 1 列。
+
+## 遍历整张表
+
+把每一行读出来处理——批量统计的标准姿势：
+
+```python filename="iterate.py"
+from openpyxl import load_workbook
+
+wb = load_workbook("销售表.xlsx")
+ws = wb.active                          # 当前激活的工作表
+
+for row in ws.iter_rows(min_row=2, values_only=True):   # 跳过表头
+    product, quantity, price = row
+    print(f"{product}: {quantity * price:.2f} 元")
+```
+
+`values_only=True` 直接给值元组而不是单元格对象，配合解包非常顺手。
+
+## 写入与格式
+
+```python filename="write.py"
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment
+
+wb = Workbook()
+ws = wb.active
+ws.title = "汇总"
+
+ws.append(["产品", "数量", "单价", "金额"])      # 追加一行
+ws.append(["键盘", 10, 199.0])
+ws["D2"] = "=B2*C2"                              # 写公式，Excel 打开时计算
+
+# 格式：表头加粗、底色、居中
+for cell in ws[1]:
+    cell.font = Font(bold=True)
+    cell.fill = PatternFill("solid", start_color="DDEBF7")
+    cell.alignment = Alignment(horizontal="center")
+
+ws.column_dimensions["A"].width = 20             # 列宽
+
+wb.save("汇总.xlsx")
+```
+
+公式就是普通字符串写进单元格——Excel 负责计算，Python 负责摆位置。
+
+## 实战：合并多个工作簿
+
+经典需求：30 个分公司各交一张表，合成总表。前三个项目学的知识全能用上：
+
+```python filename="merge.py"
+from pathlib import Path
+from openpyxl import load_workbook, Workbook
+
+folder = Path("分表")
+merged = Workbook()
+target = merged.active
+target.append(["分公司", "产品", "数量"])
+
+for file in folder.glob("*.xlsx"):
+    if file.stem == "总表":            # 跳过输出文件自己
+        continue
+    ws = load_workbook(file).active
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        target.append([file.stem, *row])      # 前面加一列来源
+
+merged.save("总表.xlsx")
+print("合并完成")
+```
+
+pathlib 扫文件、glob 过滤、解包进列表——脚本只有十几行，却省下一下午复制粘贴。
+
+<Callout type="warning" title="改别人的文件前先备份">
+
+`load_workbook` 后直接 `save` 会**覆盖原文件**，且公式之外的历史信息可能丢失。安全流程：复制一份 → 改副本 → 核对无误再替换原件。和批量改名篇的安全纪律一脉相承。
+
+</Callout>
+
+<FlashCard front="openpyxl 和 pandas 处理 Excel 怎么分工？" back="数值分析与汇总用 pandas（read_excel / to_excel）；涉及格式、公式、多工作表版式的精细操作用 openpyxl。两者可组合使用。" />
+
+## 动手试一试
+
+1. 手工造一张含 3 行数据的 Excel，用脚本读出每行并计算合计。
+2. 生成一张带表头样式和合计公式的"月度汇总.xlsx"。
+3. 建一个文件夹放三份"分表"，用合并脚本生成总表，给总表加来源列。
+
+<Quiz
+  question="openpyxl 中 ws[「D2」] = 「=B2*C2」 写入后，用脚本读取 D2 的值会是？"
+  options={["计算结果", "=B2*C2 这个公式字符串本身", "0", "报错"]}
+  answer={1}
+  explanation="openpyxl 只存储公式文本，不执行计算；计算发生在 Excel/WPS 打开文件时。要拿计算结果，需要用 data_only=True 打开且文件被 Excel 保存过，或干脆用 Python 算好写死数值。"
+/>

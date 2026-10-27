@@ -1,0 +1,145 @@
+---
+id: python-data-pandas
+title: 数据分析入门
+description: 用 pandas 读表格、筛选、分组汇总，完成第一次真正的数据分析。
+tags: [Python, pandas, 数据分析]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 30
+prerequisite: [python-directions-roadmap]
+related: [python-crawler-basics, python-excel-automation]
+---
+
+## 为什么是 pandas
+
+Excel 能做的事 pandas 都能做，但 pandas 赢在三点：**处理几十万行不卡**、**每一步可写进脚本复现**、**分析结果能直接喂给程序**。它把表格叫 **DataFrame**——一个带行标签、列标签的大字典。
+
+```bash filename="命令行"
+pip install pandas
+```
+
+## 认识 DataFrame
+
+```python filename="first-df.py"
+import pandas as pd
+
+data = {
+    "姓名": ["小明", "小红", "小刚", "小丽"],
+    "语文": [92, 85, 59, 78],
+    "数学": [88, 95, 71, 66],
+}
+df = pd.DataFrame(data)
+print(df)
+```
+
+```text
+   姓名  语文  数学
+0  小明  92  88
+1  小红  85  95
+2  小刚  59  71
+3  小丽  78  66
+```
+
+每一列是一个 Series（带标签的一维数组），整张表是 DataFrame。最常用的"体检"三件套：
+
+```python filename="peek.py"
+print(df.head(2))        # 前 2 行
+print(df.shape)          # (4, 3)：4 行 3 列
+print(df.describe())     # 数值列的统计摘要：均值、最大最小、分位数
+```
+
+## 读取真实数据
+
+pandas 能读几乎所有表格格式，CSV 最常见：
+
+```python filename="read-csv.py"
+import pandas as pd
+
+df = pd.read_csv("scores.csv", encoding="utf-8")
+print(df.shape)
+print(df.columns.tolist())     # 看看有哪些列
+```
+
+<Callout type="warning" title="读进来的第一步永远是体检">
+
+真实数据必有脏东西：空值、重复行、格式错乱的数字。固定动作三连：`df.head()` 看长相、`df.info()` 看每列类型和缺失数、`df.describe()` 看数值分布。体检完再动手分析，能避开八成低级错误。
+
+</Callout>
+
+## 筛选：只看关心的行和列
+
+```python filename="filter.py"
+# 布尔筛选：语文及格的学生
+passed = df[df["语文"] >= 60]
+print(passed)
+
+# 多条件用 & （and）和 | （or），每个条件必须加括号
+good = df[(df["语文"] >= 80) & (df["数学"] >= 80)]
+
+# 选列
+print(df[["姓名", "数学"]])          # 双括号 = 取多列
+```
+
+`df[df["语文"] >= 60]` 读作"语文列 ≥ 60 的那些行"——条件本身是一个布尔 Series，用它当"行过滤器"。
+
+## 新列与变换
+
+```python filename="transform.py"
+df["总分"] = df["语文"] + df["数学"]
+df["是否及格"] = df["语文"].apply(lambda x: "及格" if x >= 60 else "不及格")
+print(df[["姓名", "总分", "是否及格"]])
+```
+
+`apply` 对每行调用一个函数——推导式在表格世界的对应物。
+
+## 分组汇总：分析的灵魂
+
+"每个班的平均分""各月份的销售额"——全是**分组 → 聚合**：
+
+```python filename="groupby.py"
+df = pd.DataFrame({
+    "班级": ["一班", "一班", "二班", "二班", "二班"],
+    "姓名": ["小明", "小红", "小刚", "小丽", "小强"],
+    "数学": [88, 95, 71, 66, 90],
+})
+
+summary = df.groupby("班级")["数学"].mean()
+print(summary)
+```
+
+```text
+班级
+一班    91.5
+二班    75.666667
+Name: 数学, dtype: float64
+```
+
+一行 `groupby(...)[...].mean()` 完成了 Excel 里数据透视表的活。常用聚合还有 `sum()`、`count()`、`max()`、`agg({"数学": "mean", "语文": "max"})`。
+
+## 排序、空值与导出
+
+```python filename="cleanup.py"
+df_sorted = df.sort_values("数学", ascending=False)     # 降序
+df_clean = df.dropna()                                  # 丢掉含空值的行
+df_dedup = df.drop_duplicates()                         # 去重
+
+df.to_csv("result.csv", index=False, encoding="utf-8-sig")   # 导出
+```
+
+`encoding="utf-8-sig"` 导出的 CSV 用 Excel 打开不乱码——实用细节。
+
+<FlashCard front="df[df[「分数」] > 60] 这句在做什么？" back="先用 df[「分数」] > 60 生成布尔 Series（每行 True/False），再用它筛选 DataFrame，只保留 True 的行。多条件用 & | 连接，每个条件要加括号。" />
+
+## 动手试一试
+
+1. 构造一个含 5 名学生 3 科成绩的 DataFrame，算出每人的总分和各科平均分。
+2. 用 `groupby` 统计：每个班级及格人数（提示：先加"是否及格"列，再 groupby + sum）。
+3. 从网上找一份公开 CSV 数据集，完成"读取 → 体检 → 筛选 → 分组 → 导出"完整流程。
+
+<Quiz
+  question="df[(df[「a」] > 1) & (df[「b」] < 5)] 中去掉两个括号写成 df[df[「a」] > 1 & df[「b」] < 5] 会怎样？"
+  options={["结果相同", "报错或结果错误：& 优先级高于比较运算", "自动加括号", "只按 a 筛选"]}
+  answer={1}
+  explanation="& 的优先级高于 > 和 <，表达式会先算 1 & df[「b」]，产生完全错误的结果。pandas 布尔筛选的铁律：每个条件必须各自加括号。"
+/>

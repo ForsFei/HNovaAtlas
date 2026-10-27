@@ -1,0 +1,112 @@
+---
+id: ds-stack-queue
+title: 栈与队列
+description: 两种只允许在口子上进出的结构——叠盘子（后进先出）与排队（先进先出）。
+tags: [数据结构, 栈, 队列]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 30
+prerequisite: [ds-array]
+related: [ds-hashmap, python-functions]
+---
+
+## 纪律带来简单
+
+数组的口子开得多：头、尾、中间随便插删。栈和队列反其道而行——**只留一个口子**，纪律苛刻，但正因为苛刻，它们恰好命中了现实里两大类场景："最后发生的最先处理"和"最早来的最先处理"。
+
+## 栈：叠盘子
+
+食堂的盘子摞成一叠：放盘子只能放**最顶上**，拿盘子也只能从**最顶上**拿。最先放上去的最后才被拿走——**后进先出**（LIFO，Last In First Out）。
+
+```python filename="stack.py"
+stack = []
+stack.append("盘子1")     # 压栈（push）
+stack.append("盘子2")
+stack.append("盘子3")
+print(stack.pop())        # 盘子3 —— 弹栈（pop），最顶上的先走
+print(stack.pop())        # 盘子2
+print(stack[-1])          # 盘子1 —— 只看顶，不拿（peek）
+```
+
+只有三个动作：`push` 压入、`pop` 弹出、`peek` 看顶。全在尾部操作，都是 O(1)。
+
+### 栈就在你的指尖
+
+你可能每天都在用栈而不自知：
+
+| 场景 | 表现 |
+|------|------|
+| Ctrl+Z 撤销 | 撤销的永远是你**最近**那步操作 |
+| 浏览器后退 | 后退返回的是**刚才**那个页面 |
+| 编辑器括号匹配 | 遇到 `}` 就弹栈找最近的 `{` |
+
+```python filename="brackets.py" {6-13}
+def is_balanced(text):
+    pairs = {")": "(", "]": "[", "}": "{"}
+    stack = []
+    for ch in text:
+        if ch in "([{":
+            stack.append(ch)          # 开括号压栈
+        elif ch in pairs:
+            if not stack or stack.pop() != pairs[ch]:
+                return False          # 顶上不是配对的，不平衡
+    return not stack                  # 栈空 = 全部配对
+
+print(is_balanced("a(b[c]{d})e"))    # True
+print(is_balanced("a(b)c[d"))        # False
+```
+
+### 最重要的栈：函数调用栈
+
+零基础系列里"函数调函数"能层层返回、各不串台，靠的就是**调用栈**：每调用一个函数，压一帧（局部变量、回到哪一行）；函数 `return` 时弹出栈帧，回到上一层。`RecursionError: maximum recursion depth` 就是这摞盘子叠得太高——后面讲递归会再遇到它。
+
+## 队列：排队买票
+
+队列像排队买票：新来的**排到队尾**，服务窗口永远叫**队头**的人。**先进先出**（FIFO，First In First Out）——先来先服务，绝对公平。
+
+```python filename="queue.py"
+from collections import deque
+
+queue = deque()
+queue.append("顾客1")     # 进队尾
+queue.append("顾客2")
+queue.append("顾客3")
+print(queue.popleft())    # 顾客1 —— 从队头出
+print(queue.popleft())    # 顾客2
+```
+
+注意两个细节：
+
+- 入队用 `append`（进队尾），出队用 `popleft`（从队头走）——**方向相反**才算队列
+- 用 `deque`（双端队列）而不是 list：list 的 `pop(0)` 是 O(n) 全员搬家，deque 的 `popleft` 是 O(1)（它两头都能开，这正是上一节卖下的关子）
+
+### 队列在哪里干活
+
+| 场景 | 表现 |
+|------|------|
+| 打印机 | 文档按提交顺序打印 |
+| 客服系统 | 按取号顺序服务 |
+| 消息队列 | 订单请求排队处理，削掉流量洪峰 |
+| 任务管理 | 操作系统把等待执行的任务排成队列 |
+
+<Callout type="info" title="为什么大系统偏爱队列">
+
+抢购瞬间来了 10 万个请求，服务器不可能同时处理。放进队列慢慢消化，用户看到"排队中"，系统不会被冲垮——**队列是天然的抗洪闸门**。第 6 篇图的广度优先搜索也靠它驱动。
+
+</Callout>
+
+<FlashCard front="栈和队列的进出规则分别是什么？" back="栈：后进先出（LIFO），只在栈顶进出，像叠盘子；队列：先进先出（FIFO），队尾进队头出，像排队买票。撤销/后退/调用栈是栈，打印/排队/消息队列是队列。" />
+
+## 动手试一试
+
+1. 用栈检查一段文本里的括号是否配对，故意造几个不平衡的例子验证。
+2. 用 deque 模拟打印队列：三个文档先后加入，依次取出，打印每次取出的名字。
+3. 思考：浏览器"后退"如果改用队列会是什么体验？（会是"按访问顺序回放"，完全不对劲——体会规则与场景的匹配）
+
+<Quiz
+  question="依次执行 push(a)、push(b)、push(c)、pop()、pop() 后，两个弹出值依次是？"
+  options={["a 和 b", "c 和 b", "b 和 c", "c 和 a"]}
+  answer={1}
+  explanation="栈顶最后压入的 c 先弹出，随后是 b。后进先出——这就是为什么撤销操作撤的永远是最近那步。"
+/>

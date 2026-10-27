@@ -4,7 +4,9 @@ node_modules/
 .next-trash*/
 .history/
 out/
-out-old/
+out-old*/
+.next-*/
+.planning/
 *.tsbuildinfo
 .env*
 !.env.example
@@ -14,6 +16,9 @@ test-results/
 src/generated/
 **/bin/
 **/obj/
+examples/industrial-s7/.local/
+examples/industrial-opcua/.local/
+examples/industrial-yolo-onnx/.local/
 task_plan.md
 progress.md
 findings.md

@@ -1,0 +1,119 @@
+---
+id: ds-hashmap
+title: 哈希表
+description: 理解 O(1) 查找的魔法——外卖柜原理，看清 Python dict 为什么快、什么时候失灵。
+tags: [数据结构, 哈希表, 字典]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 40
+prerequisite: [ds-array]
+related: [ds-tree, python-dicts-sets]
+---
+
+## 从地摊到外卖柜
+
+按名字查电话号码：数组里只能挨个比对，O(n)。有没有一步到位的查法？想想你取外卖的柜子：取餐码 `7-3-2` 一看，直奔 7 排 3 列 2 格——**不用找，算出来的**。
+
+哈希表（hash table）就是程序世界的外卖柜：
+
+1. 存数据时，用**哈希函数**把键（如名字）算成一个格子编号，数据放进那个格子
+2. 取数据时，同一个函数再算一遍，直接奔向那个格子
+
+```python filename="hash-idea.py"
+# 概念演示：最简单的哈希函数
+def simple_hash(key):
+    return sum(ord(c) for c in key) % 10     # 字符码求和，对 10 取余
+
+cabinet = [None] * 10
+cabinet[simple_hash("ann")] = "138-0001"     # 存
+print(cabinet[simple_hash("ann")])           # 取：同一个函数算出同一个格子
+```
+
+键 → 编号 → 直达格子。**查找是 O(1)**——和数据量无关，这就是 Python `dict` 查值快如闪电的原因。
+
+## 哈希函数的要求
+
+好哈希函数要像好外卖柜：
+
+- **确定性**：同一个键，每次算出同一个编号（不然取不到自己存的货）
+- **均匀分散**：键尽量摊开到各个格子，别挤在几格里
+
+Python 的 `hash()` 内置函数就是干这个的。字符串、数字、元组都能算；**列表和字典不能**——它们可变，内容变了编号也得变，取货单就废了。这也解释了 `dict` 的键为什么必须是不可变类型。
+
+## 撞格子了怎么办
+
+十个格子存十一个人的外卖，必然有人撞格——**哈希冲突**。主流解法是"格子挂个链子"：同格的外卖串成一串，到了格子再顺着链子找：
+
+```text
+格子 3 → (ann, 138-0001) → (bob, 139-0002)
+```
+
+冲突少时链子极短，几乎不影响 O(1)；冲突太多（格子塞太满），哈希表会**扩容换更大的柜子**重新分配——所以 dict 撑着你往里加数据，依然保持快。
+
+<Callout type="warning" title="O(1) 的两个前提">
+
+1. 哈希函数够均匀（Python 内置类型有保证）
+2. 键是不可变对象（str、int、tuple）
+
+自定义对象当键、或自己写的哈希函数质量差，O(1) 可能悄悄退化成 O(n)。用标准类型当键，别操心这些。
+
+</Callout>
+
+## dict 与 set：一母同胞
+
+Python 的 `dict` 和 `set` 底层都是哈希表：
+
+```python filename="dict-set.py"
+# dict：键 -> 值
+prices = {"苹果": 5.5, "香蕉": 3.2}
+print(prices["苹果"])              # O(1) 查找
+prices["橙子"] = 4.0               # O(1) 插入
+"香蕉" in prices                   # O(1) 存在性判断
+
+# set：只要"在不在"，不要值
+seen = set()
+seen.add("apple")
+print("apple" in seen)             # O(1)
+```
+
+判断"`x` 在不在集合里"，用 list 的 `in` 是 O(n) 挨个比对，用 set 是 O(1) 算编号直达。数据一大，这一个选择的差距就是秒级与毫秒级：
+
+```python filename="membership.py"
+import time
+
+big_list = list(range(1_000_000))
+big_set = set(big_list)
+
+start = time.perf_counter()
+for _ in range(1000):
+    999_999 in big_list             # O(n) × 1000
+print(f"list 耗时: {time.perf_counter() - start:.3f} 秒")
+
+start = time.perf_counter()
+for _ in range(1000):
+    999_999 in big_set              # O(1) × 1000
+print(f"set 耗时: {time.perf_counter() - start:.6f} 秒")
+```
+
+## 什么时候选哈希表
+
+- ✔ 按键找值的场景：缓存、配置、计数器、索引
+- ✔ 高频"在不在"判断：去重、已访问标记
+- ✘ 需要保持顺序或按范围查找（"找出所有 60-70 分"哈希表帮不了——键是打散的）
+- ✘ 需要按位置取第几个（那是数组的活）
+
+<FlashCard front="哈希表 O(1) 查找的原理是什么？" back="用哈希函数把键直接算成存储格子的编号，取值时重算编号直达，不需要逐个比对。冲突靠格内链表解决，过满时扩容。" />
+
+## 动手试一试
+
+1. 用 `hash("apple")` 和 `hash("banana")` 观察 Python 哈希值，验证同一字符串两次结果一致。
+2. 把 100 万成员的 `in` 判断分别用 list 和 set 跑一遍，实测时间差。
+3. 用 dict 实现"单词计数器"：统计一段英文里每个单词出现次数（零基础系列字典篇做过，现在你能说清它为什么快了）。
+
+<Quiz
+  question="d = {} 后执行 d[[1, 2]] = 「a」 会怎样？"
+  options={["正常存入", "报错 TypeError：list 不可哈希", "自动转成字符串存入", "静默失败"]}
+  answer={1}
+  explanation="list 可变，内容一变哈希值就变，找不到当初存的格子，因此 Python 禁止它当键。不可变的 tuple 可以。这也是 dict 键必须不可变的根本原因。"
+/>

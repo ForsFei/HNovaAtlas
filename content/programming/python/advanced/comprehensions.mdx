@@ -1,0 +1,145 @@
+---
+id: python-comprehensions
+title: 推导式
+description: 用一行表达式完成筛选与变换，掌握列表、字典、集合推导式和生成器表达式。
+tags: [Python, 推导式, comprehension]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 10
+prerequisite: [python-stdlib-essentials]
+related: [python-functions-advanced, python-generators]
+---
+
+## 从循环到一行
+
+把列表里每个数翻倍，你已经会两种写法：
+
+```python filename="double.py"
+numbers = [1, 2, 3, 4, 5]
+
+# 写法一：循环 + append
+doubled = []
+for n in numbers:
+    doubled.append(n * 2)
+
+# 写法二：推导式（comprehension）
+doubled = [n * 2 for n in numbers]
+print(doubled)   # [2, 4, 6, 8, 10]
+```
+
+推导式把"建新列表"这件事压缩成一行，**读法从左到右**：`对 numbers 里的每个 n，取 n * 2`。它不只是省行数——意图一目了然："这是个变换，不是普通流程"。
+
+## 加条件：筛选
+
+`for` 后面可以跟 `if`，只保留满足条件的元素：
+
+```python filename="filter.py"
+scores = [92, 45, 77, 100, 63]
+
+passed = [s for s in scores if s >= 60]
+print(passed)      # [92, 77, 100, 63]
+
+# 变换和筛选可以同时做
+bonus = [s + 5 for s in scores if s < 60]
+print(bonus)       # [50]，只给不及格的加分
+```
+
+<Callout type="tip" title="读推导式的方法">
+
+先看 `for x in 某处`（数据从哪来），再看前面的表达式（变成什么），最后看 `if`（谁留下）。按这个顺序读，任何推导式都不慌。
+
+</Callout>
+
+## if-else 放在 for 前面：变换式
+
+注意一个易混点：想"不满足条件的也保留、只是换个值"，`if-else` 要写在 **for 的前面**：
+
+```python filename="ternary.py"
+scores = [92, 45, 77]
+
+# for 前面的 if-else：每个元素都保留，做不同变换
+labels = ["及格" if s >= 60 else "不及格" for s in scores]
+print(labels)    # ['及格', '不及格', '及格']
+
+# for 后面的 if：只筛选，不保留其余
+passed = [s for s in scores if s >= 60]
+print(passed)    # [92, 77]
+```
+
+两种写法位置不同、语义不同，混着记最容易出 bug。
+
+## 字典与集合推导式
+
+同样的语法，换一种括号就是另一种容器：
+
+```python filename="dict-set.py"
+names = ["ann", "bob", "cathy"]
+lengths = {name: len(name) for name in names}
+print(lengths)        # {'ann': 3, 'bob': 3, 'cathy': 5}
+
+squares = {n ** 2 for n in [1, 2, 2, 3]}
+print(squares)        # {1, 4, 9}，集合自动去重
+
+# 实用场景：反转字典
+original = {"a": 1, "b": 2}
+inverted = {v: k for k, v in original.items()}
+print(inverted)       # {1: 'a', 2: 'b'}
+```
+
+`for k, v in d.items()` 同时拿到键和值——字典推导式最常见的姿势。
+
+## 嵌套与展平
+
+推导式可以嵌套，最常见用途是展平二维列表：
+
+```python filename="flatten.py"
+matrix = [[1, 2, 3], [4, 5, 6]]
+
+flat = [cell for row in matrix for cell in row]
+print(flat)     # [1, 2, 3, 4, 5, 6]
+
+# 等价于：
+result = []
+for row in matrix:
+    for cell in row:
+        result.append(cell)
+```
+
+读法：`for row` 在外层，`for cell` 在内层——和等价的嵌套循环顺序完全一致。
+
+<Callout type="warning" title="一行并非永远更好">
+
+推导式超过两层嵌套、或条件超过一个时，普通循环反而更清晰。判断标准：**同事不看注释能秒懂吗？** 复杂逻辑老老实实用 for，没人会因此觉得你水平低。
+
+</Callout>
+
+## 生成器表达式：惰性的推导式
+
+把方括号换成圆括号，得到的不再是列表，而是一个"按需产出"的生成器（下一篇细讲）：
+
+```python filename="genexp.py"
+total = sum(n * n for n in range(1, 101))   # 不用先建一个万元素的列表
+print(total)    # 338350
+
+evens = (n for n in range(10) if n % 2 == 0)
+print(next(evens))   # 0，要一个算一个
+print(next(evens))   # 2
+```
+
+给 `sum()`、`max()`、`any()` 这类聚合函数喂数据时，生成器表达式是标配——省内存且语义干净。
+
+<FlashCard front="if 在 for 前面和后面有什么区别？" back="for 后面的 if 是筛选（不满足的丢弃）；for 前面的 if-else 是变换（每个元素都保留，按条件取不同值）。位置决定语义。" />
+
+## 动手试一试
+
+1. 用推导式生成 1-100 中所有能被 7 整除的数的平方。
+2. 有 `{"a": 1, "b": 2, "c": 3}`，用字典推导式只保留值大于 1 的键值对。
+3. 把 `"the quick brown fox"` 按空格拆分后，得到每个单词首字母大写的列表——分别用循环和推导式写，对比行数与可读性。
+
+<Quiz
+  question="[n for n in range(10) if n % 2] 的结果是什么？"
+  options={["0, 2, 4, 6, 8", "1, 3, 5, 7, 9", "True, False 交替", "报错"]}
+  answer={1}
+  explanation="条件 n % 2 对偶数得 0（假）、奇数得 1（真），所以只保留奇数。想取偶数要写 n % 2 == 0。"
+/>

@@ -1,0 +1,155 @@
+---
+id: python-testing
+title: 自动化测试入门
+description: 用 pytest 把"改完代码跑一遍试试"变成几秒钟的自动化验证。
+tags: [Python, pytest, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 70
+prerequisite: [python-venv-projects]
+related: [python-decorators, python-typing]
+---
+
+## 为什么要自动化测试
+
+改一处代码、手工点一遍所有功能——项目小还行，大了必然漏。**自动化测试**把验证逻辑写成代码：`pytest` 一跑，几秒钟内告诉你哪里坏了。它还是最好的"重构安全网"：有测试兜底，你才敢放心改代码。
+
+## 第一个测试
+
+安装 pytest，建 `tests/` 目录：
+
+```bash filename="命令行"
+pip install pytest
+```
+
+被测函数放在 `src/calc.py`：
+
+```python filename="calc.py"
+def add(a, b):
+    return a + b
+
+def divide(a, b):
+    if b == 0:
+        raise ValueError("除数不能为零")
+    return a / b
+```
+
+测试文件以 `test_` 开头，测试函数同样以 `test_` 开头，里面用普通 `assert` 断言：
+
+```python filename="tests/test_calc.py"
+from calc import add, divide
+
+def test_add():
+    assert add(2, 3) == 5
+
+def test_add_negative():
+    assert add(-1, 1) == 0
+
+def test_divide():
+    assert divide(10, 4) == 2.5
+```
+
+运行：
+
+```bash filename="命令行"
+pytest                 # 自动发现所有 test_*.py
+pytest -v              # 显示每个用例的名字和结果
+```
+
+```text
+tests/test_calc.py ...                          [100%]
+3 passed in 0.01s
+```
+
+assert 失败时 pytest 会打印出实际值和期望值，定位非常直观。
+
+## 测试异常
+
+"应该抛异常"也是要验证的行为，`pytest.raises` 专管这个：
+
+```python filename="test_raises.py"
+import pytest
+from calc import divide
+
+def test_divide_by_zero():
+    with pytest.raises(ValueError):
+        divide(10, 0)
+```
+
+## 用参数化消灭重复用例
+
+十组输入输出，不想写十个函数？`@pytest.mark.parametrize` 一表搞定——还记得装饰器吗，这里它出现了：
+
+```python filename="test_parametrize.py"
+import pytest
+from calc import add
+
+@pytest.mark.parametrize("a, b, expected", [
+    (1, 2, 3),
+    (-1, -1, -2),
+    (0, 0, 0),
+    (100, 200, 300),
+])
+def test_add_many(a, b, expected):
+    assert add(a, b) == expected
+```
+
+四组数据，四个独立用例，失败时精确报告是哪一组。
+
+## fixture：准备和清理测试环境
+
+测试常需要"先准备数据/环境"。fixture 把准备工作做成可复用的组件，测试函数按名字声明需要它：
+
+```python filename="test_fixture.py"
+import pytest
+
+@pytest.fixture
+def sample_tasks():
+    return [
+        {"text": "买牛奶", "done": False},
+        {"text": "交作业", "done": True},
+    ]
+
+def test_completed_count(sample_tasks):        # 参数名对上 fixture 名
+    done = [t for t in sample_tasks if t["done"]]
+    assert len(done) == 1
+
+def test_first_task_text(sample_tasks):
+    assert sample_tasks[0]["text"] == "买牛奶"
+```
+
+每个测试拿到**全新**的 fixture 实例，互不污染——这正是测试最重要的纪律。
+
+<Callout type="tip" title="测什么，不测什么">
+
+- **测**：核心业务逻辑、边界条件（空列表、零、负数、超长输入）、修过的 bug（加一个用例钉死它）
+- **不测**：print 输出长相、第三方库的内部行为、一行胶水代码
+- 追求的 不是覆盖率 100%，而是**关键路径改坏了必被发现**
+
+</Callout>
+
+## 测试驱动的工作流
+
+老练开发者的日常循环：
+
+1. 写一个会**失败**的小测试（描述想要的行为）
+2. 写最少的代码让它通过
+3. 重构，保持绿色
+
+哪怕不严格执行 TDD，至少做到：**每个 bug 修复都附赠一个回归测试**。半年后你的测试目录就是项目最可靠的说明书。
+
+<FlashCard front="pytest 怎么发现测试？" back="默认收集当前目录下 test_*.py 或 *_test.py 文件里、以 test_ 开头的函数。断言直接用 assert，失败时自动展示实际值与期望值。" />
+
+## 动手试一试
+
+1. 给零基础系列写的 `safe_divide` 写三个测试：正常除法、除零、非数字输入。
+2. 给 todo-cli 的 `complete_task` 写测试，覆盖：正常完成、编号越界两个用例。
+3. 把 `test_add_many` 故意改坏一组期望值，观察 pytest 的失败报告长什么样。
+
+<Quiz
+  question="两个测试函数都依赖同一个返回列表的 fixture，它们拿到的列表是？"
+  options={["同一个对象，会互相影响", "各自一份全新实例，互不影响", "第一个测试拿到副本，第二个拿到原件", "取决于执行顺序"]}
+  answer={1}
+  explanation="pytest 默认对每个测试重新执行 fixture 函数，保证测试之间完全隔离。这是测试可靠性的基石。"
+/>
