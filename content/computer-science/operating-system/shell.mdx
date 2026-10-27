@@ -1,0 +1,97 @@
+---
+id: os-shell
+title: Shell 与命令行
+description: 和管家对话的语言——理解命令行不老土，它是把系统能力串成流水线的利器。
+tags: [操作系统, Shell, 命令行, 管道]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 50
+prerequisite: [os-what, os-filesystem]
+related: [co-multitask, python-venv-projects]
+---
+
+## Shell 是什么
+
+内核是管家，但管家不会读心术——你得用他能懂的语言下指令。**Shell** 就是这个对话界面：你输入命令，Shell 翻译成系统调用交给内核，再把结果打印回来。
+
+| 名字 | 由来 |
+|------|------|
+| Shell（壳） | 包在内核外面的"壳层"，程序与内核之间 |
+| 命令行 / 终端 | 日常叫法，指这个文字交互界面 |
+| bash / PowerShell / zsh | 不同厂家生产的 Shell（方言不同，语法相似） |
+
+图形界面（点按钮）和命令行（敲命令）最终触发的是**同样的系统调用**。命令行不老土——它是自动化与专业效率的入口。
+
+## 为什么高手爱命令行
+
+三个图形界面做不到的优势：
+
+1. **精确**：`copy 2026-*.jpg backup` 一次说清，不用一个个拖选
+2. **可组合**：命令的输出能接给下一个命令当输入（见下文管道）
+3. **可脚本化**：把一系列命令存成文件，一键重放——**这就是编程**（Python 方向篇的批量重命名，本质就是自动化命令）
+
+```bash filename="常用命令对照"
+dir / ls          # 看目录里有什么（Windows dir，macOS/Linux ls）
+cd folder         # 进入某目录
+mkdir new         # 新建目录
+copy / cp a b     # 复制
+del / rm a        # 删除
+type / cat a.txt  # 看文件内容
+```
+
+## 管道：把命令串成流水线
+
+命令行真正的杀手锏是**管道**（`|`）：上一个命令的输出，直接成为下一个命令的输入。
+
+```text
+type app.log | find "ERROR" | sort
+   读日志        过滤含 ERROR 的行     排序输出
+```
+
+三个各只会一件小事的工具，串起来完成一件复杂的事——像数据结构篇的**生成器管道**：每一步只处理流经的数据。
+
+```mermaid
+flowchart LR
+  A["type app.log"] -->|"全部日志行"| B["find ERROR"]
+  B -->|"错误行"| C["sort"]
+  C --> D["结果输出"]
+```
+
+Linux 哲学"每个程序只做好一件事"正是围绕管道展开的。
+
+## 用编程的眼光看一条命令
+
+命令行与 Python 并不是两个世界。以删除文件为例，两侧殊途同归：
+
+```python filename="cli-vs-python.py"
+# 命令行方式
+# del old.txt        （Windows） / rm old.txt（macOS/Linux）
+
+# Python 方式——最终都是系统调用
+from pathlib import Path
+Path("old.txt").unlink()
+```
+
+Shell 收到命令后：解析单词 → 找到对应程序（或内置命令）→ **创建进程**执行 → 等它结束 → 显示结果。命令行本身就是"每敲一行就启动一个进程"的自动化工具——操作系统篇的知识在这里全部落地。
+
+<Callout type="tip" title="命令行的学习策略">
+
+别背命令。记住三件事就够：① `命令 --help` 查用法；② 常用命令就十来个，用几次就熟；③ 报错复制去搜。真正值得记住的是**思路**：把重复操作变成命令，把命令串成流水线。
+
+</Callout>
+
+<FlashCard front="管道（|）解决了什么问题？" back="让一个命令的输出直接成为下一个命令的输入，把多个单一职责的小工具串成流水线，不需要中间文件——这是命令行效率的核心来源。" />
+
+## 动手试一试
+
+1. 用命令行完成一次"看目录 → 进入 → 新建文件夹 → 创建文件 → 查看内容"，全程不碰鼠标。
+2. 体验管道：`dir | find "py"`（Windows）列出当前目录下名字含 py 的条目。
+3. 用 Python 的 `subprocess` 模块运行一条命令行命令，体会"命令行就是启动进程"这句话。
+
+<Quiz
+  question="type app.log | find 「ERROR」 这条管道命令中，find 收到的输入是什么？"
+  options={["app.log 文件名", "app.log 的全部内容", "type 命令的返回状态码", "什么都没有，find 自己读文件"]}
+  answer={1}
+  explanation="管道把前一命令的标准输出完整接给后一命令的标准输入。find 拿到的是日志的每一行，逐行筛选包含 ERROR 的行——两个工具互不知道对方存在。"
+/>
