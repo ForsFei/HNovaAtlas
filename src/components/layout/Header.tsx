@@ -6,6 +6,7 @@ import { SearchLauncher } from "@/components/search/SearchLauncher";
 
 const links = [
   { href: "/knowledge/", label: "探索知识" },
+  { href: "/roadmap/", label: "学习路径" },
   { href: "/tag/", label: "知识标签" },
   { href: "/#approach", label: "学习方式" },
   { href: "/about/", label: "关于 Atlas" },
