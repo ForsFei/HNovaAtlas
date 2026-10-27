@@ -1,0 +1,149 @@
+---
+id: industrial-vision-wpf-display-foundations
+title: WPF视觉显示：像素中心、留白换算与同帧结果叠加
+description: 区分原图像素和WPF显示坐标，推导居中等比显示、ROI边界与像素选取，建立切帧清结果、迟到隔离、线程归属和关闭排空的显示契约。
+tags: [工业自动化, 机器视觉, WPF, 坐标, 异步]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 80
+prerequisite: [industrial-vision-bounded-processing, industrial-vision-planar-calibration]
+related: [industrial-csharp-wpf-vision-viewer, industrial-csharp-inspection-pipeline, industrial-csharp-planar-calibration]
+---
+
+## 显示层要保证什么
+
+这一批把前面的自有Mono8、[有界处理](/knowledge/industrial/host-computer/vision/csharp-bounded-inspection-and-latest-preview/)和[坐标域](/knowledge/industrial/host-computer/vision/image-coordinates-planar-calibration-and-errors/)接到一个小型WPF离线窗口。只提供下一帧、处理当前帧、清空显示，以及点击查看像素，不增加相机参数面板、复杂标注或运动按钮。
+
+最重要的不是框画得漂亮，而是**当前图像、当前工件和当前结果不串单**。本例画的是预设ROI的统计框，不是算法检测出来的目标框；青色不表示产品OK。
+
+## 1. WPF坐标不是原图像素，也不是毫米
+
+图像8×6是源图像素数量。控件可能是1000×600，它描述显示布局空间；操作系统还会按DPI处理最终屏幕呈现。WPF主要使用设备无关单位，参见[微软图形渲染说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/graphics-multimedia/wpf-graphics-rendering-overview)。
+
+本例通过e.GetPosition(Viewer)取得相对同一个绘图控件的坐标，并与该控件ActualWidth/ActualHeight计算布局。不要再随手乘一次“系统缩放150%”，也不要取相对Window的位置后直接套Viewer的比例。
+
+只有在真的使用屏幕物理像素、截图或跨可视对象坐标时，才按相应坐标链转换。本文控件不额外旋转、镜像、平移或缩放；若自行添加RenderTransform或Viewbox，必须重新核对点位置与图像/叠加层使用的变换，不能继续原封不动地套公式。
+
+## 2. 等比居中显示的完整公式
+
+源图宽高为Iw、Ih，控件可用宽高为Vw、Vh：
+
+```text
+scale = min(Vw / Iw, Vh / Ih)
+drawnWidth  = Iw × scale
+drawnHeight = Ih × scale
+left = (Vw - drawnWidth) / 2
+top  = (Vh - drawnHeight) / 2
+```
+
+这对应本例明确实现的Uniform、水平/垂直居中布局，不是通用WPF Image全部Stretch/Alignment组合的公式。控件尚未布局、宽高为0、图像无效时不生成有效坐标映射。
+
+8×6图像显示在1000×600中，scale=100，实际图像占800×600，左右各留100。若直接用鼠标X÷100，整张图会偏一列；必须先减掉left。
+
+同一张图放进400×600，scale=50，图像400×300，上下各留150。改变窗口尺寸时要使用新控件尺寸重算，不能只在第一次加载时缓存比例。
+
+## 3. 像素中心和像素边缘为什么差半格
+
+原图点(Column=0,Row=0)表示第一个像素中心。但图像绘制矩形从第一个像素的外边缘开始，因此中心映射为：
+
+```text
+displayX = left + (Column + 0.5) × scale
+displayY = top  + (Row    + 0.5) × scale
+```
+
+在上面的1000×600示例中，第一个中心是(150,50)，而不是(100,0)。最后一个中心是(850,550)，也不是图像右下边界(900,600)。
+
+本例TryToDisplay只接受0..Width-1、0..Height-1的像素中心域，允许亚像素点。它与上一批平面模型的中心域一致，不接受把像素外边缘当成中心点。
+
+## 4. ROI矩形画的是面积边界
+
+ROI(X=1,Y=1,Width=2,Height=2)包含列1、2与行1、2四个像素。其显示边框应为：
+
+```text
+rectangleLeft = left + roi.X × scale
+rectangleTop  = top  + roi.Y × scale
+rectangleWidth  = roi.Width × scale
+rectangleHeight = roi.Height × scale
+```
+
+这里没有再加0.5，因为画的是像素面积边界，不是中心点。若将左上像素中心与右下像素中心直接连成矩形，会少半格/少一格，看起来像框偏移。
+
+示例框线保持2个显示单位，不随源像素放大到100倍。绘图时将框限制在图像显示矩形内，不把笔画越出图像误当ROI扩大。更复杂的轮廓、中心点、文本或缩放策略，后续按真实算法输出再增加。
+
+## 5. 鼠标点击：先排除留白，再选整数像素
+
+本例点击功能只选中一个源图像素单元：
+
+```text
+先检查鼠标在图像显示矩形内
+Column = floor((displayX - left) / scale)
+Row    = floor((displayY - top ) / scale)
+```
+
+左/上边界包含，右/下边界排除；点击留白返回false，不把坐标clamp到边缘。返回PixelHit整数列行后，从原始Mono8Image.GetPixel取值，不从缩放后的屏幕截图取灰度。
+
+这不是亚像素检测，也不是鼠标精确位置测量。即使图像缩得很小、一个显示点覆盖多个源像素，示例仍按该几何规则选择一个单元，不能因此获得更高分辨率。
+
+点击得到的整数像素中心可以作为后续平面换算的输入候选，但仍需独立标定绑定、支持域和有效性核对。窗口不自动转换毫米，更不发机械运动。
+
+## 6. 原图到WPF位图的生命周期
+
+SDK借用缓冲必须按其契约归还，显示层不持有已经释放的指针。本例从公开不可变、应用自有的Mono8Image复制字节，创建Gray8 BitmapSource；[BitmapSource.Create官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.windows.media.imaging.bitmapsource.create?view=windowsdesktop-10.0)给出像素格式、数组、尺寸、DPI与stride参数。
+
+本例字节已紧凑，stride=Width。这个宽度不能原样套到任意SDK原始缓冲；含padding的输入仍先走前面逐行复制流程。96 DPI是此位图显示元数据，不是相机光学分辨率或物方毫米比例。
+
+创建后Freeze使对象不可变。[微软Freezable说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/freezable-objects-overview)允许已冻结对象跨线程共享；未冻结对象不能照搬该规则。Freeze不替你归还SDK租约，也不会自动处理Mat/HObject或驱动句柄。
+
+这份小图示例选择每次换图创建BitmapSource。它不是大图/高帧率的零分配实现；未来若改WriteableBitmap，应另外审查UI线程更新、stride、DirtyRect与BackBuffer的生命周期，不能只替换类型名。
+
+## 7. 叠加前到底要核对哪些身份
+
+| 核对项 | 防止的错配 |
+| --- | --- |
+| PipelineSession | 旧处理器实例结果混入新实例 |
+| 完整CaptureRequest | 相同数字编号但Owner/工件/采集配置不同 |
+| FrameStamp | 不同源会话或不同帧 |
+| CameraEpoch / TriggerSequence | 不同设备代或原触发证据 |
+| 完整ProcessingRecipe | 算法版本、配置、ROI或阈值变化 |
+| 终态与测量摘要 | 将处理中/失败/空测量当成功框 |
+
+FrameDisplayState只核对这些应用元数据，不重新证明相机身份、像素内容或标定，也不提供鉴权。伪造同字段的record不能因此变成可信现场证据。实际显示输入应来自已验证的采集/处理流程。
+
+Show接受一张图时，先清除原Result和OverlayRegion。TryAttach只接受与当前图匹配的终态；相同原结果可重复观察，冲突的第二终态不能覆盖已有终态。匹配Failed只显示失败状态，不画成功ROI。
+
+## 8. 处理A时切到B，A回来怎么办
+
+```text
+显示A → 提交A处理 → 显示B并清旧结果 → A结果返回
+                                         ├─ 业务层：A仍要有结果交代
+                                         └─ 显示层：当前是B，不给B叠加A
+```
+
+显示拒绝不等于处理失败，更不是可以悄悄丢弃业务结果。本例将旧结果作为本地演示消费，显示“该结果未叠加”，再用原收据确认释放流水线容量；没有数据库或PLC，不宣称已完成持久化交接。
+
+生产项目如果需要追溯，应先按原请求落库/发布并完成匹配确认，再释放相应业务记录；预览是否显示过不应该决定工件有没有检测结果。也不要在当前工件文本框中直接写入迟到结果。
+
+## 9. UI线程归属与更新频率
+
+WPF控件由所属Dispatcher管理，后台处理结果应回到UI线程更新；参见[官方线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)。本例从按钮事件await结果，未使用ConfigureAwait(false)脱离UI上下文，继续后VerifyAccess再修改显示状态。
+
+如果结果来自真正后台回调，应捕获已有UI Dispatcher并await InvokeAsync，不在工作线程调用Dispatcher.CurrentDispatcher期待得到UI线程。也不要UI线程.Wait/.Result阻塞一个还需要回到UI完成的操作。
+
+本例是手动逐帧，不注册每帧Dispatcher推送，也不使用连续预览定时器。后续连续采集时，应复用有界最新槽、限制UI更新频率，避免图像队列有界但Dispatcher队列无限增长。
+
+## 10. 清空显示、关闭窗口与设备停止
+
+清空只删当前显示引用和叠加，不取消已接收处理。处理返回后仍按原任务交代；若已无图，结果自然不会叠加。
+
+关闭采用：禁用新操作→Complete停止接收→await已接收处理及UI交接→await工作器退出→释放离线源并清显示→真正关闭。Closing事件第一次取消关闭请求，完成后再关闭；重复关闭不重复启动排空流程。
+
+400ms延迟只是演示迟到结果，不是算法耗时测量。示例没有强杀或硬退出预算；真实原生调用不返回仍需另设计中断/隔离机制。关闭显示绝不等于相机停止曝光、雷赛轴停止或机器人安全停止。
+
+## 11. 怎样验收这一层
+
+纯几何检查应覆盖横/竖留白、缩小、像素中心、ROI边缘、点击排除和尺寸变化。元数据检查应覆盖切帧、清空、旧实例、错误工件/配方、失败和冲突终态。
+
+此外还要实际渲染验证，不能只断言一个布尔值。本例使用RenderTargetBitmap检查源灰度、青色边框及切帧后边框消失，并程序触发真实XAML按钮与关闭事件。它是离屏自动检查，不等于人工操作、多显示器/DPI矩阵或现场长期运行验收。
+
+下一篇运行[WPF离线查看器与显示检查](/knowledge/industrial/host-computer/vision/csharp-wpf-offline-viewer-and-overlay/)。视觉第8步通用基础教学至此形成完整链条，原生采集/实际标定/现场项目仍单列；之后进入HALCON对象与C#集成。

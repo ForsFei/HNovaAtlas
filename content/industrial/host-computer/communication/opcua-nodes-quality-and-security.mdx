@@ -1,0 +1,147 @@
+---
+id: industrial-opcua-nodes-quality-security
+title: OPC UA 通信基础：节点、数据质量、订阅与证书
+description: 从 PLC 数据访问理解 OPC UA 的地址空间、NodeId 与命名空间、DataValue 质量和时间戳、采样与发布，以及应用证书、用户身份和写入权限的区别。
+tags: [工业自动化, 上位机, OPC UA, PLC, C#]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 110
+prerequisite: [industrial-plc-protocols-data-contracts]
+related: [industrial-opcua-csharp-secure-read-write-subscribe, industrial-communication-data-contracts, industrial-modbus-value-decoding-wpf-monitor]
+---
+
+## 先回答：为什么还需要 OPC UA
+
+前面用 S7 读取 DB 字节，用 Modbus 读取寄存器。双方还需要约定：这个地址是温度还是状态、是哪个类型、有没有缩放、目前能否使用。
+
+OPC UA 不只是“另一种读寄存器的报文”。它允许服务端用节点和引用组织设备对象，向客户端暴露类型、属性和服务。上位机可以浏览设备、读取变量、写入允许修改的属性、订阅数据变化；服务器若提供相应模型，还可以调用方法、读取历史或接收事件。本章先做最常用的 Client/Server 数据访问，不把 PubSub、历史和报警模型一次塞进来。
+
+本文的教学设备只有三个变量：温度 Temperature、就绪 Ready、设定值 Setpoint。**它不是实际控制器，也没有加热、扫描周期或安全互锁逻辑。** 下一篇使用真正的 C# SDK 和本机服务端验证通信，不拿内存方法调用冒充 OPC UA 网络测试。
+
+## Client、Server、网关：角色不是固定的设备种类
+
+通常 WPF 上位机是 Client，PLC 内置 UA 服务或独立网关是 Server。但设备是否支持 OPC UA、是否需要许可、暴露哪些节点、读写周期和权限，都取决于型号与配置。
+
+一个把 S7 数据转为 UA 的网关，前端 UA 连接正常，并不保证后端 PLC 数据正常。网关可能缓存旧值；上位机仍须检查数据质量和更新约定，不能把网络畅通当成设备就绪。
+
+不要把 OPC UA 与旧 OPC DA 的 COM/DCOM 部署方式混为一谈。本例使用 UA TCP，地址形如 `opc.tcp://127.0.0.1:端口/HNovaDemo`；实际协议、端口与安全端点要向服务端确认，不能只凭“UA 默认端口”猜配置。
+
+## 地址空间：对象、变量、属性和方法
+
+教学地址空间可以画成一个小树：
+
+```text
+Objects
+└─ Demo                         Folder（组织节点）
+   ├─ Temperature               Variable / Double / 只读
+   ├─ Ready                     Variable / Boolean / 只读
+   └─ Setpoint                  Variable / Double / 可写，0～100
+```
+
+这只是浏览结果的树形展示；地址空间本身是节点通过引用组成的图。
+
+- Object 表达设备或组成部分，Variable 持有值；Method 是可调用的操作，不等于一个可写 Boolean。
+- Attribute 是节点的属性字段，例如 NodeId、BrowseName、DisplayName；变量还具有 Value、DataType、ValueRank、AccessLevel 等。
+- Property 是一种变量节点，不要把“属性节点”与任意 Attribute 当作同一术语。
+- Reference 表达组织、组件、类型定义等关系。Browse 的方向、引用类型与节点类别过滤会影响看到的结果。
+
+所以“读一个节点”通常还要明确读哪个 Attribute。普通实时数值读取的目标是 `Attributes.Value`，不是把整个节点对象搬回客户端。
+
+## NodeId 不是显示名称，也不是固定的 ns=2
+
+示意 NodeId：
+
+```text
+ns=2;s=Demo.Temperature
+ns=2;s=Demo.Setpoint
+```
+
+`ns` 是当前服务端命名空间表的索引；`s` 表示字符串标识符。NodeId 也可以使用数值、GUID 或字节串标识符。`Demo.Temperature` 在本例中是完整字符串标识，不表示客户端一定可以用点号分割并自动逐级访问。
+
+持久配置优先保存“Namespace URI + 标识符 + 标识符类型”，会话建立后再把 URI 映射为当前索引。服务端升级或增加模型后索引可能改变，不能把一次浏览到的 `ns=2` 永久写死。[NodeId 官方定义](https://reference.opcfoundation.org/specs/OPC-10000-3/8.2)
+
+BrowseName 用于浏览和路径解析，DisplayName 用于显示；都不能随便代替 NodeId。两个不同设备可以有相同 DisplayName。基于浏览路径访问时还要考虑每段 BrowseName 的命名空间、引用和多结果，而不是只拼中文名称。
+
+本例契约的 Namespace URI 为 `urn:hnova:industrial:opcua:demo`，变量标识符固定为 `Demo.Temperature`、`Demo.Ready` 和 `Demo.Setpoint`。更换服务端应重新核对契约，不能只改 IP 后沿用演示 NodeId。
+
+## 类型：不用手动交换寄存器，不代表可以随便强转
+
+UA 带有数据类型信息。本例 Double 对应 C# `double`，Boolean 对应 `bool`；Float 是单精度类型，不能因为都是“小数”就当成 Double。Int16、Int32、UInt16、UInt32 同样要分清。
+
+| 要检查什么 | 例子 | 为什么 |
+| --- | --- | --- |
+| DataType | Double，而非 String | `"30"` 不等于 UA Double 30.0 |
+| ValueRank | Scalar，或一维/多维数组 | 数组不能当标量解码 |
+| 实际返回类型 | `TryGetValue(out double ...)` | 防止不知情地截断或转换 |
+| 单位与范围 | ℃、0～100 | 类型正确不等于业务正确 |
+| 特殊数值 | NaN、Infinity | 浮点可表示，不一定允许参与控制 |
+| AccessLevel / UserAccessLevel | 可读、当前用户可写 | 声明支持能力不保证本次写入必然成功 |
+
+结构体、枚举、自定义 DataType、数组和 ExtensionObject 后续按实际模型处理。不要用 `ToString()` 再解析所有值来“统一类型”，这样会丢失原始类型语义。
+
+## DataValue：数值、质量和两种时间戳一起看
+
+一次变量读取返回的不应只被理解为 `23.5`。DataValue 还携带 StatusCode、SourceTimestamp 和 ServerTimestamp 等信息。Bad 时不要使用其中残留的数值；Uncertain 要按业务策略降级或拒绝，不能简单归入成功。[DataValue 官方定义](https://reference.opcfoundation.org/specs/OPC-10000-4/7.11)
+
+以本课程的温度监控为例，处理顺序是：先确认结果质量，再确认类型和有限数值，最后结合采集约定决定是否允许使用。界面可以保留“最后一次正常温度”帮助排障，但必须同时显示失效，不能继续把它当当前有效值。
+
+SourceTimestamp 由数据源赋予，ServerTimestamp 是服务端侧的时间信息；客户端还可以记录本机收到通知的时刻。三者不是同一件事。墙钟比较受时钟同步影响，本机超时宜用单调时钟计算经过时间。
+
+特别注意：**值没变化时，源时间戳可以不变化，也可能没有新的数据变更通知。** “三秒没收到变化”不必然说明温度采集坏了；反过来，一直收到同样的缓存值也不保证采集活着。要明确服务端的质量更新、设备心跳/采集计数和周期性校验策略。
+
+## Read、Write 和 Call 的成功分别意味着什么
+
+Read 可能同时涉及服务级错误和逐节点结果；一批请求里不能仅凭服务调用返回就宣布所有点位正常。SDK 的便捷方法可能对 Bad 结果抛异常，要按固定版本核对行为。
+
+Write 请求应明确 NodeId、AttributeId 和带正确类型的值；响应中的逐项 StatusCode 要逐项检查。`Good` 表示对应写入服务操作成功，不等于机器运动完成，更不等于物理量已经到位。[Write 服务规范](https://reference.opcfoundation.org/specs/OPC-10000-4/5.11.4)
+
+即使再读取到 Setpoint=30，也只验证数据点读回一致。实际动作仍需要独立的请求号、接受/执行/完成/故障状态以及控制器互锁。本例没有把“写参数”和“启动动作”绑成一个按钮，也不在超时后自动重发。
+
+Call 用于服务端提供的方法，但方法返回是否表示受理还是完成，由该方法契约决定。把 Start 从变量改成 Method，不会自动获得业务幂等或安全停机能力。
+
+## 订阅：采样、发布和 UI 刷新不是一个周期
+
+数据订阅大致经历：
+
+```text
+变量数据源 → MonitoredItem 采样/过滤 → 服务端队列
+           → Subscription 发布 → 客户端消费 → UI 展示
+```
+
+MonitoredItem 决定观察哪个属性、申请的采样间隔、过滤条件、队列大小和满队列策略；Subscription 组织发布。服务端可以修订申请参数，不能把设置的 100 ms 当作已经保证的实时性能。[MonitoredItem 模型](https://reference.opcfoundation.org/specs/OPC-10000-4/5.13.1)
+
+订阅建立后通常会有初始通知。测试“写入后收到了变化”时，必须先确认初始值，再写新值并等待匹配结果；否则第一次通知就可能让测试错误地通过。
+
+显示最新温度可以允许有界队列丢旧值；工件计数、动作边沿和报警记录不能未经分析使用相同丢弃策略。队列大小并不能补救采样间隔内已经错过的短脉冲。需要控制器锁存、单调计数或明确事件/握手机制。
+
+客户端处理太慢也会丢本地通知，因此要区分服务端队列与客户端缓冲。把网络通知回调直接改成复杂 WPF 绘图，不是提高可靠性的办法；后续界面集成采用独立接收和最新快照交接。
+
+## 安全连接：三道检查不能互相代替
+
+| 检查 | 回答的问题 | 本机示例 |
+| --- | --- | --- |
+| 应用证书与安全通道 | 对端应用是否可信，消息如何保护 | 双方显式信任本次生成的证书，SignAndEncrypt |
+| 用户身份认证 | 当前会话以哪个用户身份访问 | 只在隔离教学服务使用 Anonymous |
+| 节点访问与业务授权 | 这个身份允许改什么，当前状态是否允许 | Temperature/Ready 只读；Setpoint 限范围 |
+
+Sign 保护完整性，SignAndEncrypt 还保护消息机密性；None 不提供相同保护。本例选择 Basic256Sha256 + SignAndEncrypt，是可复现的互通基线，不声称是所有设备最优或唯一策略。现场应使用双方支持且符合安全要求的策略，不能连接失败就偷偷降级。
+
+应用证书校验还涉及有效期、主机名/Application URI、用途、密钥和签名、信任及吊销等，不是只核对证书显示名称。现场信任应通过独立渠道核对指纹和设备身份；CA 模式还要正确配置证书链与吊销信息。[安全目标](https://reference.opcfoundation.org/specs/OPC-10000-2/4.2)、[SDK 证书说明](https://github.com/OPCFoundation/UA-.NETStandard/blob/07e62f72500cc0923a2bab940653c8c1116fa286/docs/Certificates.md)
+
+不要设置 `AutoAcceptUntrustedCertificates=true`，也不要在验证事件里无条件接受。`rejected` 是排障线索，不是“把里面所有文件都复制到 trusted”的授权来源。客户端不信任服务端、服务端不信任客户端，是两个方向的问题。
+
+## 本章的连接与数据契约清单
+
+接入之前，把以下信息写清楚，再进入 API：
+
+- Endpoint URL、允许的安全模式/策略、服务端应用身份及证书核对方式。
+- 客户端证书如何审批；用户身份来自哪里，凭据如何保管和轮换。
+- Namespace URI、标识符、DataType、ValueRank、单位、读写方向和范围。
+- 非 Good 值如何显示与禁用操作；何种信息能证明采集仍在更新。
+- 采样与发布目标、队列策略、超时、断线后的状态和重订阅策略。
+- 写入超时/断线时如何保留“结果未知”，以及动作请求如何防止重复执行。
+
+继续阅读 [C# 安全连接、对象属性、读写与订阅](/knowledge/industrial/host-computer/communication/opcua-csharp-secure-read-write-subscribe/)，运行本机服务端验证这些边界。
+
+复习：为什么不能永久保存 ns=2？为什么 SourceTimestamp 旧不一定代表采集失效？为什么订阅不适合直接接短脉冲？证书可信是否代表用户有写权限？写入 Good 与动作完成之间还差什么？

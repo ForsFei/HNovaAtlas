@@ -1,0 +1,167 @@
+---
+id: industrial-csharp-opencvsharp-mat
+title: C#实践：Mat创建、图像读写、ROI与资源释放
+description: 固定OpenCvSharp4及Windows原生包，编译并运行PGM解码、Mat类型/像素访问、非连续ROI逐行复制、Clone、颜色/位深转换与PNG内存往返；20项托管与26项原生检查分别记录。
+tags: [工业自动化, C#, OpenCvSharp, Mat, 资源管理]
+difficulty: beginner
+status: published
+updated: "2026-10-23"
+order: 10
+prerequisite: [industrial-opencvsharp-mat-foundations]
+related: [industrial-csharp-mono8-buffer-lifetime, industrial-csharp-wpf-vision-viewer]
+---
+
+## 本轮交付
+
+新增examples/industrial-opencvsharp/，独立于HALCON和WPF示例。固定OpenCvSharp4及OpenCvSharp4.runtime.win为4.13.0.20260627，.NET10/x64，生成packages.lock.json。没有升级旧项目、修改系统PATH/注册表或安装系统组件。
+
+| 验证 | 实际结果 |
+| --- | --- |
+| Release真实接口编译 | 零警告零错误 |
+| 纯托管布局检查 | 20项通过，不调用原生库 |
+| 真实Mat检查 | 26项通过，运行库报告OpenCV 4.13.0 |
+| 相机/WPF/检测效果/长期内存 | 未验收 |
+
+原生通过来自实际OpenCV调用，不是HALCON可用的证明，也不表示工业检测质量已合格。[固定托管包](https://www.nuget.org/packages/OpenCvSharp4/4.13.0.20260627)、[固定原生包](https://www.nuget.org/packages/OpenCvSharp4.runtime.win/4.13.0.20260627)
+
+## 1. 文件和命令
+
+| 文件 | 用途 |
+| --- | --- |
+| PixelLayout.cs | 正步长Mono8、资源上限与ROI校验，20项托管检查 |
+| MatBasics.cs | 真实Mat/ROI/转换/编码链及26项检查 |
+| Program.cs | 托管/原生入口，失败独立退出 |
+| fixtures/contrast-target.pgm | 链接复用既有原创8×6夹具 |
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --native-test
+```
+
+--demo与--native-test运行相同的有断言演示，不打开窗口或写图像文件。退出0表示所选路径完成，1托管检查失败，2参数错误，3原生路径失败。原生失败没有替代算法回退。
+
+## 2. Mat常用属性和方法
+
+| 成员 | 作用与注意点 |
+| --- | --- |
+| Rows / Cols、Width / Height | 图像矩阵尺寸，不是控件尺寸 |
+| Dims | 维数，本例仅二维 |
+| Type() / Channels() | 组合类型与通道数，不自动保证颜色语义 |
+| ElemSize() / ElemSize1() | 每像素/每通道字节数 |
+| Total() | 元素数量，不把通道另算成像素 |
+| Step() / IsContinuous() | 行距与连续性 |
+| Empty() / IsDisposed | 无有效数据与包装已释放，不能混为一种状态 |
+| At&lt;T&gt; / Set&lt;T&gt; | 按已核对的像素类型访问；不是任意类型自动转换 |
+| Ptr(row) / Data | 原生地址，必须保证生命周期和布局有效 |
+| Clone / CopyTo | 复制像素，注意目标别名和所有权 |
+| Dispose | 释放自己拥有的包装/原生引用 |
+
+本文以固定包XML、真实编译与对应版本源码为准；在线API文档可能随项目发展变化，不能把新版本成员直接当本例都支持。[固定版本Mat源码](https://github.com/shimat/opencvsharp/blob/4.13.0.20260627/src/OpenCvSharp/Modules/core/Mat/Mat.cs)
+
+## 3. 创建和读取
+
+```csharp
+using Mat empty = new();
+using Mat image = Cv2.ImRead(file, ImreadModes.Grayscale);
+using Mat color = new(1, 1, MatType.CV_8UC3, new Scalar(10, 20, 30));
+```
+
+程序读取输出目录里的已知PGM文件，核对非空、6行8列、CV_8UC1，再读At&lt;byte&gt;(1,1)=220以及(4,7)=255。调用At时先行后列，不能把Point的x/y习惯照搬过来。
+
+Grayscale是明确解码意图，不等于所有读入图都自动保持原始位深。本例夹具本身8位，其他模式/高位深图像应按需求选择并在解码后核对，不默默截成byte。[解码模式和返回值](https://docs.opencv.org/4.13.0/d4/da8/group__imgcodecs.html)
+
+## 4. ROI：先校验，再创建共享视图
+
+```csharp
+PixelLayout.ValidateRoi(image.Cols, image.Rows, 1, 1, 2, 2);
+using Mat roi = new(image, new Rect(1, 1, 2, 2));
+using Mat deep = roi.Clone();
+roi.Set(0, 0, (byte)42);
+```
+
+ROI输出尺寸2×2，但Step仍为父图行距8。真实检查确认IsSubmatrix为true、IsContinuous为false；改ROI局部(0,0)后，原图(1,1)变42，此前deep仍为220。
+
+本例的检查函数拒绝空ROI、越界与负坐标，不自动裁剪。上限与拒绝策略属于教学适配器，不是声称OpenCV内部不支持任何空范围。若允许裁剪，应在业务结果中明确实际区域，不能把裁完的局部结果当原配方完整覆盖。
+
+## 5. 正确复制非连续Mono8
+
+CopyMono8首先检查非空、二维、CV_8UC1，然后缓存Rows/Cols/Step，逐行复制有效列：
+
+```csharp
+long stride = mat.Step();
+int rows = mat.Rows, columns = mat.Cols;
+byte[] packed = new byte[size];
+for (int row = 0; row < rows; row++)
+    Marshal.Copy(mat.Ptr(row), packed, row * columns, columns);
+```
+
+size先经PixelLayout验证得到rows×columns。缓存尺寸避免每次循环条件都跨原生接口；本例保留包分析器与警告即错误设置，没有压制相关诊断。
+
+这里只支持正步长Mono8。三通道、16位、空Mat都明确拒绝，不自动转换或猜测类型；逐行Ptr从原生Mat取得，调用期间借用者必须保证mat不被释放、重建或并发修改。
+
+PixelLayout对外部字节布局可核对最小长度(height−1)×stride+width，最后一行无需尾部padding。但CopyMono8依据Mat头部推导的范围本身，不能证明任意外部指针真的有那么多有效内存；本例只对自己已建立/解码的Mat演示，不包装相机外部缓冲。
+
+## 6. Clone、CopyTo与父对象
+
+```csharp
+using Mat destination = new();
+deep.CopyTo(destination);
+```
+
+本例空destination得到独立像素，之后修改deep不影响destination。没有对重叠ROI、目标与源已经共享内存等情况作通用保证。
+
+SurvivingRoi函数内部创建OpenCV拥有数据的parent，再返回新的ROI包装；parent头部释放后，返回ROI仍通过原生引用计数保留数据。该案例实际读取到9，但不涵盖SDK借用内存或手动释放的指针。
+
+Mat alias=image只用于ReferenceEquals检查，不另行Dispose alias，因为它是同一个包装。教学代码没有依赖“重复Dispose大概没事”来分配所有权。
+
+## 7. 三通道和位深转换
+
+```csharp
+Vec3b bgr = color.At<Vec3b>(0, 0);
+using Mat gray = new();
+Cv2.CvtColor(color, gray, ColorConversionCodes.BGR2GRAY);
+
+using Mat high = new(1, 1, MatType.CV_16UC1, new Scalar(1000));
+using Mat scaled = new();
+high.ConvertTo(scaled, MatType.CV_8UC1, .1);
+```
+
+原生检查确认Vec3b三个值10/20/30、灰度22、16位读取1000、缩放后100。另测不加alpha直接转8位结果255，说明不是自动按整图动态范围显示。
+
+这里颜色和位深转换只用已知小图，不处理Bayer、线性/非线性颜色空间、相机黑电平、12位packed解包或HDR。不要把CV_16UC1误认为能直接包装Mono12Packed；后者需要先按设备格式解析。
+
+## 8. 读取与写出的四个接口
+
+| 接口 | 输入/输出 | 本批状态 |
+| --- | --- | --- |
+| Cv2.ImRead | 文件→Mat | PGM实际验证 |
+| Cv2.ImDecode | 编码字节→Mat | PNG实际验证 |
+| Cv2.ImEncode | Mat→编码字节 | PNG实际验证 |
+| Cv2.ImWrite | Mat→文件 | 用法导读，未写文件 |
+
+```csharp
+bool encoded = Cv2.ImEncode(".png", destination, out byte[] png);
+using Mat decoded = Cv2.ImDecode(png, ImreadModes.Grayscale);
+```
+
+编码后检查成功标志/字节，再解码并逐像素比较。PNG是无损格式，本批2×2 Mono8往返相同，不代表任意格式都无损、保留全部元数据或全部位深。
+
+文件保存的一般形式是Cv2.ImWrite(outputPath, image)，应检查返回值并处理异常、权限、目录、磁盘和覆盖策略。本文不提供自动覆盖用户路径的入口，也不把内存编码通过写成已验证磁盘保存。[编解码接口参考](https://docs.opencv.org/4.13.0/d4/da8/group__imgcodecs.html)
+
+## 9. using与返回值所有权
+
+MatBasics用using管理解码图、ROI、Clone、转换目标和解码目标，程序结束时按作用域归还。返回给业务的CopyMono8结果是独立byte数组，不携带Data/Ptr或Mat。
+
+如果函数返回新Mat，调用者必须接管并Dispose；如果只是借用输入，函数不能擅自释放它。不要在using中创建Mat后原样返回，又让调用者使用已经释放的对象。
+
+MatExpr等运算临时对象也可能占用原生资源。本批不使用长运算符链，不以using Mat result等一句话就宣称所有中间对象都被正确释放。跨线程、模型缓存、WPF图像转换与长期内存观察后续再做。
+
+## 10. 检查覆盖与下一步
+
+20项托管检查覆盖正步长、末行长度、资源上限、padding剔除、独立复制、ROI范围和整数溢出边界；不调用OpenCV。
+
+26项原生检查覆盖实际P2解码、空Mat、类型/总量/像素、非连续ROI复制、共享写入、Clone/CopyTo、OpenCV自有数据保留、BGR灰度、16位饱和/缩放和PNG内存往返。运行库实报4.13.0，Release零警告零错误；不是依靠只编译或人工输出样本。
+
+本篇容器检查没有执行滤波/阈值/连通区域检测、相机采集、WPF显示或长期压力测试。接着读[C#滤波、阈值与形态学分步结果](/knowledge/industrial/host-computer/opencvsharp/csharp-filter-threshold-morphology-and-stage-readback/)，用可解释夹具观察处理中间结果；标定精度和产品OK/NG继续独立验收。

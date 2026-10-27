@@ -1,0 +1,185 @@
+---
+id: industrial-csharp-interpolation-geometry
+title: C# 插补几何校验：直线、圆心圆弧、半径圆弧与范围
+description: 用纯.NET代码检查有序轴映射、绝对相对直线、圆弧半径和扫角、优劣弧及途经极值，配62项离线断言和未执行的雷赛SDK调用形态。
+tags: [工业自动化, C#, 雷赛, 插补, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-21"
+order: 140
+prerequisite: [industrial-e3032-line-arc-geometry]
+related: [industrial-csharp-e3032-positioning-cycle, industrial-csharp-e3032-motion-observation, industrial-motion-axis-units-coordinates]
+---
+
+## 运行入口与验证范围
+
+沿用 `examples/industrial-motion/`，新增 `InterpolationGeometry.cs`、`GeometryChecks.cs`，不引入几何库、设备框架或新的WPF窗口。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --geometry-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --geometry-demo
+```
+
+这是62项纯数值检查及演示，没有原生DLL、驱动、SDK调用、IO或运动。采样对照只验证计算结果，不模拟EtherCAT周期或伺服轨迹。既有单轴、工步、WPF仍维持各自原来的范围，没有接到这套几何上自动执行。
+
+SDK说明依据[官方固定EtherCAT手册](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)7.8与9.5/9.6节核对；下方LTDMC片段**没有针对用户配套包装编译或执行**。可编译部分仅指仓库里的纯C#几何文件，不包括这些SDK片段。
+
+## 1. 小对象分别表达什么
+
+| 类型/成员 | 语义 | 不代表什么 |
+| --- | --- | --- |
+| `PlaneAxes(U,V,ConfiguredAxisCount)` | 两个有序轴索引与调用者提供的数量 | 真实轴发现、型号能力或物理轴类型 |
+| `PlanePoint(U,V)` | 一个数学平面的mm坐标 | WPF像素、机械完整位姿或原生SDK结构 |
+| `PlaneCoordinateMode` | 直线输入是Relative还是Absolute | 圆心式相对模式的SDK序列化约定 |
+| `PlaneArcDirection` | 数学平面Clockwise/CounterClockwise | 设备未经核对的物理观察方向 |
+| `PlaneBox` | 轴对齐矩形坐标范围 | 真实障碍物、软限位配置或安全区域 |
+| `PlaneLine` | 解析后的绝对起终点、长度和范围 | 卡侧速度曲线或提交票据 |
+| `PlaneArc` | 绝对点、圆心、两端半径、扫角、参考长度和范围 | 已审核/已执行轨迹或完整原生参数包 |
+
+所有方法是纯函数。输出record主要便于阅读和比较；它不是不可伪造的审批凭证。不要把任何人手工构造或`with`修改过的record直接当运动许可。
+
+## 2. 先检查映射与数值域
+
+`PlaneAxes.Validate()`要求数量非0、U/V不同、各索引小于数量。例如虚构夹具`new PlaneAxes(2,0,4)`保留这个顺序，代表U对应轴2、V对应轴0；数字4不是在宣称E3032只有4轴。
+
+本例固定策略如下，全部是教学约束，不是卡规格或机械精度：
+
+| 常量 | 值 | 用途 |
+| --- | --- | --- |
+| `CoordinateLimit` | 1,000,000mm | 各输入坐标的绝对值上限，限制教学数值域 |
+| `MinLength` | 0.001mm | 拒绝过小线长/弦长/圆心半径等退化输入 |
+| `RadialTolerance` | 0.000001mm | 比较起终半径；半径式近半圆拒绝区也用该量级 |
+| `BoundsGuard` | 0.000001mm | 对圆弧坐标包围盒保守扩张 |
+
+检查NaN、Infinity和解析后的相对终点，不只检查原始输入。有限数本身也可能在平方或加法中溢出；本例先限定坐标域，因此中间距离运算落在有限范围，不试图支持任意IEEE754输入。
+
+半径式还限制输入半径绝对值不超过CoordinateLimit；圆心式则根据已受限点坐标求半径，两者不是同一个半径上限规则。模型只处理同单位正交平面，不支持角度/长度混合度量。
+
+## 3. 直线检查怎样调用
+
+```csharp
+var axes = new PlaneAxes(2, 0, 4); // 夹具，不读取设备。
+var baseline = new PlanePoint(10, 20);
+
+PlaneLine line = InterpolationGeometry.Line(
+    axes, baseline, new PlanePoint(60, 80), PlaneCoordinateMode.Relative);
+// line.End=(70,100)，line.Length=100mm，轴顺序仍为[2,0]。
+
+var nominatedRange = new PlaneBox(0, 0, 80, 110);
+bool numericalFit = nominatedRange.Encloses(line.Bounds);
+// 只是矩形几何比较，不执行运动，也不写入卡侧软限位。
+```
+
+工厂校验映射、起点、输入、枚举，解析终点后再校验终点及线长。返回的几何结果统一为绝对坐标，未携带“请再次相加”的隐式状态。
+
+零或近零线段直接抛异常。这不是要求现场一定报错，而是本例不定义“已在目标”的业务完成策略；外层可独立处理，但不能编造一次看到了启动的运动。
+
+## 4. 圆心圆弧检查怎样调用
+
+```csharp
+var axes = new PlaneAxes(2, 0, 4);
+var start = new PlanePoint(10, 0);
+var end = new PlanePoint(0, 10);
+var center = new PlanePoint(0, 0);
+
+PlaneArc shortArc = InterpolationGeometry.CenterArc(
+    axes, start, end, center, PlaneArcDirection.CounterClockwise);
+PlaneArc longArc = InterpolationGeometry.CenterArc(
+    axes, start, end, center, PlaneArcDirection.Clockwise);
+
+// shortArc.SweepRadians=+π/2，参考长度≈15.708mm。
+// longArc.SweepRadians=-3π/2，参考长度≈47.124mm。
+```
+
+`CenterArc`只收绝对起点/终点/圆心，没有圆心相对模式参数。它检查非零半径、非重合端点、半径差，并通过`atan2`与非负角度归一化求有向扫角。未实现整圆、多圈、螺旋或三点式。
+
+对于不超过RadialTolerance的小半径差，结果保留原始终点、`Radius`、`EndRadius`和`RadialMismatch`，不偷偷修正坐标。`Length`按起点半径计算参考圆弧长度；终点只在容差内与该参考圆一致，所以这不是严格经过两个输入点的精确圆弧长度，更不是控制器实际里程。
+
+若工艺不允许这种差异，应在应用层拒绝或重新建立经审核的几何，不由本工具自动吸附/修复。明显半径不等一律拒绝，避免误把普通圆弧参数变成SDK支持的半径渐变轨迹。
+
+## 5. 半径式如何选两个候选圆心
+
+```csharp
+PlaneArc minor = InterpolationGeometry.RadiusArc(
+    axes, start, end, +10, PlaneArcDirection.CounterClockwise);
+PlaneArc major = InterpolationGeometry.RadiusArc(
+    axes, start, end, -10, PlaneArcDirection.CounterClockwise);
+// 正负选择优/劣弧，方向保持同为逆时针。
+// 此例minor圆心约(0,0)，major圆心约(10,10)，不是只修改同一圆的扫角。
+```
+
+工厂先核对弦长不大于直径，再用弦中点与法向量构造两个圆心；比较各候选在指定方向下的扫角，选取满足小于π或大于π的分支，最后复用圆心检查。
+
+`sqrt((R-d/2)*(R+d/2))`与`sqrt(R²-d²/4)`数学相同，前者便于识别接近半圆时的退化；这里并没有因此获得任意尺度的数值鲁棒性。
+
+输入恰为半圆或`2R-d ≤ RadialTolerance`时拒绝半径式，改用`CenterArc`表达经确认的半圆。工具不在浮点误差下自动把不可能的弦夹到2R，也不猜整圆圆心。
+
+## 6. 包围盒按极值求，不按动画帧猜
+
+圆弧计算先收集实际起终点，再检查0、π/2、π、3π/2是否落在本次有向角区间；包含的角度加入对应极值坐标。起终半径有很小差异时，极值使用两者较大者，并在最终范围四边加BoundsGuard，作为该数值模型的保守范围。
+
+```csharp
+var nominatedRange = new PlaneBox(-.1, -.1, 10.1, 10.1);
+bool endpointsFit = nominatedRange.Contains(start) && nominatedRange.Contains(end);
+bool shortArcFits = nominatedRange.Encloses(shortArc.Bounds);
+bool longArcFits = nominatedRange.Encloses(longArc.Bounds);
+// endpointsFit=true，shortArcFits=true，longArcFits=false。
+```
+
+`Contains`和`Encloses`边界包含，非法矩形拒绝；但圆弧边框已扩张，所以几何刚好压在名义边界时可能不通过，这是显式保守策略。调用者不应把范围扩大来消除错误，更不能把这个微小浮点guard当设备的制动/跟随/工具半径余量。
+
+生产路径范围需要结合工具体积、坐标变换、工件、轴耦合与误差模型。本例矩形只为解释几何，既不验证障碍物，也不配置软限位或认证安全区域。
+
+## 7. 雷赛常用插补接口对照
+
+| 接口 | 本次重点 | 仍需额外核对 |
+| --- | --- | --- |
+| `dmc_line_unit` | AxisNum、有序轴/目标数组、posi_mode | 轴数范围与实际配置、坐标系占用 |
+| `dmc_arc_move_center_unit` | Target_Pos、Cen_Pos、Arc_Dir、Circle、posi_mode | 相对圆心基准、整圆/多圈/螺旋语义 |
+| `dmc_arc_move_radius_unit` | 有符号Arc_Radius与独立Arc_Dir | 半圆边界、Circle及配套固件行为 |
+| `dmc_arc_move_3points_unit` | Mid_Pos为中间点，不是圆心；没有独立Arc_Dir参数 | 共线/近共线与空间Circle规则；本例无实现 |
+| `dmc_set_vector_profile_unit` | 合速度unit/s、Tacc/Tdec为s | 真实负载、曲率及配套速度限制 |
+| `dmc_get_vector_profile_unit` | 读回多个输出参数 | 返回码与各输出分别检查 |
+| `dmc_set_vector_s_profile` / `dmc_get_vector_s_profile` | 平滑时间s，s_mode保留为0 | 固定手册范围与配套版本 |
+| `dmc_check_done_multicoor` / `dmc_stop_multicoor` | 坐标系状态与组停止 | 本轮身份、每轴反馈、停止原因和机械确认 |
+
+这些接口通常是LTDMC的静态方法，不存在本例自行发明的`ArcOptions.Open()`对象。数组长度、WORD/DWORD/C long宽度、声明和调用约定按用户同包文件确认；Windows C long不是C#的64位long，不能仅凭名称照抄P/Invoke。没有提供原生适配器或ABI验证。
+
+## 8. 绝对圆心式SDK调用形态
+
+以下仅展示几何结果到参数的明确对应，**未编译或执行**。之前仍需初始化和卡身份核对、独占轴/坐标系、有效参考/基线、现场互锁、审核后的路径与速度参数；不能把`Encloses=true`当运动许可。
+
+```csharp
+// SDK形态，不属于本仓库可运行的离线入口。
+// arc必须来自本次审核及仍有效的绝对坐标计划；此处不实现该审核。
+ushort[] axisList = { arc.Axes.U, arc.Axes.V };
+double[] target = { arc.End.U, arc.End.V };
+double[] absoluteCenter = { arc.Center.U, arc.Center.V };
+
+short rc = LTDMC.dmc_arc_move_center_unit(
+    card, crd, 2, axisList, target, absoluteCenter,
+    (ushort)arc.Direction, 0, 1); // Circle=0，posi_mode=1。
+// 保存提交尝试和rc；0是调用确认，不是到位或安全证据。
+// 异常或结果未知不自动再次调用，也不修改圆心再试。
+```
+
+半径式调用保留审核后的原始有符号半径，不能把`RadiusArc`结果中的正半径绝对值写回，丢掉优弧标志：
+
+```csharp
+// SDK形态，未编译/执行。signedRadius为审核后的有符号原始输入。
+short rc = LTDMC.dmc_arc_move_radius_unit(
+    card, crd, 2, axisList, target, signedRadius,
+    reviewedDirection, 0, 1); // 同样仅示意二维、Circle=0、绝对模式。
+```
+
+直线也可以使用已解析的绝对终点和模式1；不要把相对输入解析后的终点再次以模式0发送。对于圆心式相对模式，本轮不提供推测转换函数。配置、读回、组状态和停止调用形态沿用[多轴IO接口篇](/knowledge/industrial/host-computer/motion/csharp-e3032-positioning-cycle-and-io/)，没有新增忙等UI循环。
+
+## 9. 62项检查实际覆盖到哪里
+
+检查包括：有序映射、重复/越界轴、相对终点和绝对结果一致、零/近零线段、NaN/Infinity与域限制、方向枚举、四分之一/大圆弧/半圆、跨角度零点、反向与平移、不等半径/重合端点、显式容差、半径正负与两种方向的四种组合、非法半径/弦长、近半圆拒绝、矩形包含和内部极值。
+
+另外24组方向/跨角度夹具以24,024个独立三角函数采样点检查解析包围盒，作为补充回归。它不是24,024项设备测试，也不是对所有浮点输入的形式化证明；包围盒算法本身仍基于解析极值，而非依赖这些采样才能得出范围。
+
+未覆盖实机插补误差、真实组完成、卡侧模式兼容、速度/加速度/跃度限制、曲率下的负载、触发精度、坐标恢复或安全验收。也未实现整圆、螺旋、三点重建、N轴、旋转轴混合、碰撞检测和自动参数修复。
+
+继续读[位置比较、锁存与拍照触发](/knowledge/industrial/host-computer/motion/e3032-position-compare-latch-and-camera-trigger/)和 [C#接口与单拍证据](/knowledge/industrial/host-computer/motion/csharp-trigger-and-frame-evidence/)，把“规划位置到达”“卡侧输出”“相机曝光”和“结果属于哪件工件”拆开验证，不用这套离线几何结果替代硬件证据。

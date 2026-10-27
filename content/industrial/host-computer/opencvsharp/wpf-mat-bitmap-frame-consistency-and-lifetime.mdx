@@ -1,0 +1,120 @@
+---
+id: industrial-opencvsharp-wpf-display
+title: WPF集成：Mat位图桥接、同帧叠加与资源生命周期
+description: 将OpenCvSharp像素宽度结果接入WPF，区分Mat与BitmapSource所有权、像素与DIP、后台任务与UI线程、本地显示版本与相机身份，并在关闭时排空调用。
+tags: [工业自动化, OpenCvSharp, WPF, 图像显示, 资源释放]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 120
+prerequisite: [industrial-opencvsharp-stripe-measurement, industrial-vision-wpf-display-foundations]
+related: [industrial-csharp-opencvsharp-wpf-viewer, industrial-csharp-opencvsharp-mat, industrial-csharp-wpf-vision-viewer]
+---
+
+## 这一批把什么接起来
+
+前一批已经能在固定ROI内测量亮条或暗槽的像素宽度。现在把同一算法接到WPF离线查看器，界面只有“下一张离线图”“测量像素宽度”“清空结果”三个按钮，依次回放亮条、暗槽、双条带和空白图。
+
+重点不是多加交互，而是让图像、结果和资源在正确的时间交接：图像不因Mat释放而失效，旧结果不画到新图上，坐标不因留白而错位，关闭窗口不与正在读Mat的算法争抢释放权。
+
+青色框始终是当前配方的预设ROI，不是检测出的物体框；橙色线只在WidthMeasured时表示一组唯一的代表跨度。它不是产品OK标志，也不增加上一批未验证的毫米标定、完整性或实际精度能力。
+
+## 1. 明确三类图像对象的所有权
+
+| 对象 | 本例谁创建/拥有 | 何时结束使用 |
+| --- | --- | --- |
+| Mono8Image | 本地离线图工厂，私有托管像素 | 不可变快照；失去引用后由GC管理 |
+| Mat | 后台调用内部，OpenCV自有内存 | 同步处理返回或抛错时using释放 |
+| BitmapSource | 像素深复制后创建并Freeze | UI/会话引用结束后由WPF/.NET管理 |
+
+Mono8Image不是相机SDK缓冲租约；Mat也不跨到界面字段中长期保存。处理返回的是冻结位图和独立托管测量报告，不是裸指针、ROI视图或原生句柄。
+
+BitmapSource不按Mat的Dispose方式手动释放，也不能把位图的存在当成Mat仍必须保活的理由。本例选择复制责任边界，代价是额外分配和拷贝；没有声称实现零拷贝或连续采集高帧率。
+
+## 2. Mat转位图：像素类型与步长先说清楚
+
+本例只支持非空二维CV_8UC1，映射到WPF的Gray8。先用既有MatBasics.CopyMono8逐行复制有效列，再以packed stride=width创建BitmapSource。非连续ROI保留父图Step时，不能直接从Data读取width×height并假定没有行间空隙。
+
+这里有两个不同的stride：输入Mat.Step是原生行距，可能大于有效宽度；复制后的托管Gray8字节数组行距等于width。应分别在各自边界使用，不能把父图Step直接传给已经压紧的数组。[OpenCV Mat参考](https://docs.opencv.org/4.13.0/d3/d63/classcv_1_1Mat.html)
+
+不把三通道图解释成Gray8，也不对16位图直接截断。若以后加入BGR/BGRA、16位或Bayer，应单独定义通道次序、显示缩放及转换规则；显示用的8位拉伸图也不应默默替代原始测量图。
+
+本例使用BitmapSource.Create的托管数组重载，不把Mat.Data交给WPF延后读取。位图创建后还会实际CopyPixels验证：Mat已释放、原ROI被修改时，位图内容仍正确。[BitmapSource.Create文档](https://learn.microsoft.com/en-us/dotnet/api/system.windows.media.imaging.bitmapsource.create?view=windowsdesktop-10.0)
+
+## 3. Freeze解决跨线程共享，不解决帧关联
+
+WPF大多数界面对象归属于创建它的Dispatcher。后台线程不能直接修改控件、Canvas或窗口状态。BitmapSource属于Freezable，本例创建后立即Freeze，再交给UI读取；冻结后不能继续写它。[WPF Freezable概述](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/freezable-objects-overview)
+
+但IsFrozen只说明对象不可变及可共享，不说明它属于当前图像。一个冻结的旧图依然是旧图；同尺寸同格式也可能来自另一张图。因此会话还检查位图尺寸、Gray8格式、像素内容与捕获输入的一致性。
+
+这些检查仍不是设备身份认证：示例知道本地输入来自哪一个不可变对象，却没有相机曝光时间、触发序号、工件编号或设备时钟证据。不能把离线本地版本升级描述为工业现场的同帧证明。
+
+## 4. 两条执行路径，避免为了预览先调用原生库
+
+加载离线图时，直接由Mono8Image的自有像素创建冻结位图，只显示图和预设ROI，不执行OpenCV。点击测量后才在Task.Run中：
+
+```text
+捕获当前输入与配方
+  → 新建独占Mat并逐行填入像素
+  → 从同一Mat复制冻结位图，执行既有StripeDemo.Measure
+  → using释放Mat
+  → 检查并分离托管输出
+  → 本地版本仍一致时发布
+```
+
+StripeDemo.Measure内部借用输入并自行隔离测量ROI，不改写这张Mat。即使算法失败，局部using也会释放原生图像；已创建但未发布的临时位图只会失去引用，不作为成功结果回填。
+
+这条链不把“能预览离线图”当成原生环境可用的证据。OpenCV加载失败是处理失败，不是NoEdges，也不会换一套纯C#图像算法继续运行。
+
+## 5. 单在途任务，不把按钮连点变成隐形队列
+
+FrameSession同一时间只接收一个处理请求；Busy时第二次提交被拒绝，没有队列和后台重放。换图、清空仍允许进行，但只改变当前显示意图，不声称取消旧原生调用。
+
+点击测量时捕获不可变FrameSelection及本地Revision。加载下一图或清空结果都会更新Revision并立即撤下旧报告。任务完成后，只有未进入Closing且Revision仍匹配才发布；迟到成功和迟到错误都丢弃。
+
+例如A图处理中切到B图，A的成功结果不能覆盖B；A随后报错，也不能把B标成失败。若只是清空A的结果，A的在途任务同样不能把线重新画回来。重复加载相同像素也会产生新的显示意图，不复用旧结果资格。
+
+这个丢弃策略适用于离线查看器，不是生产检测结果留存策略。实际工位即使不再显示某张图，也可能必须保留其终态、对账和PLC回执；这些留给后续有界处理与结果交接章节。
+
+## 6. 不只核对宽度字段，也核对结果结构
+
+会话要求后台返回的配方与捕获配方相等，灰度轮廓长度匹配，再将轮廓复制并重新执行纯托管的分组/配对规则，核对Outcome、宽度、端点、边组和候选对。后台可变数组不会在发布后继续影响界面。
+
+上一批Report中的轮廓已经沿扫描方向排列；Reverse=true时，复核必须先恢复到正轴顺序，再调用内部会反转的Analyze。直接拿报告再次反转会产生坐标或极性错误，本例专门测试了这条路径。
+
+这只是输出格式和内部一致性复核，不重新执行原生滤波，也不能证明一组外部任意轮廓来自对应图像。实际后端的同源性来自本地同步调用边界，不应把报告验证器解释成算法正确性或数据真实性证明。
+
+## 7. 图像像素、WPF DIP与ROI边界
+
+本例使用同一个FrameworkElement绘制图像、ROI和跨度，采用居中Uniform等比布局，减少两个控件各自Stretch导致的错位。比例s=min(可用宽/像素宽,可用高/像素高)，剩余区域为黑色留白。
+
+图像坐标采用整数像素中心约定。测量点映射到DIP时，要在坐标上加0.5再缩放；ROI的整数X/Y表示像素面积起始边界，直接缩放，不再加0.5：
+
+```text
+点：displayX = left + (imageX + 0.5) * scale
+ROI左边：displayLeft = left + roi.X * scale
+```
+
+新查看器图像为128×96，默认ROI(16,16,96,64)。在500×300的离屏绘制区域中，比例3.125、图像范围(50,0,400,300)；测量点(39.5,47.5)/(71.5,47.5)显示为(175,150)/(275,150)，ROI显示范围(100,50,300,200)。这批ROI高度与前篇演示的32不同，不能照抄前篇中心线y31.5。
+
+图像和叠加使用同一映射并裁到图像区域。缩放只改变DIP跨度，不改变报告中的32px。DPI、DIP、原图像素与毫米仍是不同单位；本轮仅验证96DPI离屏结果，没有多显示器/多DPI人工验收。
+
+## 8. 关闭窗口：先禁收，再排空，再Close
+
+第一次Closing事件先取消本次关闭，设置Closing、清空当前图和结果，禁止新的加载、清空和提交，再异步等待工作Task结束。待任务实际退出后，通过Dispatcher排队再次Close，第二次由allowClose放行。
+
+不用UI线程的Wait/Result阻塞，也不从关闭事件抢先Dispose后台仍在读的Mat。Task.Run只是移动执行线程，不提供对原生函数的强制取消；CancellationToken或停止等待本身都不等于原生调用结束。[WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+原生调用不返回时，本例会继续等待，没有硬关闭期限、跨进程隔离或看门狗。现场需要这些能力时，应在SDK允许范围内设计退出路径，不能简单用超时后释放共享内存来“解决”。本例也不保证GC即时回收全部位图资源。
+
+## 9. 验证结果与仍未验证的事项
+
+独立项目Release零警告零错误。36项WPF/会话检查实际创建位图、跨线程读取和调用Dispatcher，处理算法使用明确测试替身，不执行OpenCV；26项真实OpenCV/WPF检查调用Mat/Reduce/Gaussian，验证位图、原生资源释放及离屏绘图。
+
+本机离屏图确认青色ROI、橙线、黑边及半像素位置；清空、换图、多候选和关闭会撤下不适用的线。还用门闩控制真实后台调用，验证旧结果隔离，以及Mat使用中不被提前释放、排空后实际IsDisposed。
+
+这不是可见窗口人工操作验收，也不包含多DPI、相机/工件关联、实际测量精度、产品质量、连续采集队列、长期内存/帧率或PLC/运动接入。HALCON原生环境的既有待验项也不会因OpenCV/WPF通过而自动完成。
+
+## 继续实践
+
+进入 [C# WPF离线测量查看器、位图桥接与关闭排空](/knowledge/industrial/host-computer/opencvsharp/csharp-wpf-mat-bitmap-measurement-viewer/)。接着读[有界测量、最新预览与资源观察](/knowledge/industrial/host-computer/opencvsharp/bounded-measurement-preview-and-resource-observation/)，之后再进入YOLO；不靠更多按钮替代算法与结果交接的明确边界。

@@ -1,0 +1,128 @@
+---
+id: industrial-halcon-procedure-integration
+title: HDevelop集成：过程接口、源码导出与HDevEngine
+description: 将交互算法整理为无窗口的可调用过程，区分C#源码导出与HDevEngine包装导出，约定图标/控制参数、版本、空结果、异常和部署依赖。
+tags: [工业自动化, HALCON, HDevelop, HDevEngine, C#]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 120
+prerequisite: [industrial-halcon-objects-foundations, industrial-csharp-halcon-metrology]
+related: [industrial-csharp-halcon-engine, industrial-csharp-inspection-pipeline]
+---
+
+## 从“在HDevelop里运行”到“由上位机调用”
+
+前面已经学习分割、匹配和测量。现在不再增加一种算法，而是整理算法与C#应用的边界：图像由谁提供、参数怎样传入、结果怎样返回、异常由谁处理，以及修改算法后怎样发布。
+
+本批沿用HALCON 24.11.3，补一个小型分割过程与真实HDevEngine接口。没有安装或启动HDevelop，过程文件是仓库手工编写的源文件，不是实际点过导出菜单生成的产品；其引擎加载、语法与算法数值仍待原生环境验证。
+
+## 1. 三种方式不要混成一种
+
+| 方式 | 应用执行什么 | 修改算法后通常需要什么 |
+| --- | --- | --- |
+| 手写/导出C#算子代码 | HOperatorSet等.NET接口调用 | 更新C#源码并重新构建应用/算法程序集 |
+| 直接使用HDevEngine | 运行时加载HDevelop程序/过程 | 发布兼容的过程及依赖，并受控重新加载 |
+| Library Project Export的引擎包装 | 自动生成的C#接口内部调用HDevEngine | 检查包装接口与过程版本，仍部署引擎及过程 |
+
+HDevEngine是运行HDevelop逻辑的解释执行库。库项目导出可生成包装代码，减少手写参数转接，但不是把每个HALCON算法编译成一个脱离运行库的纯C#实现。[官方引擎概念](https://www.mvtec.com/products/halcon/features-tools/development-tools-programming/hdevengine)、[官方C#库项目导出教程](https://www.mvtec.com/knowledge-base/videos-tutorials/single-view/integrate-hdevelop-code-into-a-c-application-using-library-project-export)
+
+传统源码导出则将逻辑转换成目标语言代码，仍调用HALCON。两种路线都不是“只复制一个cs文件，从此不需要HALCON运行环境”。[HDevelop的代码导出与运行集成](https://www.mvtec.com/products/halcon/features-tools/development-tools-programming/hdevelop)
+
+本轮没有实际执行任一种IDE导出，也没有交付自动生成包装器。已有HOperatorSet示例是直接接口路线；新增EngineDemo是手写引擎桥接路线。
+
+## 2. 程序、局部过程、外部过程
+
+程序文件常用.hdev，外部过程常用.hdvp。main适合组织开发试验，但上位机集成更适合一个输入输出清楚的过程。局部过程属于程序，外部过程可独立保存并由过程搜索路径加载。
+
+在固定包中，HDevProgram表示程序；HDevProcedure既可加载外部过程，也可通过程序和过程名取得局部过程；HDevProcedureCall承载一次调用。不要把它们都当成一个只有Run方法的脚本对象。
+
+生产项目不一定要把所有算法都拆成单独文件。先保持一个明确入口，确有复用时再拆辅助过程，避免为一次阈值分割设计复杂插件系统。
+
+## 3. 本例的过程接口
+
+过程名atlas_blob_v1，使用第一批8×6原创夹具。四组参数独立定义：
+
+| 参数组 | 名称 | 契约 |
+| --- | --- | --- |
+| 输入图标 | Image | 一张8×6、单通道byte夹具图像 |
+| 输出图标 | Selected | 面积2..10px的连通区域对象元组 |
+| 输入控制 | Low | 一个有限灰度值0..255，上限固定255 |
+| 输出控制 | ContractVersion | 一个数值1，表示这版接口 |
+| 输出控制 | Areas / Rows / Columns | 每个输出区域对应的像素面积/中心行列 |
+
+图标与控制参数不能混传。区域不是一个面积数字，图像路径也不是图像；路径字符串若作为控制参数传入，过程必须自己ReadImage，那会形成另一种接口，本例不这样做。
+
+名称、数量、形状、单位和空结果约定都属于契约。参数仍叫Rows，但实际已改成毫米Y，属于不兼容变更，不能只依靠类型都是double就放行。
+
+## 4. 不含显示操作的过程主体
+
+仓库源文件procedures/atlas_blob_v1.hdvp中的主体为：
+
+```hdevelop
+ContractVersion := 1
+Areas := []
+Rows := []
+Columns := []
+threshold (Image, Region, Low, 255)
+connection (Region, Components)
+select_shape (Components, Selected, 'area', 'and', 2, 10)
+count_obj (Selected, Count)
+if (Count > 0)
+    area_center (Selected, Areas, Rows, Columns)
+endif
+```
+
+每次执行都初始化全部控制输出。没有候选时返回空元组，不用上一帧结果、不补零面积。Selected有N个区域时，三个数值元组应各有N项；不把CountObj当像素数。
+
+这是教学接口，不包含完整产品判定。Low=200的夹具预期仅保留面积4、中心(1.5,1.5)；Low=254预期没有候选。两组都只是待原生验证的预期。[阈值](https://www.mvtec.com/doc/halcon/2411/en/threshold.html)、[连通域](https://www.mvtec.com/doc/halcon/2411/en/connection.html)、[特征筛选](https://www.mvtec.com/doc/halcon/2411/en/select_shape.html)
+
+## 5. 从交互脚本清理掉什么
+
+不要在生产入口里随意ReadImage固定开发盘符、打开窗口、等待按钮、执行stop、枚举相机或发PLC命令。图像采集、工件调度和UI显示应由上位机组织，算法入口只处理明确输入。
+
+dev_display等是HDevelop显示环境相关操作，不能假定进入后台引擎后就自动显示在WPF控件上。需要显示适配时要单独处理；本批直接保持无窗口过程，不配置IHDevOperators、不启动远程调试服务。
+
+模型句柄等有状态资源也不能随意藏在全局变量。正式定位/测量过程应约定模型由谁创建、借用多久、谁清除、怎样切换配方；本例故意只用无跨帧模型的分割任务讲清接口，不同时扩张缓存和并发系统。
+
+## 6. 文件与版本怎样发布
+
+本例csproj将.hdvp复制到输出目录procedures，C#使用AppContext.BaseDirectory定位，不依赖启动终端当前目录。SetProcedurePath是外部过程搜索配置，不是把目录加入Windows系统PATH。
+
+正式发布应将过程、辅助过程、模型、参数、应用接口版本作为受控集合。不能只替换入口.hdvp，却漏掉它调用的辅助过程或与之匹配的模型。ContractVersion只能发现部分接口不兼容，不证明文件来自可信来源，也不是内容哈希或签名。
+
+脚本本身可以执行算子和文件操作，所以不能把用户上传的任意过程、浏览器输入的过程路径直接交给引擎。本例路径固定在仓库输出目录，没有开放任意脚本执行或动态下载。
+
+“无需重编译应用”也不等于可以在运行中的工位随意热替换：至少要停止新提交、等待在途调用完成、切换完整版本、预检并记录版本，再允许接收下一件。当前示例没有实现热更新和回滚。
+
+## 7. 无候选、接口错误、执行异常分开
+
+| 情况 | 处理 |
+| --- | --- |
+| Execute正常完成，Selected为0对象 | 正常NoCandidates，不自动判产品合格 |
+| 版本不支持或元组长度不一致 | 接口/输出错误，不发布业务结果 |
+| 过程缺失、参数名错误、算子异常 | 调用失败，保留诊断，不改成无候选 |
+| 原生DLL加载失败 | 环境失败，不推断许可证失效 |
+
+HDevEngineException具有Category、HalconError、ProcedureName、LineNumber等诊断属性，可帮助定位过程和算子。完整LineText可能包含路径或工艺信息，生产日志应限制敏感内容，不能不加区分地把原始异常展示给全部用户。
+
+本例CLI统一原生路径失败退出3，不自动重试、不吞异常、不调用设备。真正的帧/工件关联仍应由[有界检测与结果交接](/knowledge/industrial/host-computer/vision/bounded-processing-preview-and-result-handoff/)承载。
+
+## 8. 怎样对照验证两条路线
+
+先固定同一张图、同一组参数、同样的系统设置和输出定义，再比较HDevEngine与直接算子调用。比较区域数量和对应面积/中心，不比较控制台字符串，不把候选顺序当跨算法永久身份。
+
+本例native-test计划验证Low=200与254，并与第一批HalconApiDemo直接接口比较；实际仍因DLL加载失败未执行。之后还要在HDevelop中打开同一过程、逐步执行，检查接口与空结果，再补噪声和边界图、异常释放与长期内存。
+
+20项纯托管检查只验证Low/接口版本/输出数组，不解析HDevelop语法。XML可被通用解析器读取，也不等于HALCON已经接受该过程文件。不要把这些层次合并成“引擎运行通过”。
+
+## 9. 复习与面试追问
+
+1. Library Project Export与普通C#源码导出一样吗？不是，应检查产物是算子代码还是引擎包装。
+2. SetProcedurePath是在改系统PATH吗？不是，它配置外部过程搜索路径。
+3. 为什么不用全局变量传上次结果？调用之间可能互相污染，接口和状态归属也不清楚。
+4. 空输出可以当作算法异常吗？不能；正常无候选与执行失败应分开。
+5. 更新过程无需重编译，是否能运行中直接替换？不能据此省略在途调用隔离、版本验证和发布流程。
+6. C#和HDevelop结果一致，就能上线量尺寸吗？还需要实际数据、标定、重复性、性能和工艺验收。
+
+接着读[C#引擎对象、参数传递、执行和释放](/knowledge/industrial/host-computer/halcon/csharp-hdevengine-procedure-call-and-lifetime/)。继续读[WPF后台执行与关闭排空](/knowledge/industrial/host-computer/halcon/wpf-background-execution-frame-results-and-shutdown/)，不将无窗口CLI或窗口编译当成已完成人工UI联调。

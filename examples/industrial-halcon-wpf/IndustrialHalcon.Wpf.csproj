@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <PlatformTarget>x64</PlatformTarget>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../industrial-halcon/IndustrialHalcon.csproj" />
+    <Compile Include="../industrial-vision/Mono8Image.cs;../industrial-vision/PlainPgm.cs" Link="Core/%(Filename)%(Extension)" />
+    <None Include="../industrial-vision/fixtures/contrast-target.pgm" Link="fixtures/contrast-target.pgm" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../industrial-halcon/procedures/atlas_blob_v1.hdvp" Link="procedures/atlas_blob_v1.hdvp" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

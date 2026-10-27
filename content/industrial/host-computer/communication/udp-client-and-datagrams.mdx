@@ -1,0 +1,202 @@
+---
+id: industrial-udp-client-datagrams
+title: C# UDP 工业通信：UdpClient、数据报边界与请求响应匹配
+description: 对照 TCP 理解 UDP 数据报与 Connect 语义，查用 UdpClient 的发送接收和关闭方法，通过本机设备模拟器验证来源端点、请求编号、超时和异常数据报。
+tags: [工业自动化, C#, UDP, UdpClient, 网络通信]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 40
+prerequisite: [industrial-tcp-client-listener-stream]
+related: [industrial-tcp-session-heartbeat-recovery, industrial-serial-framing-and-wpf, industrial-host-computer-chapter-map, csharp-io-network-streams]
+---
+
+## UDP 与 TCP 的关键差别
+
+TCP 面向连接、提供有序字节流；UDP 面向数据报，不先建立 TCP 那样的传输连接，也不提供交付、顺序和去重保证。因此不要把 UDP 理解成“少写一行 Connect 的 TCP”。
+
+| 比较项 | TCP | UDP |
+| --- | --- | --- |
+| 接收单位 | 一段连续字节 | 一份数据报 |
+| 应用边界 | 要自行分帧 | 保留数据报边界，但报文内部格式仍由应用定义 |
+| 丢失、重复、乱序 | 传输层在连接内处理有序交付等机制，应用仍可能失败 | 应用按业务要求识别、容忍或处理 |
+| “关闭”的含义 | 释放连接，可能观察到 EOF/复位 | 释放本地 socket，不会向对端发送 TCP 式断开通知 |
+| 发送成功证明什么 | 不证明设备业务已完成 | 更不能证明设备已收到数据报 |
+| 典型应用考虑 | 持续状态交换、可靠命令通道等 | 按设备协议进行发现、状态上报或低开销消息交换等 |
+
+选择哪种传输，首先取决于设备已经支持的协议。不能因为 UDP 看起来快，就把有业务确认要求的运动指令随意改成 UDP；也不能把 TCP 的“可靠传输”误解成动作恰好执行一次。
+
+本节沿用 [TCP 教学协议](/knowledge/industrial/host-computer/communication/tcp-client-listener-and-stream/)：`READ <请求号> TEMP\r\n` → `TEMP <同一请求号> 253\r\n`，ASCII，载荷最多 96 字节。**本例一个 UDP 数据报恰好包含一个完整协议帧**。
+
+## UdpClient 的常用对象、属性和方法
+
+使用 `System.Net.Sockets.UdpClient`，.NET 10 自带，不需要安装单独 UDP 库：
+
+| 成员 | 用途 | 注意 |
+| --- | --- | --- |
+| `new UdpClient()` | 创建 UDP socket | 首次发送可由系统绑定本地端口 |
+| `new UdpClient(localEndpoint)` | 绑定指定本地地址/端口 | 端口 0 表示由系统分配；服务端则用约定端口 |
+| `Connect(remoteEndpoint)` | 设置默认远端 | 不做 TCP 握手，不证明对端可用 |
+| `Send` / `SendAsync` | 发送一份数据报 | 本地发送完成不表示对端收到或业务完成 |
+| `Receive` / `ReceiveAsync(token)` | 接收一份数据报 | 异步版本可直接传入取消令牌 |
+| `UdpReceiveResult.Buffer` | 收到的数据报字节数组 | 按本协议检查长度和格式 |
+| `UdpReceiveResult.RemoteEndPoint` | 本份报文的来源 IP/端口 | 与允许的设备端点比对，不只检查 IP |
+| `Available` | 查询当前 socket 中可用数据量 | 不作为消息计数器或在线状态 |
+| `Client` | 底层 Socket | 查看本地端点或配置确有需要的选项 |
+| `EnableBroadcast` | 是否允许发送广播 | 本节不启用，不对局域网广播教学指令 |
+| `JoinMulticastGroup` / `DropMulticastGroup` | 加入/退出组播组 | 不等于广播，需要协议与网络配置支持 |
+| `Close` / `Dispose` | 释放本地 socket | 本例用 `using`，不存在“等 UDP 对端确认断开” |
+
+### UDP 的 Connect 到底做了什么
+
+对于固定设备，可以先 `udp.Connect(device)`，之后发送不再每次填写远端，接收也限制为该默认远端。但这不是 TCP 式连接建立；目标端口即使没有服务，也不能凭 Connect 返回就宣称“设备连接成功”。[Microsoft：UdpClient.Connect](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.udpclient.connect?view=net-10.0)
+
+本例不调用 Connect，而是每次 SendAsync 指定远端，并检查 `RemoteEndPoint`，让来源过滤过程可以直接观察。这两种 API 用法不要混写：已经设置默认远端时，发送就使用相应的不带目标重载。
+
+接收操作返回 `UdpReceiveResult`，其中同时包含数据和来源；若调用了 Connect，其他来源的数据报会被过滤。[Microsoft：ReceiveAsync](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.udpclient.receiveasync?view=net-10.0)
+
+## 数据报边界不等于业务正确
+
+如果设备调用两次 SendAsync，发送 `TEMP` 和剩余内容，应用收到的就是两份独立数据报。**本协议不允许把它们拼接成一帧**。本节在每份数据报上新建解析器，并要求恰好得到一帧、没有残留。
+
+```csharp
+public static string DecodeDatagram(ReadOnlySpan<byte> bytes)
+{
+    if (bytes.Length > MaxPayload + 2)
+        throw new FormatException("数据报超出教学协议上限。");
+    var decoder = new CrlfFrameDecoder(MaxPayload);
+    IReadOnlyList<string> frames = decoder.Feed(bytes);
+    if (frames.Count != 1 || decoder.BufferedBytes != 0)
+        throw new FormatException("一个 UDP 数据报必须恰好包含一帧。");
+    return frames[0];
+}
+```
+
+这里保留 CRLF 是为了与 TCP 共用业务格式，不是 UDP 天生要求结束符。另一种 UDP 协议完全可以不加 CRLF，只检查自身的字段和长度。
+
+还要注意：
+
+- 空 UDP 数据报是可能收到的一种输入，不是 TCP 的 EOF。本教学协议不允许空帧，所以报格式失败。
+- 数据报不能无限大。应按设备协议限制消息大小，并考虑路径 MTU 与 IP 分片；本例 98 字节上限来自教学协议，不是 UDP 的通用最大值。
+- 如果业务真需要跨数据报分片，应定义消息号、片号、总长、超时和内存上限；不能沿用一个无界 StringBuilder 等“总有一天能拼完”。
+
+## 客户端完整主线
+
+代码在同一项目 `examples/industrial-networking/` 的 `NetworkQueries.ReadUdpAsync` 中。下面展示主要逻辑；`WireProtocol` 包含编码、分帧与字段验证：
+
+```csharp
+using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 0));
+using var exchange = CancellationTokenSource.CreateLinkedTokenSource(stop);
+exchange.CancelAfter(responseTimeout);
+try
+{
+    string requestId = WireProtocol.NewId();
+    await udp.SendAsync(WireProtocol.Request(requestId), device, exchange.Token);
+    while (true)
+    {
+        UdpReceiveResult received = await udp.ReceiveAsync(exchange.Token);
+        if (!received.RemoteEndPoint.Equals(device))
+            continue; // 完整示例会报告忽略原因。
+
+        string frame = WireProtocol.DecodeDatagram(received.Buffer);
+        TemperatureReply reply = WireProtocol.ParseResponse(frame);
+        if (reply.RequestId != requestId)
+            continue; // 旧请求或其他请求，不能更新本次读数。
+
+        return reply.Temperature;
+    }
+}
+catch (OperationCanceledException)
+    when (!stop.IsCancellationRequested && exchange.IsCancellationRequested)
+{
+    throw new TimeoutException("UDP 请求响应超时；不自动重发。");
+}
+```
+
+示例绑定回环地址是为了只与本机模拟器通信，不是可直接复制到任意现场网卡的配置。跨机适配应明确本地接口、地址族、设备目标和访问范围。
+
+### 为什么同时校验来源和请求号
+
+来源端点不一致，可能是无关发送方；即使 IP 相同，端口不同也不是约定服务。来源一致但请求号不同，可能是迟到的旧响应、重复报文或别的请求。
+
+这两类输入在本例中记录忽略，不延长等待期限。来自预期设备、但格式或量程无效的数据报会让本次查询失败，防止协议异常被静默掩盖。
+
+来源和编号校验是关联规则，不是安全认证。UDP 来源可能被伪造，请求号也不是秘密；安全场景需要协议支持的认证/保护机制，不能只依赖“来自内网”。
+
+### 为什么不每次 ReceiveAsync 都重置期限
+
+假设一次请求总共允许 1 秒，200 ms 收到旧响应，400 ms 又收到旧响应。如果每次都重新等 1 秒，就可能被无关消息无限拖延。
+
+本例在发送前创建一次 `exchange`，整个发送与接收循环共用它。到期后取消实际的异步接收，等待操作结束，再释放 socket；不是留一个后台 ReceiveAsync 继续抢下一次查询的数据。
+
+### 超时后是否应该重发
+
+UDP 不保证交付，但“加个重试”不等于业务可靠：可能请求丢了，也可能请求已执行而响应丢了。只读温度查询可以按需求设计有限重试；有副作用的命令则需要设备端请求去重、执行状态和有效期等契约。
+
+本教学客户端不自动重发。每次显式调用新建 socket 和请求号，收到有效响应或失败后释放。更复杂的重试、去重缓存与长期订阅不在这一轮实现。
+
+## 设备端：接收一份，再回复给来源
+
+UDP 不用 TcpListener，也没有 Accept。绑定本地端口后，ReceiveAsync 告诉你报文来自哪里：
+
+```csharp
+using var udp = new UdpClient(new IPEndPoint(IPAddress.Loopback, 43121));
+while (!stop.IsCancellationRequested)
+{
+    UdpReceiveResult request = await udp.ReceiveAsync(stop);
+    string id = WireProtocol.ParseRequest(
+        WireProtocol.DecodeDatagram(request.Buffer));
+    await udp.SendAsync(WireProtocol.Response(id), request.RemoteEndPoint, stop);
+}
+```
+
+这是主线片段，实际项目还包含 Ctrl+C 取消、异常报告和故障场景。设备应回给请求的真实来源端点，而不是猜一个客户端端口；客户端使用的往往是临时端口。
+
+完整模拟器顺序处理消息。故障模式 `slow` 中人为等待也会阻塞它处理后续请求，这是教学简化，不是生产服务的推荐并发模型。
+
+## 本地运行与故障验证
+
+开两个终端。从仓库根目录在终端 A 运行：
+
+```powershell
+dotnet run --project examples/industrial-networking/IndustrialNetworking.csproj -- --udp-device 43121 stalethenvalid
+```
+
+终端 B：
+
+```powershell
+dotnet run --project examples/industrial-networking/IndustrialNetworking.csproj -- --udp-client 43121
+```
+
+预期先记录“忽略旧请求或其他请求的数据报”，再显示 25.3 °C。设备端 Ctrl+C 结束；客户端成功或失败都会释放本地 socket。没有额外的“打开连接/关闭连接”握手。
+
+| 场景 | 模拟行为 | 预期 |
+| --- | --- | --- |
+| `normal` | 正常回复 | 得到有效温度 |
+| `stalethenvalid` | 先发另一个编号，再发正确响应 | 过滤旧响应，仍能完成 |
+| `wrongsourcethenvalid` | 先从其他本地端口发响应 | 过滤错误来源，再完成 |
+| `wrongid` | 只回错误请求号 | 忽略后最终超时 |
+| `drop` | 收到查询但故意不回复 | 超时；这是应用侧不回复模拟，不是物理网络丢包 |
+| `slow` | 等 2 秒再回复 | CLI 的 1 秒期限先到 |
+| `malformed` | 温度不是整数 | 格式失败 |
+| `empty` | 发空数据报 | 格式失败，不当作 EOF |
+| `oversize` | 发 512 字节数据报 | 超出教学协议上限 |
+
+运行 `--self-test` 会同时验证 TCP 与 UDP。测试使用真实回环 socket 和临时端口，但不涵盖现场交换机、广播/组播、跨机防火墙、真实网络丢包率或设备 SDK 兼容性。不能把本机收发通过等同于“工业通信全部验收”。
+
+## 放到 WPF 时怎样使用
+
+现阶段可以在一个异步命令中 await 一次 `ReadUdpAsync`，然后在 UI 线程更新结果；不要为已经异步的网络 I/O 额外加 Task.Run，也不要 `.Result` 阻塞 UI。
+
+窗口负责本次操作的 CancellationTokenSource：断开/关窗时 Cancel，并 await 查询任务结束。界面至少区分正在查询、有效值、超时、取消和格式失败，不能让上次成功温度继续伪装为当前在线值。
+
+本篇保持单次 UDP 查询；[TCP 长连接、心跳、恢复与 WPF 示例](/knowledge/industrial/host-computer/communication/tcp-long-connection-heartbeat-and-recovery/)进一步展示持续接收、单在途请求关联和状态快照，不是把 UDP 查询简单换个界面，也没有提前加入并发请求表。不要把单次查询示例包装一下就称为完整的长期在线监控。
+
+## 自测与面试追问
+
+1. UDP Connect 返回成功，能否证明目标设备已在线？
+2. 一份数据报没有完整结束符，应保存后拼下一份吗？答案取决于哪一层契约？
+3. 空数据报为什么不应照搬 TCP 的“0 表示断开”判断？
+4. 来源 IP 正确但来源端口不同，是否接受？来源相同但请求号不同呢？
+5. 不断收到无关消息时，怎样保证总等待期限仍然有效？
+6. 如果响应丢失但动作已经执行，重发会产生什么后果？单有请求号为什么还不够？

@@ -1,0 +1,109 @@
+---
+id: industrial-communication-data-contracts
+title: 工业通信入门：设备角色、协议层次与数据契约
+description: 从上位机与设备的数据方向出发，区分接口、传输、协议和 C# 库，建立包含类型、字节序、单位和完成语义的数据契约。
+tags: [工业通信, 上位机, CSharp, 数据契约, 学习路线]
+difficulty: beginner
+status: published
+updated: "2026-10-19"
+order: 0
+prerequisite: [industrial-host-computer-learning-path]
+related: [industrial-serialport-basics, industrial-host-computer-chapter-map, csharp-io-network-streams]
+---
+
+## 一次读写到底经过哪些地方
+
+上位机通信通常同时涉及四件事：PC 软件调用哪个对象，字节经过什么连接，对方按照什么规则解释字节，以及业务如何使用结果。学会调用 `Open()` 或 `ConnectAsync()`，只是其中一步。本系列会按“理论 → C# 对象与常用成员 → 开启/连接、读取、写入、关闭 → 异常和完整示例”的顺序讲每一种通信。
+
+以读取温度为例：界面请求刷新，通信模块发出协议请求，设备处理后返回字节，解析模块核对格式并转换单位，最后界面显示本次有效读数。没有收到有效响应时，旧值可以保留，但要同时标明它不是刚刚读到的新值。
+
+## 上位机、下位机与请求方向
+
+“上位机/下位机”描述系统分工，不能直接推出谁一定是 TCP 服务端、谁一定先发送数据。PC 可以主动轮询 PLC，也可以监听仪表上报；具体连接角色由设备接口和通信协议决定。
+
+| 对象 | 常见职责 | 通信时需要明确 |
+| --- | --- | --- |
+| C# 上位机 | 参数编辑、任务请求、数据显示、记录 | 请求何时发起，如何匹配响应，何时反馈成功 |
+| PLC 或运动控制器 | 执行动作和流程、维护 IO 与状态 | 哪些点可写，指令何时接受，完成和故障如何表示 |
+| 仪表、扫码枪等设备 | 测量或采集，并提供结果 | 主动上报还是请求响应，数据格式和结束条件 |
+| 驱动器、IO 模块等 | 执行输出或提供状态 | PC 是否直接访问，还是通过控制器交换数据 |
+
+“输入/输出”也必须注明观察视角。例如 PC 向 PLC 写入目标值，对 PC 是输出数据，对 PLC 是接收数据；已有的 [EtherCAT PDO](/knowledge/industrial/ethercat/communication/pdo/)文章同样强调数据方向的视角。
+
+## 接口、传输、协议、库分别解决什么
+
+| 层次 | 示例 | 回答的问题 |
+| --- | --- | --- |
+| 物理连接/接口 | RS-232、RS-485、以太网连接 | 用什么介质或接口连接，连接条件是什么 |
+| 传输 | TCP、UDP；串口字节收发 | 数据如何送到对端，提供哪些传输语义 |
+| 应用协议 | Modbus、S7、MC、设备自定义报文 | 如何表示读写请求、地址、数据和错误 |
+| C# 对象或库 | `SerialPort`、`TcpClient`、协议库、厂商 SDK | 程序通过哪些成员使用上述能力 |
+
+例如，RS-485 设备可以使用 Modbus RTU，也可以使用厂商自定义协议。能用串口对象发送数据，不代表设备能理解任意字符串。Modbus 官方分别提供应用协议、串行链路和 TCP 实现文档，学习时也应分别处理。[Modbus 规范入口](https://www.modbus.org/modbus-specifications)
+
+## C# 中通常从哪些对象开始
+
+| 通信方向 | 本系列使用或计划介绍的对象/库 | 主要调用位置 |
+| --- | --- | --- |
+| 串口 | `System.IO.Ports.SerialPort` | 配置串口，`Open`，`Read`/`Write`，`Close`/`Dispose` |
+| TCP 客户端 | `TcpClient` 与 `NetworkStream` | `ConnectAsync` 建立连接，`GetStream` 后通过流读写 |
+| TCP 模拟设备 | `TcpListener` | 监听并接受客户端，再取得对应连接的流 |
+| UDP | `UdpClient` | 绑定或指定远端后 `SendAsync`/`ReceiveAsync`；默认远端设置不等于 TCP 握手 |
+| Modbus | NModbus 等协议库 | 在串口或网络传输之上表达线圈/寄存器访问 |
+| 西门子 PLC | S7.NET+ 等设备协议库 | 按设备和库支持范围访问数据区 |
+| OPC UA | OPC Foundation .NET 实现 | 配置应用与会话，读写节点、订阅数据 |
+
+`TcpClient` 本身不是寄存器访问器：网络读写通过它取得的 `NetworkStream` 完成。[Microsoft：TCP 类型与用法](https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/sockets/tcp-classes)。后续协议篇会固定所用包版本，再列出实际成员和示例，库之间的方法名与地址语法要分别核对。[NModbus](https://github.com/NModbus/NModbus)、[S7.NET+](https://github.com/S7NetPlus/s7netplus)、[OPC Foundation .NET](https://github.com/OPCFoundation/UA-.NETStandard)
+
+## 先写一份能够解释数据的表
+
+假设有一个教学温控工位，数据方向以 PC 为观察视角。下面是业务数据契约示意，不绑定具体 PLC 地址；进入具体协议时再补寄存器或数据区映射。
+
+| 数据 | 方向与类型 | 单位/含义 | 需要约定的边界 |
+| --- | --- | --- | --- |
+| `TemperatureRaw` | PC 读，有符号 16 位整数 | 0.1 °C；253 表示 25.3 °C | 协议编码、量程、采样时间、有效性 |
+| `TargetRaw` | PC 写，有符号 16 位整数 | 0.1 °C 的目标值 | 合法范围、何时应用、能否读回确认 |
+| `RequestId` | PC 写，无符号请求标识 | 区分本次与上次操作 | 重复请求、回绕与重新连接后的规则 |
+| `AcceptedId` | PC 读，控制器反馈 | 控制器已接受的请求 | 接受是否代表开始执行，拒绝如何反馈 |
+| `CompletedId` | PC 读，控制器反馈 | 已完成的请求 | 成功与故障分别如何表示 |
+| `FaultCode` | PC 读，枚举或错误码 | 当前故障原因 | 清除条件、历史记录与复位流程 |
+
+真正的点位表还应包含协议地址、读写权限、长度、字节/字顺序、缩放、刷新策略和异常值。请求号只是设计中的一部分，需要控制器实际配合；在任意旧设备上多写一个数字，并不会自动获得去重能力。
+
+## 同一个数字，字节表示也可能不同
+
+有符号与无符号、文本与二进制、大小端、比例系数，都属于数据解释规则。下面的完整控制台片段说明：二进制大端 `01 2C` 表示整数 300，按每单位 0.1 °C 转换后是 30.0 °C；ASCII 文本 `"300"` 则是三个字节。
+
+```csharp filename="Program.cs"
+using System.Buffers.Binary;
+using System.Text;
+
+byte[] binary = [0x01, 0x2C];
+short raw = BinaryPrimitives.ReadInt16BigEndian(binary);
+decimal temperature = raw / 10m;
+Console.WriteLine($"raw={raw}, temperature={temperature:0.0}");
+Console.WriteLine(Convert.ToHexString(Encoding.ASCII.GetBytes("300"))); // 333030
+```
+
+本系列串口示例的离线断言也检查这两种表示。后续遇到 32 位数或浮点数，还要核对多寄存器的字顺序，不能只凭“都是两个寄存器”推断解析方式。
+
+## 四种成功状态，要分别观察
+
+1. **连接或端口已打开**：本机通信资源可使用。
+2. **写入调用完成**：本次调用没有报告写入错误，业务结果仍需协议确认。
+3. **收到有效响应/接受反馈**：对端识别并处理了请求，需要进一步判断具体状态。
+4. **业务动作完成**：设备满足约定的完成条件，必要时另查结果和故障码。
+
+超时只说明在约定时间内没有得到预期结果。可能请求未到，也可能设备已经执行而响应丢失。读取温度通常可以再查；启动一次加工则要先确认请求状态和去重机制，再决定重试。通信中断也不应自动把“未知”显示成“设备空闲”。
+
+## 从什么示例开始
+
+下一篇是[串口 SerialPort：配置、打开、读写与关闭](/knowledge/industrial/host-computer/communication/serialport-basics/)。它采用明确约定的 ASCII 行协议，完整列出常用属性、方法、事件和异常，并提供可编译项目。TCP、UDP、Modbus 和 PLC 后续各有对应章节，采用相同的查用结构。
+
+## 自测
+
+1. 使用 RS-485 的设备，是否一定能收到 Modbus 请求？还需要查哪些信息？
+2. `01 2C`、`2C 01` 和文本 `"300"` 的解释各依赖什么约定？
+3. PC 调用写入方法返回后，为什么还不能立即显示“加工完成”？
+4. 写入超时后直接重发启动指令，可能产生什么业务问题？
+5. 为温度显示增加“有效性”和“采样时间”，能避免哪些误判？

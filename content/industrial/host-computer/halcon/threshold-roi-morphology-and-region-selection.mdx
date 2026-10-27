@@ -1,0 +1,133 @@
+---
+id: industrial-halcon-segmentation-and-morphology
+title: HALCON分割：阈值、ROI、形态学与区域筛选
+description: 用带孔亮块和孤立亮点解释全局/局部阈值、ROI坐标、开闭运算、填孔、连通域及多特征筛选，保留原始缺陷证据而非盲目清理图像。
+tags: [工业自动化, HALCON, 图像分割, 形态学, ROI]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 20
+prerequisite: [industrial-halcon-objects-foundations, industrial-csharp-halcon-first-pipeline]
+related: [industrial-csharp-halcon-segmentation, industrial-csharp-planar-calibration]
+---
+
+## 本篇要解决什么问题
+
+前面学会了Threshold→Connection→SelectShape，但实际图片不只是“黑背景上一块白目标”：照明有梯度、边缘有毛刺、目标内部可能有孔、视野外还会出现反光。这里把每个处理步骤的目的分开，避免把一长串算子当固定模板。
+
+仍按HALCON 24.11，C#示例固定官方24113.0.0接口。下面小图的面积是原创夹具的手算预期，不是本机HALCON实测；真实API的编译与原生运行状态见[配套C#实践](/knowledge/industrial/host-computer/halcon/csharp-roi-segmentation-and-stage-readback/)。本篇不输出产品OK/NG，也不发送运动或PLC命令。
+
+## 1. 先定义分割对象，不急着找阈值
+
+先回答三个问题：要找的是整个工件、亮标记，还是暗孔？孔是缺陷、设计结构，还是允许忽略的纹理？结果要用于计数、定位，还是尺寸测量？
+
+同一张带孔工件图，如果任务是取外形中心，可以另建填孔掩膜；如果任务是检查漏孔或孔面积，直接FillUp就把证据消掉了。保留原图和原始阈值区域，再按任务建立处理分支，比反复覆盖同一个变量更容易解释。
+
+一个够用的起点是：固定离线图→确认像素类型→确定ROI→选择阈值策略→仅做有理由的形态处理→逐连通块筛选→保存像素特征及步骤参数。图像质量不稳定时，也要回头检查光源、曝光和工装，而不是一直加算子。
+
+## 2. 全局阈值：选的是灰度区间，不是物体
+
+对于本例的单通道byte图，`Threshold(Image, Region, 200, 255)`选出灰度在闭区间200..255的ROI内像素。200也被选中，199不会被选中。不同亮块可能放在同一个区域对象里，之后才用Connection拆开。官方还说明整数图像的浮点阈值会取整处理，因此本例直接使用整数参数。[Threshold参考](https://www.mvtec.com/doc/halcon/2411/en/threshold.html)
+
+| 情形 | 初始策略 | 必须检查的边界 |
+| --- | --- | --- |
+| 背景与亮目标灰度稳定分离 | 固定亮区间 | 曝光变化是否让目标跌出区间 |
+| 暗目标、亮背景 | 选择较低灰度区间 | 阴影、黑边是否也被选中 |
+| 照明缓慢变化、目标是局部亮暗差 | 局部阈值候选 | 目标尺度、滤波窗口与Offset |
+| 目标与背景灰度严重重叠 | 优先改善成像/选特征 | 不能期待调一个阈值解决全部问题 |
+
+不要把uint2图像也当0..255，或先压到byte却不记录缩放规则。阈值200是本夹具参数，不是“工业亮目标默认值”。
+
+## 3. 局部阈值：比较局部背景，不等于自动正确
+
+HALCON的DynThreshold比较原图与阈值图。阈值图常由原图平滑得到；`light`寻找相对局部背景偏亮的像素，`dark`寻找偏暗像素。滤波窗口太小会跟随目标自身，Offset太小会引入噪点；宽大亮目标可能只剩边缘附近的响应，不能默认输出完整目标。[DynThreshold参考](https://www.mvtec.com/doc/halcon/2411/en/dyn_threshold.html)
+
+教学对照链是：原图→MeanImage获得背景估计→DynThreshold获得候选区域→再做任务相关筛选。不要将本篇全局阈值夹具的面积预期直接套到这条链。
+
+MeanImage会改变灰度并处理边缘，官方特别提醒缩小domain后直接滤波可能产生非预期结果。因此需要邻域时，优先在完整图或有足够余量的处理区域上滤波，再限制最终检测ROI；这不意味着随意扩大ROI就能消除所有边缘误差。[MeanImage参考](https://www.mvtec.com/doc/halcon/2411/en/mean_image.html)
+
+本批可执行案例只做固定全局阈值；局部阈值不是已验证的替代算法。实际引入前，要单列滤波尺寸、Offset、边界和光照变化样本。
+
+## 4. ROI：Row/Column、包含端点与原图坐标
+
+本例图像16×16，合法像素中心行列均为0..15。矩形ROI左上(Row=2,Column=2)，右下(13,13)，包含两端，共12×12=144个像素中心。不能把右下角写成“宽度16”，也不能把Column当Row。
+
+```hdevelop
+gen_rectangle1 (ROI, 2, 2, 13, 13)
+reduce_domain (Image, ROI, ImageROI)
+threshold (ImageROI, RegionRaw, 200, 255)
+```
+
+GenRectangle1接收左上/右下角参数；本例限定整数像素中心，避开浮点坐标离散化的额外问题。[GenRectangle1参考](https://www.mvtec.com/doc/halcon/2411/en/gen_rectangle1.html)
+
+ReduceDomain不把图像变成12×12。这里AreaCenter仍返回原图Row/Column；只有真正裁剪等操作才需要额外记录坐标变换，详见[对象与domain基础](/knowledge/industrial/host-computer/halcon/iconic-objects-tuples-domains-and-operators/)。如果目标被ROI截断，中心和面积会随之变化，即使候选数量仍为1也不能视为完整目标。
+
+## 5. 开运算：去小结构，也可能去掉真实缺陷
+
+以3×3矩形结构元素理解：腐蚀后再膨胀，小孤立点容易被去掉；足够大的结构可保留，但细线、窄桥和小凸起也可能消失。不能只凭面积判断一定保留，形状和局部厚度同样重要。HALCON用OpeningRectangle1指定Width/Height。[开运算参考](https://www.mvtec.com/doc/halcon/2411/en/opening_rectangle1.html)
+
+本例只允许奇数1..7，是为了手工推演和限制参数范围；HALCON算子的官方宽高范围是1..511，并非只支持奇数。1×1在本例作为不改变区域的对照，不代表所有场景都应该支持用户任意改核。
+
+如果细划痕就是待检缺陷，先开运算去掉它，再报告“没发现缺陷”显然不成立。处理后的区域只能回答处理后定义的问题。
+
+## 6. 闭运算与填孔不是同一个按钮
+
+ClosingRectangle1用矩形结构元素做闭运算，可能弥合小间隙、改变局部边界。它逐个区域对象处理；已经Connection拆开的两个对象，不能期待一个ClosingRectangle1自动把它们合并。确需共同处理时应先Union1/Union2，但合并是否合理仍由任务决定。[闭运算参考](https://www.mvtec.com/doc/halcon/2411/en/closing_rectangle1.html)
+
+FillUp填充区域内的孔，区域对象数量不因此改变；其邻域约定也需要核对。它不是“仅填小于3×3的孔”，尺寸受限填孔要另选策略。与外界连通的缺口也不能直接当作封闭孔处理。[FillUp参考](https://www.mvtec.com/doc/halcon/2411/en/fill_up.html)
+
+本例选择“开运算＋可选FillUp”作为一条可解释路线，不再强行追加闭运算。检查孔时关闭填孔；提取外轮廓掩膜时才允许开启，并保留原始证据。先填孔还是先开运算也可能改变结果，不能随意交换步骤后仍沿用旧预期。
+
+## 7. 为什么形态处理后还要与ROI取交集
+
+ROI首先约束的是图像的domain；生成区域后，不应假设后续每个区域算子都会记住这个检测ROI。膨胀、闭运算或填孔可能产生原先未选中的像素。若最终结果必须位于检测ROI，显式Intersection后再Connection与筛选。
+
+Intersection会用第二组区域的合并结果，分别与第一组区域求交；本例第二组只有一个ROI。不依赖交集后仍保留空区域对象，后续按实际CountObj和正面积筛选处理。[Intersection参考](https://www.mvtec.com/doc/halcon/2411/en/intersection.html)
+
+取交集只保证输出位置受限，不会恢复被ROI切掉的真实边缘。正式检测还需定义触边目标是拒绝、重新采图还是单独标记；本示例不包含触边判定，因此Candidates只表示数学候选。
+
+## 8. Connection之后按多个特征筛选
+
+Connection按像素连通性拆开区域；8邻域下斜对角接触也可能属于同一块。对象的顺序不等于从左到右，更不等于工件身份。需要固定工位对应关系时应另定义排序/匹配规则。
+
+本例SelectShape同时要求area在40..60、width与height各在3..10，Operation为`and`；三组特征、下限、上限逐项对应。`or`则是至少一项满足，会产生完全不同的结果。width/height是平行图像坐标轴的范围，不是旋转工件的真实长短边。[SelectShape参考](https://www.mvtec.com/doc/halcon/2411/en/select_shape.html)
+
+圆形度、矩形度等可继续作为候选特征，但不应同时堆几十个阈值掩盖数据问题。旋转、遮挡、粘连或真实尺寸测量，需要后续定位/测量专题，不由“面积合适”直接推导产品合格。
+
+## 9. 原创夹具：每一步到底剩多少
+
+`examples/industrial-halcon/fixtures/region-target.pgm`为16×16 P2图，背景16。目标位于行4..10、列4..10，共7×7，灰度220；中心(7,7)为背景孔，因此目标原始面积48。另有ROI内孤点(2,2)=220，以及ROI外(1,14)=255。
+
+以下均是手算预期，待匹配原生环境执行：
+
+| 路线 | 阈值像素 | 开运算后 | 可选填孔后 | ROI交集后 | 连通块/选中块 |
+| --- | --- | --- | --- | --- | --- |
+| 默认3×3开运算＋填孔 | 49 | 48 | 49 | 49 | 1 / 1 |
+| 3×3开运算，不填孔 | 49 | 48 | 48 | 48 | 1 / 1 |
+| 1×1开运算＋填孔 | 49 | 49 | 50 | 50 | 2 / 1 |
+| 阈值改为230..255 | 0 | 跳过 | 跳过 | 跳过 | 0 / 0 |
+
+默认输出中心为原图(7,7)、处理后面积49；不填孔为48。1×1路线保留孤点，填孔后总面积50，但筛选仅留下49像素目标。230..255路线不能选中ROI外白点。四个案例分别检查去噪、填孔、多块筛选和ROI/空结果，不是四个真实工况的数据集。
+
+## 10. 调参顺序与故障定位
+
+先检查原图和ROI是否正确，再看原始阈值区域，然后才看开运算、填孔和特征区间。每次只改一个因素，保存参数与样本，不只保存最终“看起来干净”的图。
+
+| 现象 | 优先检查 |
+| --- | --- |
+| 原始阈值就没有目标 | 灰度类型、阈值方向、ROI位置、曝光 |
+| 原始有目标，开运算后消失 | 核是否大于目标局部厚度，是否误删细结构 |
+| 填孔后面积突然增加 | 内孔是否是待检结构，是否应该保留 |
+| 连通块变少但总面积相近 | 是否粘连、邻域变化、闭运算连接了原本独立部分 |
+| 总像素合理但没有选中 | 每块的面积/轴向宽高及and区间，是否误筛旋转目标 |
+| 无候选却被当作正常合格 | 业务层是否混淆NoCandidates、OK和执行异常 |
+
+## 11. 复习与面试
+
+1. 为什么不总是先Connection？整体形态处理与逐对象处理的含义不同，要先决定是否允许桥接、合并与填孔。
+2. 为什么开运算后再膨胀不一定恢复原状？小结构已经在腐蚀时消失，后续无法凭空重建原证据。
+3. 面积从48变49，是测量更准确了吗？只是填孔改变了掩膜，不能据此声称真实工件尺寸更准确。
+4. 一个候选能直接输出毫米位置吗？不能，还需要坐标域、标定、误差与任务身份。
+5. 原生库缺失时返回NoCandidates合理吗？不合理，算法未执行，应独立报环境/执行失败。
+
+下一篇：[C# ROI分割、常用算子与分步读回](/knowledge/industrial/host-computer/halcon/csharp-roi-segmentation-and-stage-readback/)。随后进入[NCC定位、模板原点与搜索区域](/knowledge/industrial/host-computer/halcon/ncc-matching-models-origins-and-search/)，再补形状匹配与测量、HDevelop导出/HDevEngine和WPF。

@@ -1,0 +1,182 @@
+---
+id: industrial-serialport-basics
+title: C# 串口 SerialPort：常用属性、打开关闭与读取写入
+description: 从串口参数和行协议开始，详解 SerialPort 的配置、Open/Close、Read/Write、超时、DataReceived 事件与可运行的客户端/教学设备端。
+tags: [工业通信, CSharp, 串口, SerialPort, RS485]
+difficulty: beginner
+status: published
+updated: "2026-10-19"
+order: 10
+prerequisite: [industrial-communication-data-contracts]
+related: [industrial-serial-framing-and-wpf, industrial-host-computer-chapter-map, csharp-io-streams-ownership, wpf-ui-thread-and-async]
+---
+
+## 先确定串口参数和报文规则
+
+串口通信先确认端口号、波特率、数据位、校验位、停止位与流控，再确认设备协议。本文的 `9600, 8N1` 表示波特率 9600、8 个数据位、无校验、1 个停止位；它是教学约定，实际配置取决于设备手册。RS-232/485 连接上的应用报文也要独立确认。
+
+本篇使用自定义的 ASCII 行协议：请求为 `READ TEMP\r\n`，正常响应为 `TEMP=253\r\n`，整数单位为 0.1 °C，允许范围 -400～1250。未知请求返回 `ERR=UNKNOWN\r\n`。请求和响应都以 CRLF 两字节结束，因此可以选择 `WriteLine` 和 `ReadLine`。这套示例命令只适用于配套教学设备端。
+
+## 使用哪个包和对象
+
+命名空间为 `System.IO.Ports`，核心对象为 `SerialPort`。配套项目使用 .NET 10，固定引用 `System.IO.Ports` **10.0.0** 作为复现基线，不表示它是最新版本；现代 .NET 控制台项目需要该包引用。[NuGet 包](https://www.nuget.org/packages/System.IO.Ports/10.0.0)
+
+```xml filename="IndustrialSerialPort.csproj"
+<PackageReference Include="System.IO.Ports" Version="10.0.0" />
+```
+
+创建 `SerialPort` 只创建配置对象，真正占用并打开设备需要 `Open()`。先用 `SerialPort.GetPortNames()` 查看本机端口，枚举结果不能证明设备型号、连接健康或端口一定可打开。
+
+## 常用配置属性
+
+下表优先覆盖现场最常查用的配置。端口标识、通信格式和流控应在打开前设置；运行中修改部分属性可能失败或影响通信，应按需要关闭后重新配置。[SerialPort 类型与成员](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport)
+
+| 属性 | 类型/本例值 | 用途与注意点 |
+| --- | --- | --- |
+| `PortName` | `string`，如 `"COM3"` | 系统端口名，不是仪表内部站号 |
+| `BaudRate` | `int`，`9600` | 波特率；需与对端设置匹配 |
+| `DataBits` | `int`，`8` | 每字节的数据位数 |
+| `Parity` | `Parity.None` | 无校验；也可能按设备要求用 Even/Odd |
+| `StopBits` | `StopBits.One` | 停止位，不能随意使用 None |
+| `Handshake` | `Handshake.None` | 本例无流控；设备可能要求其他流控方式 |
+| `DtrEnable` / `RtsEnable` | `bool`，本例均为 false | 控制对应信号；按设备和转换器要求配置 |
+| `Encoding` | `Encoding.ASCII` | 字符串读写的编码；不负责解释二进制数值 |
+| `NewLine` | `string`，`"\r\n"` | `ReadLine`/`WriteLine` 使用的行结束符 |
+| `ReadTimeout` / `WriteTimeout` | `int`，本例 1500 ms | 同步读写的有限等待配置 |
+| `ReadBufferSize` / `WriteBufferSize` | `int`，字节数 | 缓冲配置，不是协议帧长度 |
+
+`Encoding` 只影响字符与字节的转换。固定二进制协议优先使用 `Read(byte[], ...)` / `Write(byte[], ...)`，再按协议解析；`NewLine` 也不会给二进制 `Write` 自动补结束符。
+
+## 状态与诊断属性
+
+| 属性 | 应该怎样理解 |
+| --- | --- |
+| `IsOpen` | 本地端口资源是否已打开；不能据此判断设备仍在线或响应正确 |
+| `BytesToRead` | 当前可读缓冲字节数，不代表其中包含完整帧 |
+| `BytesToWrite` | 待发送缓冲量，不是设备已处理字节数 |
+| `ReceivedBytesThreshold` | 数据事件相关阈值，不是“每收到一帧就触发”的设置 |
+| `BaseStream` | 底层流入口；不要让它与 `SerialPort` 的另一套接收方法同时争读 |
+
+`SerialPort` 和其 `BaseStream` 的缓冲行为有差异，同一接收通道应明确由谁消费数据。[Read 的缓冲说明](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.read)
+
+## 开启、读取、写入、关闭用哪些方法
+
+| 操作 | 常用成员 | 关键语义 |
+| --- | --- | --- |
+| 枚举 | `SerialPort.GetPortNames()` | 静态方法，返回端口名称数组 |
+| 打开 | `Open()` | 使用已配置参数打开端口，失败会抛异常 |
+| 关闭 | `Close()` | 关闭端口与内部流，使 `IsOpen` 为 false |
+| 最终释放 | `Dispose()` / `using` | 结束对象使用，异常路径也需要释放资源 |
+| 写二进制 | `Write(byte[], offset, count)` | 发送指定范围字节，不自动追加行结束符 |
+| 写文本 | `Write(string)` | 编码文本，不追加 `NewLine` |
+| 写一行 | `WriteLine(string)` | 编码文本并追加 `NewLine` |
+| 读二进制 | `Read(byte[], offset, count)` | 返回实际读取数量，不保证读满 count |
+| 读单字节 | `ReadByte()` | 读取一个字节，不能当作一帧 |
+| 读一行 | `ReadLine()` | 等待 `NewLine`，返回文本不含结束符 |
+| 读到标记 | `ReadTo(string)` | 读取到指定字符串标记 |
+| 取现有文本 | `ReadExisting()` | 返回当时可取到的文本，不等待完整一行或一帧 |
+| 丢弃缓冲 | `DiscardInBuffer()` / `DiscardOutBuffer()` | 明确放弃数据，会造成内容丢失；不是通用“修复粘包”操作 |
+
+先记住两组选择：**文本行协议用 `ReadLine`/`WriteLine`；二进制协议用字节读写再组帧**。`WriteLine` 的追加行为见[官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.writeline)，`ReadLine` 的结束符移除和等待规则见[官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.readline)。
+
+## 最小调用顺序：一次请求与响应
+
+下面的完整 `Program.cs` 展示控制台中的同步调用顺序。它与配套项目使用相同配置和教学命令；把 COM3 改成已配置好的教学端口。不要将这段同步等待直接放进 WPF 的 UI 按钮事件执行。
+
+```csharp filename="Program.cs"
+using System.IO.Ports;
+using System.Text;
+
+using var port = new SerialPort("COM3", 9600, Parity.None, 8, StopBits.One)
+{
+    Handshake = Handshake.None,
+    Encoding = Encoding.ASCII,
+    NewLine = "\r\n",
+    ReadTimeout = 1500,
+    WriteTimeout = 1500,
+    DtrEnable = false,
+    RtsEnable = false,
+};
+
+try
+{
+    port.Open();                       // 打开本地串口资源
+    port.WriteLine("READ TEMP");        // 实际追加 CRLF
+    string response = port.ReadLine(); // 读到 CRLF，返回内容不含 CRLF
+    Console.WriteLine(response);       // 正常示例：TEMP=253
+    port.Close();                      // 正常路径明确关闭
+}
+catch (TimeoutException error)
+{
+    Console.Error.WriteLine($"未在超时内完成读写：{error.Message}");
+}
+catch (UnauthorizedAccessException error)
+{
+    Console.Error.WriteLine($"端口被占用或无访问权限：{error.Message}");
+}
+catch (IOException error)
+{
+    Console.Error.WriteLine($"设备或驱动 I/O 错误：{error.Message}");
+}
+// 即使中途抛异常离开作用域，using 仍会 Dispose。
+```
+
+这里没有设置“读取成功就代表温度有效”。完整项目还调用 `TemperatureProtocol.ParseResponse`，核对 `TEMP=` 前缀、整数格式、范围和 0.1 °C 缩放，再把它作为业务读数。异常类型也要区分：未打开或重复打开等错误可能抛 `InvalidOperationException`，配置无效可能抛参数异常；工程日志应保留类型与上下文，不能全写成“串口连接失败”。
+
+## 读写最容易误用的三个地方
+
+### `WriteLine` 与手工结束符重复
+
+已经设置 `NewLine = "\r\n"` 时，使用 `WriteLine("READ TEMP")` 即可。如果再把 CRLF 拼进参数，会发出两个结束符。另一个正确选择是 `Write("READ TEMP\r\n")`，因为 `Write` 不再补行结束符。
+
+### 读到字节后，只处理实际数量
+
+以下是二进制接收片段，需放在已打开端口的接收逻辑中。只有前 `count` 个字节是本次新数据，后面不是协议补齐值；得到一个片段后还需要协议组帧。
+
+```csharp filename="ReceiveChunk.cs"
+byte[] buffer = new byte[256];
+int count = port.Read(buffer, 0, buffer.Length);
+Console.WriteLine(Convert.ToHexString(buffer.AsSpan(0, count)));
+```
+
+`Read` 的 `count` 参数是本次最多读取数量，返回值才是实际数量。[Microsoft：Read 重载](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.read)
+
+### 超时不等于设备没有执行
+
+读不到约定结束符，也会让 `ReadLine` 持续等待到超时，即使已经收到部分字符。协议要求 CRLF 而程序只等 LF，或者设备只发 CR，都可能产生解释偏差。`ReadTimeout` 的默认无限等待不适合直接搬到界面线程；也不要推断它会自动控制 `BaseStream` 的所有异步操作。[ReadTimeout 说明](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.readtimeout)
+
+本教学命令是只读查询，超时后仍应分析当前会话中是否可能残留旧响应。对启动、送料等动作命令，还要确认设备是否已接受或执行，不能无条件重发。
+
+## `DataReceived` 等事件什么时候用
+
+常见事件还有 `ErrorReceived` 和 `PinChanged`。订阅形式为 `port.DataReceived += OnDataReceived`，退出接收流程时使用对应的 `-=` 解除；事件处理器参数类型为 `object` 与 `SerialDataReceivedEventArgs`。
+
+`DataReceived` 表示接收侧有数据事件，**不保证每字节一次，也不代表一条消息完整到达**。回调运行在辅助线程，不能直接修改 WPF 控件。一个会话通常确定一个接收消费者：若回调在 `ReadExisting`，另一个循环又在 `ReadLine`，两者可能分别拿走同一条消息的不同部分。[Microsoft：DataReceived](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.datareceived)
+
+本篇用同步行读取先展示清楚对象生命周期；下一篇进入[接收缓冲、组帧与 WPF 交接](/knowledge/industrial/host-computer/communication/serial-receive-framing-and-wpf/)。同步读取移到后台后也不意味着可以随时取消：示例设备端通过有限读取超时检查退出请求，取消令牌本身不直接中断 `ReadLine()`。
+
+## 运行完整示例
+
+仓库项目是 `examples/industrial-serialport/IndustrialSerialPort.csproj`。不带参数或使用 `--list` 时只枚举端口，不打开设备；`--self-test` 验证端口配置、协议解析和字节表示，也不打开端口。
+
+```powershell
+dotnet run --project examples/industrial-serialport/IndustrialSerialPort.csproj -- --self-test
+dotnet run --project examples/industrial-serialport/IndustrialSerialPort.csproj -- --list
+```
+
+如已在自己的测试环境准备了**互相连通的一对串口**，例如 COM3 ↔ COM4，可开两个终端先运行设备端，再运行客户端。两个独立但未连通的 COM 端口不构成这个测试条件。
+
+```powershell
+dotnet run --project examples/industrial-serialport/IndustrialSerialPort.csproj -- --device COM4 9600
+dotnet run --project examples/industrial-serialport/IndustrialSerialPort.csproj -- --client COM3 9600
+```
+
+客户端发送一条查询并解析结果后关闭；设备端收到查询后回复固定的 `TEMP=253`，Ctrl+C 后在有限等待结束时退出。项目没有安装虚拟串口驱动；离线断言不覆盖串口打开、驱动行为、真实收发或接线，以上串口交换步骤需要有相应端口环境才能验收。
+
+## 查用与自测
+
+1. 枚举出 COM3，能否断定它可打开并连接着目标设备？`IsOpen` 又能证明什么？
+2. `Write`、`WriteLine` 与字节数组 `Write` 如何选择？哪一种会追加结束符？
+3. `Read(buffer, 0, 256)` 返回 7 时，应解析多少字节？如何判断完整帧？
+4. `DataReceived` 中能直接修改 WPF 文本框吗？能和另一个 `ReadLine` 循环共同接收吗？
+5. `ReadTimeout` 到期后，哪些设备动作结果仍然未知？关闭与最终释放对象分别应放在哪里？

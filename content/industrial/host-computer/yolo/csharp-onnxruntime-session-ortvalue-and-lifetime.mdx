@@ -1,0 +1,182 @@
+---
+id: industrial-csharp-yolo-onnx-session
+title: C#实践：ONNX Runtime会话、OrtValue、Run与资源释放
+description: 使用固定YOLOX-Nano与ONNX Runtime1.27.0 CPU包，逐项解释会话选项、元数据、输入张量、原生输出Span与Dispose，运行31项托管和17项真实原生检查并对照Python结果。
+tags: [工业自动化, C#, ONNX Runtime, YOLOX, 原生资源]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 50
+prerequisite: [industrial-yolo-onnx-contract]
+related: [industrial-csharp-yolo-preprocessing, industrial-csharp-yolo-evaluation]
+---
+
+## 项目、命令与运行结果
+
+新增examples/industrial-yolo-onnx/，net10.0/x64，固定[Microsoft.ML.OnnxRuntime1.27.0](https://www.nuget.org/packages/Microsoft.ML.OnnxRuntime/1.27.0) CPU包及packages.lock.json；传递Managed1.27.0与System.Numerics.Tensors9.0.0。引用相邻纯C#项目复用Bgr24Image，不修改其输入策略或引入原生依赖。
+
+从仓库根目录运行：
+
+```powershell
+dotnet restore examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj --locked-mode
+dotnet build examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-restore
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --fetch-model examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --demo examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+锁模式还原、Release零警告零错误；31项托管与17项实际CPU检查通过。只有fetch-model联网，不覆盖已有文件，模型约3.66MB，写入被忽略的.local。成功0，托管/下载失败1，用法2，原生入口失败3；没有测试替身、自动重试或原生失败回退。
+
+## 1. 官方对象与本项目封装分别是什么
+
+| 层次/对象 | 常用成员 | 本轮如何使用 |
+| --- | --- | --- |
+| SessionOptions | IntraOpNumThreads、InterOpNumThreads、ExecutionMode、GraphOptimizationLevel | 构建会话前配置 |
+| SessionOptions | AppendExecutionProvider_CPU(1)、Dispose | 只注册CPU，1为useArena，不是线程数 |
+| InferenceSession | 构造函数、InputMetadata、OutputMetadata、Run、Dispose | 加载固定字节、检查、执行、关闭 |
+| NodeMetadata | IsTensor、ElementType、Dimensions | 拒绝不匹配的名称/类型/维度 |
+| OrtValue | CreateTensorValueFromMemory、GetTensorDataAsSpan、GetTensorTypeAndShape、Dispose | 创建输入、读取输出 |
+| RunOptions | 构造、Dispose | 一次Run的运行选项，本批无超时/取消功能 |
+| 输出集合 | Count、索引、Dispose | 一次释放所有返回OrtValue |
+| OrtEnv | Instance().GetVersionString() | 读取实际原生版本，不按每帧释放全局环境 |
+| 本项目ModelArtifact | FetchAsync、ReadVerified、Verify | 下载/校验限定产物 |
+| 本项目YoloXInput | PrepareNoResize、Shape、Values、Sha256 | 独立BGR0..255输入，r=1 |
+| 本项目YoloXNanoSession | 构造、RuntimeVersion、InputName、OutputName、Run、Dispose | 单调用者顺序生命周期 |
+| 本项目YoloXRawOutput | Shape、Values、CopyValues | 不借原生指针的托管快照 |
+
+前七行来自运行时API，不是YOLO专用库；后三个封装是本例代码。官方生命周期说明见[基础C#教程](https://onnxruntime.ai/docs/tutorials/csharp/basic_csharp.html)。这里没有网络连接/打开相机的Connect，创建会话就是加载本地计算图，不是连接远程设备。
+
+## 2. 最小封装调用：加载、执行与关闭
+
+```csharp
+using YoloXNanoSession session = new(modelPath);
+YoloXInput input = YoloXInput.PrepareNoResize(YoloXInput.CreateFixture());
+YoloXRawOutput output = session.Run(input);
+Console.WriteLine(output.Values.Length); // 301665，原始值数量，不是目标数
+```
+
+modelPath必须指向固定模型，构造过程中验证尺寸/哈希、加载与元数据；不自动查找相似文件、联网补模型或猜动态输入。using保证作用域正常或异常结束后释放session。
+
+单个会话可以复用，避免每张图都重复初始化。封装限定单调用者顺序Run/Dispose，没有线程池和WPF接入；未实现并发关闭的排空协议。输入是自有渐变图，不是检测图片文件入口。
+
+## 3. 配置SessionOptions
+
+```csharp
+using SessionOptions options = new()
+{
+    IntraOpNumThreads = 1,
+    InterOpNumThreads = 1,
+    ExecutionMode = ExecutionMode.ORT_SEQUENTIAL,
+    GraphOptimizationLevel = GraphOptimizationLevel.ORT_DISABLE_ALL
+};
+options.AppendExecutionProvider_CPU(1);
+```
+
+IntraOpNumThreads控制算子内部线程相关设置；InterOpNumThreads与算子间执行相关，顺序执行时不是再启动一个“并行工位”。这里统一1是为了固定参考条件，不是保证性能最佳。GraphOptimizationLevel禁用图优化用于本轮数值对照，不要求生产照抄。
+
+AppendExecutionProvider_CPU的1是启用CPU内存arena的参数，不是设备号、批大小或线程数。使用arena/原生内存池时，释放某个输出也不意味着WorkingSet立即下降；本批没有作内存曲线或无泄漏证明。
+
+SessionOptions在创建会话后按using释放，会话自己持有执行资源；不要为了省一次对象创建，先Dispose一个仍在Run中的InferenceSession。GPU需要对应包/执行提供器与原生依赖，这里未尝试加载GPU。
+
+## 4. 读固定模型并验证元数据
+
+ModelArtifact.ReadVerified用FileStream以只读打开，限定长度，读出同一byte[]计算SHA256；文件流随即关闭，构造InferenceSession时使用该byte[]，不是又从路径读另一份。
+
+```csharp
+InferenceSession opened = new(bytes, options);
+try
+{
+    ValidateMetadata(opened.InputMetadata, "images", [1, 3, 416, 416]);
+    ValidateMetadata(opened.OutputMetadata, "output", [1, 3549, 85]);
+    session = opened;
+}
+catch
+{
+    opened.Dispose();
+    throw;
+}
+```
+
+ValidateMetadata还检查Count==1、IsTensor和ElementType==typeof(float)。检查失败时刚创建的会话也必须释放，不能只在“完全构造成功”的对象里写Dispose。
+
+实际模型自定义元数据为空。NodeMetadata的Dimensions并不告诉我们BGR/归一化或85项每项含义；即使另一个模型形状一样，哈希和产物说明不同也不能混入当前封装。
+
+## 5. 准备输入OrtValue，注意托管缓冲的生命周期
+
+封装内部关键代码：
+
+```csharp
+using OrtValue inputValue = OrtValue.CreateTensorValueFromMemory(
+    input.Buffer, input.Shape.ToArray());
+using RunOptions runOptions = new();
+```
+
+Buffer是本项目内部自有float[]，不向普通调用者开放；Shape是long[]形式的[1,3,416,416]。创建OrtValue后，运行时包装/固定该托管缓冲，而不是把普通数组自动变成永远独立的原生副本。整个Run期间保持数组存活且不修改，inputValue结束后Dispose解除对应资源。
+
+公共Values只读，PrepareNoResize从已有Bgr24Image读取并分离为自己的float数组；允许源图stride，但模型数组连续。源宽必须416，高1..416，填充114，无RGB交换或/255，也不接收第二批PreparedInput。
+
+如果要在封装外写最小原生调用，可以从input.Values.ToArray()明确创建自有float[]，再CreateTensorValueFromMemory，而不是为了“零拷贝”绕过只读边界。优化前先建立所有权和正确性。
+
+## 6. 指定输入名和输出名执行Run
+
+```csharp
+using IDisposableReadOnlyCollection<OrtValue> outputs = session.Run(
+    runOptions,
+    new Dictionary<string, OrtValue> { ["images"] = inputValue },
+    ["output"]);
+```
+
+字典的键是模型节点名，不是文件名或任意显示名称；这里请求output，不枚举名字后随意挑第一个就认为它是检测结果。多输入/多输出模型需要各自的契约，本封装明确不支持。
+
+Run是本例同步调用，返回时计算完成才读取结果。套Task.Run只改变调用线程，不自动赋予原生硬取消；Task.WhenAny超时也不表示图停止执行。不能超时后立刻Dispose在途输入/会话，下一批流水线集成还需有界调度与关闭排空。
+
+## 7. 原生Span必须在释放前复制
+
+```csharp
+OrtValue value = outputs[0];
+OrtTensorTypeAndShapeInfo info = value.GetTensorTypeAndShape();
+ReadOnlySpan<float> raw = value.GetTensorDataAsSpan<float>();
+return new YoloXRawOutput(raw.ToArray());
+```
+
+完整代码先检查输出个数、info.ElementDataType/Shape、长度和所有值有限，再复制。GetTensorTypeAndShape返回的信息对象不按本例OrtValue方式Dispose；输出Span则指向OrtValue管理的原生缓冲，不能在outputs释放后继续访问或把指针交给延迟UI回调。
+
+ToArray发生在using范围内，返回只持有普通float[]。测试中实际会话和原生输出都已释放，托管结果仍能读取；CopyValues返回另一份可写副本，修改它不改变已有结果。这证明本例结果分离，不证明整个进程所有原生缓存已归还操作系统。
+
+## 8. Dispose顺序与错误路径
+
+一次调用依次创建输入OrtValue、RunOptions、输出集合；using按反向顺序释放输出、选项与输入。外层会话跨调用保留，结束后Dispose。构造后元数据检查失败也释放刚打开的会话；封装Dispose幂等，关闭后Run抛ObjectDisposedException，不假装返回空检测。
+
+本批真实CPU检查还直接调用ORT验证三个失败：错误输入名称、错误尺寸[1,3,1,1]、正确形状却int32类型，均收到真实OnnxRuntimeException。不是只用托管替身模拟错误。
+
+缺原生库/位数不符、模型损坏和ORT执行错误由命令报告FAILED，原生入口退出3，不回退手写预测。本例未人为删除运行时DLL验证缺库场景，也不声称能够强制终止原生卡死调用。
+
+## 9. 数值参考怎样复现
+
+不安装Python也可执行native-test，它核对固定20样点。已有Python NumPy/ONNX Runtime的环境可额外生成完整参考：
+
+```powershell
+python examples/industrial-yolo-onnx/reference_yolox_nano.py examples/industrial-yolo-onnx/.local/yolox_nano.onnx examples/industrial-yolo-onnx/.local/reference-python127.f32
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --compare-reference examples/industrial-yolo-onnx/.local/yolox_nano.onnx examples/industrial-yolo-onnx/.local/reference-python127.f32
+```
+
+输出路径必须是新文件，已有则拒绝覆盖；重复生成换一个未用路径即可。本机使用已安装Python ORT1.27.0/NumPy2.5.0，没有pip安装或环境升级，C#生产示例不依赖Python。
+
+参考文件无头，小端float32、严格1,206,660字节。C#逐项检查有限值与容忍abs≤1e-5+1e-4×abs(reference)，长度错或任何数值不匹配都失败。实际结果：
+
+```text
+Actual CPU ONNX Runtime 1.27.0; pinned YOLOX-Nano.
+Input images [1,3,416,416] BGR float32 0..255
+Output output [1,3549,85], 301665 raw floats; no decode/NMS.
+20 Python reference samples passed
+Full Python raw comparison: 301665 values; maxAbsError=0
+```
+
+这里是同一个ORT引擎的两种语言入口，不是不同推理引擎相互验证。maxAbsError=0只属于这次本机条件，不能当其他硬件必须完全相同的保证，更不代表模型检测准确率。
+
+## 10. 验证范围与继续阅读方向
+
+31项托管检查验证完整输入哈希、BGR范围、stride/填充、快照、受限尺寸、模型尺寸/错误哈希和数值比较器；不创建原生会话。17项真实CPU检查验证固定产物、元数据、两次实际Run、样点、输入未改写、输出释放后可读、关闭与实际错误名称/形状/dtype拒绝。完整Python对照另按301665项数值记录，不把它们计成301665个模型测试用例。
+
+第四批继续读[网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)及 [C#解码、抑制记录与完整参考](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)，再补一般图像缩放/读取、参考评价与WPF。真实标注/工件、GPU、现场质量、长期资源和FPS仍未验收。

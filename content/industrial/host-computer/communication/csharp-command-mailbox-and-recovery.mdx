@@ -1,0 +1,188 @@
+---
+id: industrial-csharp-command-mailbox-recovery
+title: C# 动作握手实践：命令邮箱、MC读写、结果查询与去重测试
+description: 用 .NET 10 和固定 McpX 包实现单命令邮箱，说明请求/状态字段、分阶段提交、结果确认、Unknown与本地等待状态，验证真实回环下的回执丢失、重复与重启。
+tags: [工业自动化, C#, PLC, MC协议, 动作握手, 故障恢复]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 160
+prerequisite: [industrial-device-command-handshake-idempotency]
+related: [industrial-csharp-mcpx-read-write, industrial-host-computer-chapter-map, wpf-ui-thread-and-async]
+---
+
+## 这一次交付的是什么
+
+配套 `examples/industrial-handshake/`，使用.NET 10、McpX 0.13.0，复用上一示例的纯报文辅助文件，新增业务状态机、MC回环服务、C#客户端及自动检查。不新增UI、消息总线或数据库框架。
+
+```xml
+<PackageReference Include="McpX" Version="0.13.0" />
+```
+
+客户端仍使用实际的TCP / Binary / 3E读写，不以内存方法调用冒充网络恢复。但设备动作只在内存状态机中模拟，不控制真实电机或PLC；测试不等于现场安全验收。
+
+包API基线与[前一篇McpX教程](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)一致：构造同步连接，ReadAsync/WriteAsync无调用方CancellationToken，using执行Dispose。[固定库源码](https://github.com/YudaiKitamura/McpX/tree/3e883803ec2e6434fd66fafdad2cf938da16ad89)
+
+## 文件分工与常用对象
+
+| 文件/类型 | 用途 | 主要方法或属性 |
+| --- | --- | --- |
+| Contract.cs / Ticket | 不可变请求身份与参数 | BootId、RequestId、Operation、Target、Version、Encode/Decode |
+| Contract.cs / Snapshot | 一份完整状态发布 | State、Result、AcceptedId、CompletedId、ControlAck、Reply、Terminal |
+| Observation / Resolution | 客户端当前掌握的证据 | Known、NotSubmitted、Unknown、EpochChanged、NotRetained、Conflict、WaitTimeout、WaitCanceled |
+| Mailbox | 确定性模拟控制器 | Stage、SetControl、Advance、Read、Reboot |
+| LoopbackController | MC服务与独立模拟扫描任务 | Endpoint、Model、故障注入开关、DisposeAsync |
+| HandshakeClient | 打开会话、提交/确认、查询与等待 | InspectAsync、CreateTicket、SubmitAsync、QueryAsync、WaitAsync、ReleaseAsync、ResetObservedControlAsync |
+| SelfChecks | 离线状态转移与真实回环负例 | RunAsync |
+
+这些业务类是本课程自己的代码，不是McpX已经提供的“通用PLC动作SDK”。把传输方法和业务方法分开，才能知道哪里在读写寄存器，哪里在决定一次任务的意义。
+
+## 候选参数区和控制字
+
+示例全部使用D字设备，不写物理输出：
+
+| 地址 | 字段 | 表示与所有者 |
+| --- | --- | --- |
+| D200～D201 | ExpectedBootId | uint，低字先；PC填写目标启动代 |
+| D202 | RequestId | ushort；PC分配，0无效 |
+| D203 | Operation | ushort；本例仅1=模拟动作 |
+| D204 | Target | short，0～1000；仅教学原始参数 |
+| D205 | Version | ushort；本例为1 |
+| D206 | Control | PC写：0复位通道，1提交，2释放终态 |
+
+设备允许候选参数分段写入，但仅在Control与Ack均为0时允许修改。收到非0控制字才锁存完整六字参数；Control保持时重复写相同控制值不再次执行。
+
+模拟器在寄存器服务回调中模拟一次提交处理，执行进度则由独立50ms定时任务推进。真实PLC通常在扫描程序里处理提交，MC写入回执可能早于PLC接受；客户端因此仍轮询控制回复，不能用模拟器回调时序推断实机时序。
+
+## 状态块及字段含义
+
+客户端从D240开始一次申请18个ushort：
+
+| 地址 | 字段 |
+| --- | --- |
+| D240 | RevisionBegin |
+| D241～D242 | BootId |
+| D243 | HighWater：本代已消费最大编号 |
+| D244 | CurrentId |
+| D245 / D246 | State / Result |
+| D247 / D248 | AcceptedId / CompletedId |
+| D249～D251 | 已锁存的Target / Operation / Version |
+| D252 / D253 | Control镜像 / ControlAck |
+| D254 / D255 | ReplyId / Reply |
+| D256 | ExecutionCount：测试诊断计数 |
+| D257 | RevisionEnd |
+
+RequestId、AcceptedId、CompletedId都是16位编号，不能按int读取时不小心跨进旁边字段。BootId占两个字，编码显式低字先；地址表、C#解码和模拟服务保持一致。
+
+`Snapshot.Decode`先检查数量、头尾版本、偶数版本和枚举，再校验状态与编号的对应。Done必须带匹配CompletedId；Rejected不能有AcceptedId；普通运行状态不能夹带错误结果。坏快照不进入界面有效状态。
+
+版本发布的真实实现约束见[理论篇](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)。这里是锁保护的内存快照与故障注入，不是已经验证过某款PLC的原子读写能力。
+
+## 读取、提交与控制通道复位
+
+读状态的实际包调用很短：
+
+```csharp
+ushort[] words = await plc.BatchReadAsync<ushort>(Prefix.D, "240", 18);
+Snapshot status = Snapshot.Decode(words);
+```
+
+`CreateTicket`要求状态为Idle且控制通道已归零，按HighWater+1分配编号，检查参数范围；编号耗尽抛错，不回绕。请求要保留给后续查询，本例不替调用者持久化。
+
+`SubmitAsync`内部按以下顺序执行：
+
+```csharp
+await plc.BatchWriteAsync<ushort>(Prefix.D, "200", ticket.Encode());
+stop.ThrowIfCancellationRequested();
+controlAttempted = true; // 必须在调用写入之前设置
+await plc.WriteAsync<ushort>(Prefix.D, "206", 1);
+```
+
+为什么先设标志？因为调用抛异常并不能证明设备没收到Control=1。若标志在await成功后才设，断线负例就可能被错误归类为NotSubmitted。
+
+随后检查BootId、ControlAck=1与ReplyId匹配；看到回复后写Control=0并确认通道归零。方法返回的Snapshot保存已观察到的控制回复，动作随后仍可继续推进。
+
+`Reply.Recorded`表示设备记录这次请求，State可能是Accepted，也可能已经Rejected。方法返回 `Resolution.Known` 仅表示某份证据已知，**不是一个可以直接点亮“加工成功”的bool**。
+
+## 完整正常路径
+
+这些类在同一示例程序集内使用，以下片段展示调用关系：
+
+```csharp
+await using var controller = new LoopbackController();
+var client = new HandshakeClient(controller);
+Ticket ticket = HandshakeClient.CreateTicket(await client.InspectAsync(), 300);
+
+Observation submitted = await client.SubmitAsync(ticket);
+if (submitted.Resolution != Resolution.Known ||
+    submitted.Snapshot?.Reply != Reply.Recorded)
+    throw new InvalidOperationException("先核对提交结果，不自动再发一次。");
+
+Observation result = await client.WaitAsync(ticket, TimeSpan.FromSeconds(3));
+if (result.Resolution == Resolution.Known && result.Snapshot?.State == ActionState.Done)
+{
+    // 此处先记录本次完成证据；真实应用应按需要持久化。
+    Observation released = await client.ReleaseAsync(ticket);
+    // 继续检查 released 的 Resolution 和 Reply，不把确认失败改写为动作失败。
+}
+```
+
+本轮命令行执行完整自测，不提供长期运行界面。单命令所有者必须顺序调用；示例没有多PC仲裁，也不支持将多个SubmitAsync并发调用当作请求队列。
+
+## 状态机怎样避免重复与覆盖
+
+Mailbox首先比较启动代；再比较当前请求的身份和完整载荷：同身份同参数返回Duplicate，同身份不同参数返回Conflict。旧编号小于等于HighWater时返回Stale；当前结果未释放，新编号返回Busy。
+
+新请求允许记录时，先更新HighWater并锁存候选参数，然后检查载荷、范围和互锁。拒绝也会保留Rejected结果并消费该身份，不能修个参数仍沿用同一个编号冒充同一动作。
+
+Accepted进入Running时才增加ExecutionCount；Done设置CompletedId。此计数是测试观测，不是产品中的掉电保持日志，也不是物理轴实际执行次数证明。
+
+状态机会在开始前再次检查互锁，防止“提交时允许、执行时条件已失效”；运行中故障转Faulted，CompletedId保持0。真实互锁和停止策略必须在控制器及安全系统中正确实现，不能照搬这个内存bool作为安全功能。
+
+## 回执丢失以后：只查询原请求
+
+测试将 `DropNextSubmitReply=true`，在控制器完成提交处理后丢弃MC回执并关闭连接：
+
+```csharp
+controller.DropNextSubmitReply = true;
+Observation first = await client.SubmitAsync(ticket); // Unknown
+Observation recovered = await client.WaitAsync(ticket, TimeSpan.FromSeconds(3));
+// 以同一ticket只读查询；不会自动再写Control=1。
+```
+
+客户端使用新会话查询同一BootId、RequestId和载荷，最终找到保留Done。检查SubmitWrites仍为1、ExecutionCount为1，证明这个场景没有重放提交。
+
+此时控制字可能仍保持1。`ResetObservedControlAsync`是**显式写零操作**：先确认同代、已处理的控制阶段及ReplyId，再归零并验证。它不是只读查询，也不发送提交或释放；不能用它代替未知情况下的自动“恢复全部状态”。
+
+提交和释放共用控制发布流程；如果Release在控制字调用前失败，NotSubmitted也只表示“本次释放控制未发出”，绝不表示该动作从未执行。请求终态证据与控制通道状态必须分开保留。
+
+## 超时、停止等待和结果缺失
+
+`WaitAsync`使用本机Stopwatch计算业务等待，查询并等待短间隔，不修改设备状态。等待预算到后返回WaitTimeout；调用方停止时返回WaitCanceled或在提交可能发生后保留Unknown。
+
+每次SDK I/O仍使用800ms期限且无外部token，因此业务等待不是硬实时退出上限，单次连接、I/O和清理可能使实际返回晚于业务预算。不用取消外层await后留下仍在通信的任务。[固定TCP期限实现](https://github.com/YudaiKitamura/McpX/blob/3e883803ec2e6434fd66fafdad2cf938da16ad89/McpXLib/Transports/TcpPlcTransport.cs)
+
+WaitTimeout或WaitCanceled不触发Control=2、不复位CPU、不停止模拟任务。测试先暂停模拟进度，观察等待超时/取消，再恢复进度；同一请求仍会完成。
+
+QueryAsync返回NotRetained时，只说明没有匹配的当前保留结果；即便HighWater更大，也不能据此重建已经丢失的详细完成信息。EpochChanged更不能被翻译为“旧动作没执行”。
+
+如果释放回执丢失，动作结果可能已经被清除，但之前记录的Done仍是证据。检查确认没有新增提交，不把结果确认故障变成再次加工。
+
+## 运行与故障检查
+
+```powershell
+dotnet run --project examples/industrial-handshake/IndustrialHandshake.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-handshake/IndustrialHandshake.csproj -c Release -- --demo
+```
+
+两个入口运行同一有限流程，成功输出 `Completed 55 checks`。项目链接使用相邻 `examples/industrial-mc/McFrames.cs`；复制示例时需保留该文件或调整项目引用。
+
+55项检查分为纯状态转移与真实回环：部分参数不启动、控制保持不重触发、重复/冲突/Busy、终态保持/释放、高水位防旧请求、互锁拒绝/变化、执行故障、身份和版本快照、请求号耗尽、回执丢失后的只读查询、等待取消、重启拒绝旧代、坏快照和关闭释放。
+
+服务仅绑定127.0.0.1系统分配端口，客户端无外部设备参数。网络服务和独立模拟扫描都取消并await结束，不安装服务、不访问COM、不改PLC工程。
+
+## 尚未覆盖的能力与下一步
+
+这里没有实际PLC程序、梯形图/ST落地、PC日志持久化、掉电保持去重、多发布者仲裁、远程Stop/Cancel、安全认证、跨工位事务或WPF人工验收。模拟器BootId从1开始，Reboot只在同一进程实例里递增；不应将其当成可靠的跨程序重启身份生成方案。
+
+第5步的基础协议读写与动作握手教学主线至此具备可运行示例，现场接入仍按型号验收。接下来进入第6步运动基础与雷赛单轴：先讲轴、单位、状态、回零与停止边界，再确定具体卡型和SDK，不直接拿本例请求字去控制真实轴。

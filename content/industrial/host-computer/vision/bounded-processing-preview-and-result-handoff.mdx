@@ -1,0 +1,144 @@
+---
+id: industrial-vision-bounded-processing
+title: 视觉处理流水线：有界队列、预览分流与结果交接
+description: 从采集后的自有图像出发，区分预览丢帧和检测任务拒收，解释背压、在途容量、处理失败、身份冻结与结果确认的工程边界。
+tags: [工业自动化, 机器视觉, C#, 并发, 数据交接]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 40
+prerequisite: [industrial-vision-acquisition-identity, industrial-csharp-single-capture-session]
+related: [industrial-csharp-mono8-buffer-lifetime, industrial-csharp-command-mailbox-recovery, industrial-csharp-inspection-pipeline]
+---
+
+## 从“有一张图”到“这件工件有交代”
+
+上一批[单拍关联](/knowledge/industrial/host-computer/vision/csharp-single-capture-session-and-frame-correlation/)解决的是请求、原触发和图像能否可靠关联。本篇接着回答：图像归谁处理、忙不过来怎么办、结果怎样交出去。相机保持通用路线，不选择品牌SDK，不引入HALCON/OpenCvSharp/YOLO，也不增加网页交互。
+
+先记住四个不同的事实：收到完整图像、应用接收处理任务、算法返回测量、业务接收结果。任意两个都不能直接画等号。尤其是“方法返回了”不等于“产品合格”，屏幕显示了绿色也不等于PLC已经接收。
+
+## 1. 为什么不能在相机回调里做完所有事
+
+典型坏结构是：拿到SDK借用缓冲后，直接跑算法、写文件、等UI，再释放缓冲。任一环节变慢都可能延长缓冲占用；具体影响取决于SDK的缓冲池、线程模型和采集策略，不能假定所有厂商行为相同。
+
+通用的分层顺序是先核对质量和身份，在借用期限内完成必要的自有复制，再归还SDK结果。之后由应用持有自有图像，进入有明确容量的处理路径。实际是否能零复制、转移SDK结果所有权，需要按SDK契约单独设计，本项目先选择容易验证的托管深复制。
+
+```text
+SDK结果／离线租约
+    → 核对完整性、身份 → 自有图像 → 尽快归还借用资源
+                                      ├─ 预览：一个最新发布槽，可替换旧预览
+                                      └─ 检测：明确接收 → 单处理器 → 有界结果保留 → 显式确认
+```
+
+图中分流发生在自有图像层，不能把已归还的SDK指针同时送给两个线程。本例Mono8Image公开API不可变，两个分支可以共享同一自有对象；这不意味着Mat、HObject或任意SDK Clone都具备相同复制/并发语义。
+
+## 2. 预览与检测不是同一种队列
+
+| 路径 | 关注点 | 忙不过来时 | 不能推导什么 |
+| --- | --- | --- | --- |
+| 操作员预览 | 尽可能接近当前画面 | 可以替换尚未显示的旧预览 | 预览没显示不等于没有检测 |
+| 工件检测 | 每个已接收任务有明确交代 | 未接收就明确拒收；已接收不静默丢弃 | 队列接收不等于算法成功 |
+| 结果交接 | 正确身份与明确消费 | 保留未确认结果并限制继续接收 | 内存确认不等于数据库提交/PLC确认 |
+
+最新槽只知道“最近一次发布”，不知道哪个相机时间更新。如果多个生产者乱序发布，旧曝光也可能最后到达。真实预览可另加同一会话的帧序/年龄核对；本例不做设备时间同步或自动丢弃过期曝光。
+
+预览图上画检测框时，也必须核对结果对应的FrameStamp。不能把上一张的框直接画到最新预览上，再称为实时检测。可以显示带有明确身份的检测截图，或只在身份一致时叠加；后续WPF章节再落地显示。
+
+## 3. Channel能解决什么，不能解决什么
+
+C#的System.Threading.Channels用于生产者与消费者之间传递数据，可创建有界通道。常用配置与方法可查[微软官方Channels说明](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)。
+
+| API/配置 | 用途 |
+| --- | --- |
+| Channel.CreateBounded / BoundedChannelOptions | 设置等待项上限及读写者约定 |
+| FullMode = Wait | 满时WriteAsync等待；TryWrite立即返回false |
+| DropOldest / DropNewest / DropWrite | 配置丢弃策略，不能当成检测任务完成 |
+| Writer.TryWrite | 非阻塞尝试交入通道，必须处理返回值 |
+| Writer.WriteAsync | 异步等候写入，不应在外部无限创建等待者 |
+| Reader.ReadAllAsync | 消费通道中的项 |
+| Writer.TryComplete | 声明不再写入；不是强杀当前算法 |
+
+本例检测通道使用Wait模式，但应用只用TryWrite，并且额外维护任务账本。不要以为“类型叫有界Channel”就自然限制了所有后台任务、结果集合和图片缓存。
+
+特别常见的绕开容量的写法是每帧执行一次Task.Run，里面再await WriteAsync。通道虽然有限，外面的等待Task及其图像引用仍可能不断增长。这里固定一个处理器，不为每帧创建处理Task或等待写入队列。
+
+## 4. 容量必须包含哪些阶段
+
+本项目采取简单、保守的定义：
+
+```text
+保留项数 = 排队中 + 正在处理 + 已完成但未确认 + 已失败但未确认
+保留项数 ≤ Capacity
+```
+
+假设Capacity=2，A正在处理、B排队，那么C返回Full。随后A、B都处理完但调用者一直不交接结果，C仍返回Full。只有调用者处理完某个原始结果，并显式Acknowledge，才释放一项容量。
+
+因此结果消费者变慢会向前形成背压。这里没有单独的“结果队列满、处理器写不出去”问题：接收任务时已经为其最终结果预留账本位置，结果直接进入原项。
+
+这仍不是进程总内存上限。图像字节、处理临时数组、预览引用、源缓存、上游尚未提交图像、调用者保留的Task/结果，都需要另外预算。示例限制每张Mono8最多1,048,576像素、账本Capacity为1～16；这些是教学约束，不是相机能力或高帧率指标。GC也不保证确认后立即回收全部局部引用。
+
+## 5. 满载不是检测NG，更不是自动补拍
+
+TrySubmit返回Full表示**这次没有接收处理责任**。它没有创建待处理项，也没有推进请求高水位。调用者仍持有原CaptureResult及其自有图像，不能假装已经送检成功。
+
+可选业务策略包括在触发前保守限制新任务、保留一份原图等待显式再提交、或将工件转入明确的人工处置流程。具体要根据节拍、工位缓存和设备能力决定，本例不执行暂停运动、停线或剔料。
+
+若保留原图后重投，重投的是同一次采集的自有图，不是再发一次触发。还需要检查工艺期限、配置及工件是否仍允许处理；不能通过重写ReceivedAt把旧图变新图。本流水线只做结构核对，没有采集/处理截止期限或独立看门狗。
+
+原来的SingleCaptureSession.TakeForProcessing只返回一次。第一次取出后必须保留变量，Full时不能反复调用TakeForProcessing期待再次取图。示例demo在流水线Accepted之后才ReleaseCapture；采集槽释放也仍不是产品成功。
+
+## 6. 结果必须带什么身份
+
+示例结果携带以下字段，而不是仅返回bool：
+
+| 信息 | 用途 |
+| --- | --- |
+| PipelineSession | 隔离本进程内不同流水线实例 |
+| CaptureRequest.Key / Workpiece | 保留采集请求和工件的业务身份 |
+| Request.ProfileRevision | 保留采集配置版本 |
+| FrameStamp / CameraEpoch / TriggerSequence | 保留主机图像、设备代和原触发的不同身份域 |
+| Recipe.Version / Region / Threshold | 冻结本次算法配方及输入参数 |
+| Stage / Measurement / ErrorCode | 分离算法完成、测量值和处理失败 |
+
+流水线不再建立触发关联；CaptureResult应来自上一批TakeForProcessing。普通record可被手工构造，Complete/IdentityQualified为true并不是身份真实性证明，也不是鉴权边界。
+
+配方在构造时冻结。需要换ROI、阈值、算法版本或采集配置时，不修改已入队任务的参数；本例停止接收、排空并交接旧实例，再为新采集上下文建立新实例。实际热切换及跨工件配方管理留待明确需求，不引入复杂框架。
+
+## 7. 算法完成、失败与产品判定
+
+本轮算法只计算固定ROI的像素统计。合成图左侧2×2区域的均值220、阈值不低于200的像素数4，属于可复现的数值，不是相机检测效果或合格率。
+
+Completed表示测量函数返回了符合基本结构约束的摘要。Failed表示函数抛异常或返回了空/非法摘要，Measurement置空，不能沿用上一件成功结果。
+
+产品OK/NG还需要经审核的工艺标准、测量单位/标定、容差及适用条件。本例没有产品判定，也没有PLC写入，更没有让算法异常自动变为NG并继续生产。
+
+示例允许后续独立图像继续处理，前提是算法为纯托管、无共享设备状态的测量函数。若真实库报告原生上下文损坏、相机离线或整体配置失效，应在外层停止新任务并对账，不能照搬这个继续策略。
+
+## 8. 结果确认不是一个随意的Clear
+
+先await得到结果、处理或持久化，最后显式确认。不要在读取结果时立即从集合删除，也不要在finally里无条件确认，否则消费失败可能同时丢失唯一内存结果。
+
+本例只接受同一实例返回的原始InspectionResult对象；复制record、外来实例、错误请求及重复确认均不会清除别的任务。这是进程内收据契约，不是可序列化网络协议、数字签名或跨重启去重。
+
+请求序号在固定采集OwnerSession内严格递增，已确认的旧序号不能重新执行。示例也拒绝乱序提交的较小序号；本路线当前是串行单拍，不支持多相机、多工位、并行批处理。高水位只在本实例内存存在，重启后不能声称exactly-once。
+
+如果之后需要PLC交接，应另设计发布、稳定快照、接受、匹配确认与断线恢复，可复习[设备命令握手](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)。打印Console不等于PLC收到，调用本地Acknowledge也不等于工艺结果已落库。
+
+## 9. 正常关闭与取消为什么要分开
+
+本例只提供正常排空：Complete停止接收，已接收任务继续处理，await Completion等待唯一处理器退出。尚未确认结果继续保留，工作器不需要等待结果被读走，因此不会由于结果消费者未读而卡在第二条输出队列。
+
+但如果测量函数永久不返回，Completion也不会完成。本例没有强制终止或硬时限；接入真实库前，需要确认调用期限、库支持的中断方式，以及必要时的进程隔离，不能遗留后台调用就释放其原生图像。
+
+CancellationToken采用协作取消，发出请求不等于监听者已经停止；参见[微软取消模型](https://learn.microsoft.com/en-us/dotnet/standard/threading/cancellation-in-managed-threads)。示例没有取消契约，因此意外OperationCanceledException记录为Failed，不伪造“已安全取消”。取消图像处理更不等于相机停止曝光、机械停止或机器人停止。
+
+## 10. 复习与面试追问
+
+1. 为什么预览可替换旧帧，而检测不能静默DropOldest？前者服务显示新鲜感，后者承担已接收工件的处理责任。
+2. Channel容量为2，为什么仍可能无限耗内存？通道外等待者、Task、图片列表、结果历史可能无界。
+3. 结果没被消费，如何让上游看见？把未确认终态纳入容量，而不是处理完就立即释放名额。
+4. 收到Full后能不能再拍一张？不能把拒收当成补拍许可；先保留和处理原任务/工件的去向。
+5. 算法Completed能直接置PLC的OK吗？不能，测量、工艺判定、发布和对方确认是不同阶段。
+6. 退出时调用Complete够不够？还要等待工作器结束、交代未确认结果；不返回的原生调用需要另外设计处理办法。
+
+下一篇用可运行的[C#有界处理与最新预览槽](/knowledge/industrial/host-computer/vision/csharp-bounded-inspection-and-latest-preview/)把这些约束逐项验证。后续再进入坐标/标定与WPF显示，不用占位检测框冒充实际视觉功能。

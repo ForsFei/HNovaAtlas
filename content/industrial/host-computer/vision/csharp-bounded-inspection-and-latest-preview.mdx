@@ -1,0 +1,209 @@
+---
+id: industrial-csharp-inspection-pipeline
+title: C# 有界视觉处理：Channel、结果收据与最新预览槽
+description: 使用真实托管Mono8图像运行单处理器与有界任务账本，演示TrySubmit、等待结果、Acknowledge、Complete和预览替换，提供71项离线检查。
+tags: [工业自动化, C#, 机器视觉, Channel, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 50
+prerequisite: [industrial-vision-bounded-processing, industrial-csharp-single-capture-session]
+related: [industrial-csharp-mono8-buffer-lifetime, industrial-vision-imaging-foundations]
+---
+
+## 本轮的对象和范围
+
+沿用`examples/industrial-vision/`新增InspectionPipeline.cs与PipelineChecks.cs。.NET 10，无第三方包、原生视觉库、相机SDK或网络。图像仍来自原创固定P2夹具，不是相机照片；采集关联仍由离线夹具声明。
+
+新增一个实际后台处理器和有界Channel，运行真实Mono8区域统计；不是只打印队列状态。预览分支仅实现线程安全的最新自有图槽，未新增WPF窗口或网页交互。
+
+先读[容量与结果交接原理](/knowledge/industrial/host-computer/vision/bounded-processing-preview-and-result-handoff/)。以下自定义类型都属于本项目，不是某款相机SDK、HALCON或OpenCvSharp的API。
+
+## 1. 编译、检查与demo
+
+```powershell
+dotnet build examples/industrial-vision/IndustrialVision.csproj -c Release
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --pipeline-test
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --pipeline-demo
+```
+
+本批71项流水线检查；既有`--self-test`为63项图像/缓冲检查，`--capture-test`为73项单拍应用检查，三组独立记录。
+
+demo先接收part-1，计算左上亮块ROI，得到Completed、均值220。未确认第一件结果时提交part-2得到Full；打印并本地确认第一件后，显式重投已持有的part-2图像，再释放其采集槽。没有重拍、PLC写入或数据库提交。
+
+## 2. 常用属性和方法一览
+
+| 对象/成员 | 用法与约束 |
+| --- | --- |
+| ProcessingRecipe | 算法版本、期望采集配置版本、ROI、阈值；构造时固定 |
+| InspectionPipeline构造 | 固定Capture OwnerSession、尺寸、配方、Capacity；启动唯一工作器 |
+| Session / Recipe / Capacity | 本地流水线代、固定配方及容量 |
+| RetainedCount | 排队＋运行＋未确认终态的当前项数 |
+| TrySubmit(CaptureResult) | 非阻塞尝试接收，返回InspectionSubmission |
+| Submission.Admission / Result | 明确接收状态；Accepted携带最终结果Task |
+| Read(CaptureKey) | 查询本实例保留项；返回Queued/Processing/Completed/Failed及终态结果 |
+| Acknowledge(InspectionResult) | 显式交接原结果对象成功后释放一项 |
+| Complete / Completion | 停止新接收；等待已接收项排空和工作器退出 |
+| LatestPreviewSlot.Publish | 发布自有图；true表示替换了尚未取走的预览 |
+| LatestPreviewSlot.Take | 原子取走最新发布图，没有图返回null |
+
+没有Open/CloseCamera、Grab、WritePLC、产品OK/NG或Cancel方法。上一批OfflineFrameSource的Open/Acquire/Close仍仅表示离线源生命周期，不能把处理流水线的Complete当成相机停止采集。
+
+## 3. 构造处理器：冻结输入契约
+
+```csharp
+ProcessingRecipe recipe = new(
+    Version: "roi-statistics-v1",
+    ProfileRevision: 1,
+    Region: new PixelRoi(1, 1, 2, 2),
+    Threshold: 200);
+
+InspectionPipeline pipeline = new(
+    captureOwner: capture.OwnerSession,
+    width: 8, height: 6,
+    recipe: recipe, capacity: 2);
+```
+
+这里capture指已建立的SingleCaptureSession，完整初始化见[单拍会话教程](/knowledge/industrial/host-computer/vision/csharp-single-capture-session-and-frame-correlation/)。ROI使用原图零基列/行坐标，不是屏幕坐标或毫米坐标。构造时校验非空版本、正配置版本、有效尺寸/ROI，容量限制1～16。
+
+默认算法调用`image.Measure(recipe.Region, recipe.Threshold)`，全程只读自有托管像素。注入的measure委托是测试/教学扩展点，要求只返回本次区域统计，不用于隐藏相机操作、共享可变原生对象或机械动作。
+
+## 4. Channel怎样配置
+
+实现中的核心是：
+
+```csharp
+input = Channel.CreateBounded<Entry>(new BoundedChannelOptions(capacity)
+{
+    SingleReader = true,
+    SingleWriter = false,
+    AllowSynchronousContinuations = false,
+    FullMode = BoundedChannelFullMode.Wait
+});
+Completion = Task.Run(WorkAsync);
+```
+
+Entry为内部账本项，不向调用者暴露。工作器通过ReadAllAsync顺序取项，调用并等待一个测量函数，再处理下一项。只有构造时一次Task.Run，不是每帧都Task.Run。
+
+微软的[Channels文档](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)说明Wait模式下TryWrite满载立即false、WriteAsync等候。这里使用TryWrite，不把SDK回调变成等待容量的后台堆积点；额外账本限制比Channel等待项限制更保守，终态未确认也占名额。
+
+SingleWriter=false允许多调用者使用通道；但业务仍限定一个采集OwnerSession、请求序号递增。锁保护账本、接收/关闭及确认的一致性，并不把乱序多工件输入自动变成有序协议。若较大序号先接收，之后较小序号会Stale。
+
+## 5. 接收结果必须逐类处理
+
+```csharp
+CaptureResult owned = capture.TakeForProcessing(now)
+    ?? throw new InvalidOperationException("没有可移交的合格图像");
+
+InspectionSubmission submission = pipeline.TrySubmit(owned);
+if (submission.Admission == InspectionAdmission.Accepted)
+{
+    // 仅释放采集槽，不是产品成功；实际失败时应对账而非继续触发。
+    if (!capture.ReleaseCapture(owned.Request.Key, now))
+        throw new InvalidOperationException("采集交接状态需要复核");
+}
+else
+{
+    // 保留owned及状态，明确交给上层处置；不能悄悄丢图或自动重拍。
+    Console.WriteLine($"未新接收：{submission.Admission}");
+}
+```
+
+以上是条件分支片段，不能直接把局部owned丢出作用域就称为“保留”；完整demo在同一作用域持有第二份图，确认结果后显式重投。真实应用应由单所有者持有待交接项，禁止不断接新图扩展成无界List。
+
+| Admission | 含义与调用者责任 |
+| --- | --- |
+| Accepted | 账本/通道接收了这一份图，可以等待其Result |
+| Full | 未接收，Result为null，调用者仍持有图；未推进高水位 |
+| Closed | 已Complete，不可继续接收；即使旧对象再次提交也返回Closed |
+| AlreadyTracked | 同一个CaptureResult对象已有保留项，返回原Task；没有重复执行 |
+| Conflict | 同Key但不是原对象，拒绝覆盖，即使with复制字段完全相同也保守拒绝 |
+| Stale | 本实例已接收过更大或相同序号，且该Key不在保留项中 |
+| Invalid | 请求/身份字段缺失、格式/尺寸/质量/配置不符合基础契约 |
+
+只对Accepted进行一次正常采集交接。AlreadyTracked用于观察既有任务，不是新接收或第二次释放采集槽；若第一次释放状态不确定，应核对原状态，不把重复提交当作恢复协议。
+
+TrySubmit检查有限时间数值但不检查当前图像年龄；也不重新证明CameraEpoch、触发身份、Complete等声明。调用者必须使用上一批真实核对后的输出并维护工艺时效。复制普通record即可伪造声明，示例不是对不可信进程的安全边界。
+
+## 6. 等待结果与检查失败
+
+```csharp
+if (submission.Admission == InspectionAdmission.Accepted)
+{
+    InspectionResult result = await submission.Result!;
+    if (result.Stage == ProcessingStage.Completed)
+        Console.WriteLine($"{result.Request.Workpiece}: mean={result.Measurement!.Mean}");
+    else
+        Console.WriteLine($"{result.Request.Workpiece}: processing failed: {result.ErrorCode}");
+
+    // 这里只是本地演示：没有数据库持久化，也没有PLC接收确认。
+    if (!pipeline.Acknowledge(result))
+        throw new InvalidOperationException("结果收据不匹配");
+}
+```
+
+正常测量返回Completed；函数异常或非法摘要返回Failed、Measurement=null及最多80字符的异常类型名，不存无限异常历史或直接展示异常Message。结果保留原工件、采集Key、帧号、设备代、触发号和固定配方，不读取“当前选中的工件”来贴标签。
+
+Task成功完成只是“交出了一个InspectionResult”，该结果本身可能是Failed，不能仅看Task.IsCompletedSuccessfully判产品合格。也不能把区域均值220直接解释成曝光合格、缺陷合格或200毫米。
+
+示例对摘要检查ROI、计数、数值范围等基本结构，不能证明算法正确。错误算法仍可能返回外观合法的数值，需要另做数据集、精度、重复性、鲁棒性与工艺验收。
+
+## 7. 为什么要交回原收据
+
+```csharp
+bool accepted = pipeline.Acknowledge(result);          // 原对象、同实例、尚未确认
+bool copied = pipeline.Acknowledge(result with { });  // false
+```
+
+实现用流水线代、请求Key及ReferenceEquals核对原始结果。不是比较某个bool，也不接受任意构造的“完成通知”。这只能保护进程内调用契约，不能直接用于JSON反序列化、数据库恢复或网络客户端确认。
+
+Read不会自动删除；Acknowledge才释放账本。Failed与Completed同样必须交代。旧请求即使已经确认释放，也会被本实例的序号高水位拒绝再次执行；高水位不持久化，不能推导跨进程exactly-once。
+
+调用者若长期保存原输入、结果Task或历史列表，仍会额外占内存；确认不是强制GC。真实审计需设计有界缓存与持久化，不把这个内存字典当数据库。
+
+## 8. 最新预览槽只负责显示分支
+
+```csharp
+LatestPreviewSlot preview = new();
+bool replaced = preview.Publish(owned.Evidence.Frame);
+OwnedFrame? latest = preview.Take();
+if (latest is not null)
+    Console.WriteLine($"preview frame={latest.Stamp.Number}, replaced={replaced}");
+```
+
+Publish用Interlocked.Exchange替换槽，Take用相同操作取走并置空。Publish返回true只说明替换了一份尚未取走的预览，**不代表丢失了一个检测任务**。两个分支引用的是公开不可变Mono8Image，不需要给它调用Dispose。
+
+该实现只保留一份槽引用，没有图像队列、叠加绘图、缩放或Dispatcher。多生产者并发时“最新”按发布交换的先后决定，不自动按相机曝光时间排序。不要把它直接替换成SDK借用指针，也不要假定原生视觉对象不需要各自生命周期管理。
+
+## 9. 关闭：先禁止新任务，再等排空
+
+```csharp
+try
+{
+    // 接收任务、消费结果；所有非接收分支都要明确处置。
+}
+finally
+{
+    pipeline.Complete();
+    await pipeline.Completion;
+}
+```
+
+Complete可以重复调用，没有恢复/重新打开方法。排空后Read和Acknowledge仍可用，未确认结果仍在原账本中；丢弃整个对象会丢失这些内存历史，正常退出流程仍应处理完全部结果。
+
+没有第二条有界结果通道，因此工作器退出不依赖结果消费者是否正在读取。但算法不返回仍会阻塞排空，本例没有取消或硬时限。检查中的WaitAsync(5秒)只是发现测试挂起的保护，不是流水线终止算法的能力，也不能据此提前释放原生资源。
+
+本例测量函数若抛OperationCanceledException会记录Failed，因为没有建立任务取消协议。真实取消需明确排队未运行、运行中、终态及外部副作用的含义；不能通过吞异常声称相机/执行机构已经停止。
+
+## 10. 71项检查覆盖到哪里
+
+- 构造与输入：容量、配方、ROI、质量、配置、工件、来源和尺寸约束。
+- 并发与容量：门闩控制第一项运行/第二项排队，第三项明确Full；未确认终态仍占容量。
+- 身份：同对象重复只返回原Task、改对象冲突、原帧和配方随结果传递、确认后旧序号不再执行。
+- 结果：异常/空摘要转为带Key失败，不沿用旧测量；失败结果也保留并确认。
+- 关闭：空队列、重复Complete、已有任务排空、关闭后拒收，结果可在退出后继续交接。
+- 线程边界：32次并发提交同一对象，仅一次Accepted；最新预览替换不改变检测自有像素。
+
+测试用TaskCompletionSource门闩控制顺序，不靠Thread.Sleep猜时序；单个断言也可能检查多个字段，71不是并发压力覆盖率。当前未做长期吞吐、内存曲线、设备丢帧、原生库、WPF人工操作、产品质量或PLC闭环验收。
+
+接着学习[图像坐标、平面标定与误差](/knowledge/industrial/host-computer/vision/image-coordinates-planar-calibration-and-errors/)，运行 [C#三点仿射与独立检查](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)，之后再做克制的WPF显示。HALCON、OpenCvSharp和YOLO按后续路线分别讲对象与常用方法，不在本批引入占位封装。

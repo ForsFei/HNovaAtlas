@@ -1,0 +1,263 @@
+---
+id: industrial-tcp-client-listener-stream
+title: C# TCP 工业通信：TcpClient、TcpListener 与 NetworkStream 读写
+description: 从客户端服务端与 TCP 字节流讲起，查用 C# TCP 常见属性方法，结合请求编号、CRLF 分帧、连接与响应期限，以及本地教学设备验证正常、慢响应和断开。
+tags: [工业自动化, C#, TCP, Socket, 网络通信]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 30
+prerequisite: [industrial-communication-data-contracts, industrial-serial-framing-and-wpf]
+related: [industrial-tcp-session-heartbeat-recovery, industrial-udp-client-datagrams, industrial-host-computer-chapter-map, csharp-io-network-streams]
+---
+
+## 从串口换到网口，哪些概念变了
+
+串口一节已经把“字节接收”和“协议组帧”分开。TCP 也需要组帧，但打开串口变成了**建立到指定 IP 和端口的连接**，还多了监听、接受连接、对端关闭和网络故障等问题。
+
+先记住三组不同概念：
+
+- 以太网线缆/网卡是网络接入的一部分；TCP 是传输协议；设备的读写命令是应用协议。
+- TCP 客户端负责主动发起连接，服务端负责监听并接受连接。它们不等于业务上的上位机和下位机：某些设备也会主动连接 PC。
+- TCP 提供有序字节流，不替你定义“读温度”“启动运动”等业务语义，也不保存应用每次 Write 的边界。
+
+本节选择常见的“PC 主动连接设备”模式。C# 使用 `System.Net`、`System.Net.Sockets` 中的 `TcpClient`、`TcpListener` 和 `NetworkStream`，不需要额外安装工业库。这些类建立在 Socket 之上；需要更底层控制时再使用 `Socket`。[Microsoft：TCP 类概览](https://learn.microsoft.com/en-us/dotnet/fundamentals/networking/sockets/tcp-classes)
+
+配套项目为 `examples/industrial-networking/IndustrialNetworking.csproj`，目标 .NET 10。本轮只做低频、每次查询新建连接的完整链路，暂不加入长连接状态机或 WPF 面板。
+
+## IP、端口与连接对象分别是什么
+
+`127.0.0.1:43120` 表示本机回环地址上的一个 TCP 服务端点。IP 指向主机/接口，端口区分该主机上的服务；TCP 与 UDP 的端口空间分别管理。
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+
+var device = new IPEndPoint(IPAddress.Loopback, 43120);
+using var client = new TcpClient(AddressFamily.InterNetwork);
+await client.ConnectAsync(device.Address, device.Port, stop);
+using NetworkStream stream = client.GetStream();
+```
+
+`stop` 是由调用方提供的 `CancellationToken`。这个片段只展示建立连接，不包含完整的响应期限和协议校验，后面会补齐。
+
+客户端一般不必固定本地端口，系统会分配临时端口。服务端通常监听一个事先约定的端口。不要因为设备手册写了“TCP 通信”，就自行猜测它监听哪个端口或使用哪套命令。
+
+本地模拟器只绑定 `IPAddress.Loopback`，不会监听整个局域网；`IPAddress.Any` 表示监听所有 IPv4 本地接口，不是连接目标地址。跨机测试应另外确认网卡地址、路由、设备服务配置和防火墙，不直接把教学服务暴露出去。
+
+## TcpClient 的常用属性与方法
+
+| 成员 | 用法 | 容易误解的地方 |
+| --- | --- | --- |
+| `new TcpClient()` / 指定地址族 | 创建连接对象 | 仅创建对象还没有连接设备 |
+| `Connect(host, port)` | 同步建立连接 | 不要直接放在 WPF UI 线程等待 |
+| `ConnectAsync(address, port, token)` | 异步建立连接并支持取消 | 成功只说明传输连接建立，不证明业务已就绪 |
+| `GetStream()` | 获取连接上的 `NetworkStream` | 先连接成功再使用 |
+| `Connected` | 最近一次 I/O 所反映的连接状态 | 不是可提前保证下一次读写成功的在线探针 |
+| `Available` | 当前排队可读的字节数 | 不等于完整报文长度；0 不等于断线 |
+| `NoDelay` | 控制是否禁用 Nagle 算法 | 不会强制一次 Write 对应一次 Read，也不提供实时保证 |
+| `ReceiveBufferSize` / `SendBufferSize` | 调整 socket 缓冲大小 | 不是协议帧长，也不是设备一次读写上限 |
+| `ReceiveTimeout` / `SendTimeout` | 同步接收/发送等待设置 | 不替代本节异步 API 的令牌期限 |
+| `Client` | 访问底层 Socket | 可查看端点、设置所需选项；不要让多处代码随意关同一个 socket |
+| `Close()` / `Dispose()` | 关闭并释放连接资源 | 本例用 `using` 保证正常和异常路径都释放 |
+
+`Connected` 的说明特别强调：它反映最近一次操作时的状态，网络可能在检查后立即变化。因此不要写 `if (client.Connected) 就认定设备可用`；真正的读写仍必须处理异常和超时。[Microsoft：Connected](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.tcpclient.connected?view=net-10.0)
+
+## NetworkStream 的常用属性与方法
+
+| 成员 | 用途 | 本例规则 |
+| --- | --- | --- |
+| `Read(byte[], offset, count)` | 同步读取字节 | 数量参数是容量上限，返回值才是实际读取数 |
+| `ReadAsync(Memory<byte>, token)` | 异步读取字节 | 单消费者循环；只解析实际返回的部分 |
+| `Write` / `WriteAsync` | 写入字节 | 自己编码协议；不会追加结束符 |
+| `ReadExactlyAsync` | 按已知数量读足或失败 | 适合协议已明确长度的部分，不会自己识别 CRLF |
+| `DataAvailable` | 当前是否已有可立即读取的数据 | false 不表示 EOF，也不表示未来不会再来数据 |
+| `CanRead` / `CanWrite` | 流是否具有对应操作能力 | 不是设备在线状态 |
+| `ReadTimeout` / `WriteTimeout` | 同步操作超时设置 | 不影响本节的异步读取期限，应传取消令牌 |
+| `Flush` | 对 NetworkStream 本身没有额外发送缓冲刷新作用 | 不是“等待设备执行完成”；若外面另包写入器，另看写入器缓冲 |
+| `Dispose` / `DisposeAsync` | 释放流 | 同时明确 TcpClient 的作用域，不让连接悬空 |
+
+对非空接收缓冲，`ReadAsync` 返回 0 表示对端有序关闭了发送方向，且没有更多字节可读。若协议还在等完整帧，就应作为 EOF 失败；连接复位等异常则可能抛出 `IOException`，不能只处理返回 0。[Microsoft：ReadAsync](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.networkstream.readasync?view=net-10.0)
+
+`ReadTimeout` 不影响异步 ReadAsync，相关区别要与串口同步读取分开理解。[Microsoft：ReadTimeout](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.networkstream.readtimeout?view=net-10.0)
+
+## 报文契约：加上请求编号
+
+为了不把旧响应当成新结果，本节在上一节文本协议的基础上加了请求号：
+
+```text
+请求：READ 7d362efcc0b14d5ebd8df5a488346a62 TEMP\r\n
+响应：TEMP 7d362efcc0b14d5ebd8df5a488346a62 253\r\n
+```
+
+请求号由 `Guid.NewGuid().ToString("N")` 产生，约定为 32 位小写十六进制；响应必须原样返回。同一协议也会用于下一篇 UDP，便于比较传输层差异。
+
+协议约定：可打印 ASCII 载荷，最多 96 字节，不含结尾 CRLF；温度原始值是整数，单位 0.1 °C，范围 -400～1250。请求和响应各一帧，不允许主动上报。
+
+该协议是本课程自定义的教学协议，不是 Modbus TCP、MC 或西门子 S7。网口相同不代表应用报文能互换。请求号只用于关联，不是密码，也不会自动让设备具备幂等或恰好一次执行能力。
+
+## 读取完整一帧，再验证业务响应
+
+本例直接复用串口一节的 `CrlfFrameDecoder`，因为它只依赖字节和协议，不依赖串口硬件。区别在于输入来自 NetworkStream：
+
+```csharp
+public static async Task<string> ReadFrameAsync(
+    NetworkStream stream, CancellationToken stop)
+{
+    var decoder = new CrlfFrameDecoder(WireProtocol.MaxPayload);
+    byte[] buffer = new byte[256];
+    while (true)
+    {
+        int count = await stream.ReadAsync(buffer.AsMemory(), stop);
+        if (count == 0)
+            throw new EndOfStreamException(decoder.BufferedBytes == 0
+                ? "对端在完整响应前关闭。" : "对端关闭，仍残留半帧。");
+        IReadOnlyList<string> frames = decoder.Feed(buffer.AsSpan(0, count));
+        if (frames.Count == 0) continue;
+        if (frames.Count != 1 || decoder.BufferedBytes != 0)
+            throw new FormatException("单次请求收到多余帧或残留字节。");
+        return frames[0];
+    }
+}
+```
+
+这里检测的是本次读取块中可见的多余字节，不声称已经检查完未来才到达的数据。因为本例一条连接只做一个请求，拿到有效结果后就关闭，不会把这条流继续交给下一次查询。
+
+若改成长连接，不能每请求一次就随意重建流解析器、丢掉未消费字节；应让会话接收器一直拥有它，再按请求号分发响应。具体实现见[长连接、心跳、有限恢复与 WPF](/knowledge/industrial/host-computer/communication/tcp-long-connection-heartbeat-and-recovery/)。
+
+## 客户端：连接、写入、读取和释放
+
+完整代码在项目的 `NetworkQueries.cs`。下面是查询主线，调用的 `WireProtocol` 和 `ReadFrameAsync` 都包含在配套项目中：
+
+```csharp
+using var client = new TcpClient(device.AddressFamily) { NoDelay = true };
+
+using (var connect = CancellationTokenSource.CreateLinkedTokenSource(stop))
+{
+    connect.CancelAfter(connectTimeout);
+    try
+    {
+        await client.ConnectAsync(device.Address, device.Port, connect.Token);
+    }
+    catch (OperationCanceledException)
+        when (!stop.IsCancellationRequested && connect.IsCancellationRequested)
+    {
+        throw new TimeoutException("TCP 建立连接超时。");
+    }
+}
+
+using var exchange = CancellationTokenSource.CreateLinkedTokenSource(stop);
+exchange.CancelAfter(responseTimeout);
+try
+{
+    using NetworkStream stream = client.GetStream();
+    string requestId = WireProtocol.NewId();
+    await stream.WriteAsync(WireProtocol.Request(requestId), exchange.Token);
+    string frame = await ReadFrameAsync(stream, exchange.Token);
+    TemperatureReply reply = WireProtocol.ParseResponse(frame);
+    if (reply.RequestId != requestId)
+        throw new FormatException("TCP 响应请求号不匹配。");
+    return reply.Temperature;
+}
+catch (OperationCanceledException)
+    when (!stop.IsCancellationRequested && exchange.IsCancellationRequested)
+{
+    throw new TimeoutException("TCP 请求响应超时；连接已放弃，不自动重发。");
+}
+```
+
+这个例子刻意保留了几个边界：
+
+1. 建立连接期限与发送/等待响应的总期限分开。CLI 默认分别为 2 秒和 1 秒，因此不是“整个调用最多 1 秒”。
+2. 发送与读取共用一次 `exchange` 令牌；每到一块字节都不会重新开始计时。
+3. 取消令牌传给实际网络 API，并 await 操作结束，不只是用 `WaitAsync` 停止等待一个仍在后台占用流的任务。
+4. 调用方取消时保留 `OperationCanceledException`；只有内部期限到达才转换成 `TimeoutException`。
+5. EOF、错误格式、请求号不符、超时和用户取消都会离开作用域并释放本次连接。没有自动重发。
+
+写入返回成功，只说明本地发送操作完成，不证明设备已解析、接受或执行。对于“启动”“送料”一类动作，超时后的实际结果可能未知，需要业务状态查询或设备端去重，不能直接复制这个只读查询然后加无限重试。
+
+## 服务端：监听不等于已连接
+
+`TcpListener` 管理监听 socket；`AcceptTcpClientAsync` 返回的是某一条已接受连接。服务器要同时管理这两类资源：
+
+| 成员 | 作用 |
+| --- | --- |
+| `new TcpListener(IPAddress.Loopback, port)` | 选择本地监听地址和端口 |
+| `Start()` / `Start(backlog)` | 开始监听；backlog 不是应用并发处理数量 |
+| `LocalEndpoint` | 查看实际绑定端点；端口 0 可让系统分配测试端口 |
+| `AcceptTcpClientAsync(token)` | 等待并取得一条连接 |
+| `Stop()` | 停止监听；已接受的 TcpClient 仍要分别释放 |
+
+最小服务端流程如下；片段假设已提供 `stop`，仍需在外层捕获并记录异常：
+
+```csharp
+var listener = new TcpListener(IPAddress.Loopback, 43120);
+try
+{
+    listener.Start();
+    using TcpClient peer = await listener.AcceptTcpClientAsync(stop);
+    using NetworkStream stream = peer.GetStream();
+    string id = WireProtocol.ParseRequest(
+        await NetworkQueries.ReadFrameAsync(stream, stop));
+    await stream.WriteAsync(WireProtocol.Response(id), stop);
+}
+finally
+{
+    listener.Stop();
+}
+```
+
+完整模拟器 `DeviceSimulator.RunTcpAsync` 会循环接受连接，为请求读取设置期限，记录单次会话错误并释放 accepted client；只绑定本机，不是面向公网的通用服务器。它顺序处理连接，慢客户端会暂时影响后续请求；并发上限、客户端身份和生产服务治理不在本轮范围内。
+
+## 运行本地设备和客户端
+
+从仓库根目录开两个终端。终端 A：
+
+```powershell
+dotnet run --project examples/industrial-networking/IndustrialNetworking.csproj -- --tcp-device 43120 split
+```
+
+终端 B：
+
+```powershell
+dotnet run --project examples/industrial-networking/IndustrialNetworking.csproj -- --tcp-client 43120
+```
+
+预期打印 25.3 °C 后结束本次客户端。设备端 Ctrl+C 取消监听并退出。43120 是本例 TCP 端口，与网站 43110 无关；如果端口占用，需要两端一起换。
+
+模拟器的 `split` 会把 CR 与 LF 放到两次 WriteAsync 中，但 TCP 仍可能把它们合并到一次 ReadAsync；我们测试的是客户端不依赖发送调用边界，而不是保证某种网络切包结果。
+
+### 故障场景
+
+停止原设备端后，可用下列场景名替换 `split` 再启动：
+
+| 场景 | 模拟行为 | 客户端应看到什么 |
+| --- | --- | --- |
+| `normal` | 一次写入完整响应 | 有效温度 |
+| `split` | 分两次写入响应 | 仍能组帧得到温度 |
+| `slow` | 等待 2 秒才回复 | CLI 的 1 秒响应期限到达 |
+| `close` | 读到请求后不回复就关闭 | 完整响应前 EOF |
+| `partial` | 只发 `TEMP ` 就关闭 | 半帧 EOF |
+| `malformed` | 温度字段为 `abc` | 业务格式失败 |
+| `wrongid` | 回另一个请求编号 | 响应关联失败 |
+
+没有服务监听时，系统可能返回连接拒绝，也可能先重试，由应用连接期限先结束；不要把所有连接失败都显示成“设备不存在”。
+
+运行自动检查：
+
+```powershell
+dotnet run --project examples/industrial-networking/IndustrialNetworking.csproj -- --self-test
+```
+
+检查绑定本机临时端口，通过操作系统 TCP/UDP socket 验证收发、故障和取消，每个模拟器结束时都等待后台任务退出。不扫描局域网、不访问实际设备；因此不能替代真实设备协议兼容、跨机网络和防火墙验收。
+
+## 常见错误与复习追问
+
+1. `Connected == true` 时，下一次 WriteAsync 为什么仍可能失败？
+2. `ReadAsync` 返回 7，应解析多大的数组范围？返回 0 与暂时没有字节有什么区别？
+3. 设备发了两次消息，为什么一次 Read 可能同时拿到它们？
+4. 为什么设置 `ReadTimeout = 1000` 不能替代这里的异步期限？
+5. 为什么监听器 Stop 后，还要释放每一个已接受连接？
+6. 如果把本例改成 TCP 长连接，需要把解析器、请求表和取消状态放在哪个生命周期？
+
+下一篇用相同业务协议对照 [UDP 数据报与 UdpClient](/knowledge/industrial/host-computer/communication/udp-client-and-datagrams/)，理解为何 UDP 不做 TCP 式连接，却更需要明确来源和请求关联。

@@ -1,0 +1,171 @@
+---
+id: industrial-csharp-plc-motion-handoff
+title: C# PLC—雷赛任务交接：一次意图、结果关联与断线不重放
+description: 用62项离线检查实现PLC请求身份与PC本地执行身份的映射、重复冲突、结果保留、会话隔离及失联锁定，不连接PLC或调用运动SDK。
+tags: [工业自动化, C#, PLC, 雷赛, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 200
+prerequisite: [industrial-plc-leadshine-motion-handoff]
+related: [industrial-csharp-command-mailbox-recovery, industrial-csharp-e3032-motion-observation, industrial-csharp-recovery-review]
+---
+
+## 入口与实际执行范围
+
+在既有 `examples/industrial-motion/` 中新增 `PlcMotionHandoff.cs`、`HandoffChecks.cs`，仍为纯.NET、无第三方包：
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --handoff-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --handoff-demo
+```
+
+62项检查只验证内存交接逻辑。没有PLC网络/寄存器编码/状态发布器，没有LTDMC、真实轴、PLC程序或原生执行适配器；demo直接注入虚构的派发和完成证据，不驱动既有SimAxis/WPF或相机。
+
+本篇类名均为课程定义的应用对象，不是雷赛或PLC厂商库的新接口。
+
+## 1. 核心对象与字段
+
+| 类型 | 字段含义 |
+| --- | --- |
+| `PlcJobKey` | 经外层核对的PLC启动代与非零16位RequestId |
+| `StationMotionJob` | Key、工件标签、固定配方修订及位置ID |
+| `PlcHandoffInput` | 主机单调采样时间、PLC代、质量、远程自动与工艺许可 |
+| `ExecutorTicket` | PC执行会话与本次本地意图ID |
+| `MotionExecutionIntent` | 一次取出的任务及Ticket，不代表已发送到卡 |
+| `MotionExecutorReport` | 外部已关联本次动作的归一化结果及质量声明 |
+| `RetainedMotionJob` | 保留任务、Ticket和阶段；原请求不会被后续候选参数修改 |
+| `HandoffView` | PC会话、高水位、对账锁定与保留历史 |
+
+字段里的Guid属于应用归一化域，不是PLC硬件原生身份。真实代值的产生、编码、掉电及重启规则由外层实现并验证。本轮构造夹具中的Guid没有硬件身份效力。
+
+## 2. 构造时固定上下文
+
+```csharp
+Guid verifiedPlcBoot = Guid.NewGuid(); // 仅示意，真实值需先由启动对账取得。
+var bridge = new PlcMotionHandoff(verifiedPlcBoot,
+    recipeRevision: 1, allowedPositions: new ushort[] { 1, 2 });
+
+bridge.Update(new PlcHandoffInput(SampledAt: 0, PlcBoot: verifiedPlcBoot,
+    Valid: true, RemoteAuto: true, ProcessPermit: true), now: 0); // 夹具显式声明，未读取设备。
+var job = new StationMotionJob(new PlcJobKey(verifiedPlcBoot, 1),
+    Workpiece: "part-A", RecipeRevision: 1, PositionId: 1);
+```
+
+PlcHandoffInput的质量、远程自动和许可默认均为false，必须由外层证据显式赋值，不靠构造一个对象默认放行。白名单被复制到内部集合，不受外部数组之后修改影响；集合只表达可接受的位置ID，不包含真实坐标。配方修订在实例内固定，实际坐标、轴和速度仍需另行锁定与审核。
+
+在任务未结束时修改配方/参考/映射，外层应使本实例失效，不从“当前最新配置”继续执行旧意图。构造函数不会自动读配方、建立参考或申请真实轴资源。
+
+## 3. Receive、TakeIntent与RecordDispatch分开
+
+```csharp
+HandoffReply reply = bridge.Receive(job, now: .01);
+// Accepted：本地保留，尚未调用SDK。
+
+MotionExecutionIntent? intent = bridge.TakeIntent(now: .02);
+// 同一任务只能取到一次。返回后已进入本地派发边界。
+
+if (intent is not null)
+{
+    // 教学夹具：声明调用得到确认；这里没有任何真实原生调用。
+    bridge.RecordDispatch(intent.Ticket, DispatchEvidence.Acknowledged, now: .03);
+}
+```
+
+`RecordDispatch`复用既有`DispatchEvidence`枚举：NotAttempted为调用者明确知道没有尝试，Acknowledged只是原生调用确认，OutcomeUnknown表示派发结果未知。
+
+实际适配器必须在调用前保留尝试边界，单所有者await其已启动操作并核对结果；不能只在catch里写“未发送”。本轮没有这样的原生适配器，也不会为了补全示例而对真实LTDMC发出一次运动。
+
+取出意图后再反复轮询，`TakeIntent`返回null；同一请求重复Receive也不会产生新意图。`IntentsTaken`计的是本地取出次数，不是实际电机启动次数或持久化执行次数。
+
+## 4. 同号、改参、新号和拒绝分别处理
+
+| 请求情况 | 返回/保留行为 |
+| --- | --- |
+| 同Key、完整载荷相同 | Duplicate，保留原阶段，不重复取意图 |
+| 同Key但位置/配方/工件不同 | Conflict，不修改原任务 |
+| 原任务或终态尚保留，另一个Key到来 | Busy，不覆盖结果 |
+| 结果已释放，编号不大于高水位 | Stale，不重新执行 |
+| 零编号或请求代不匹配 | InvalidIdentity，不切换已核对的PLC代 |
+| 可识别的新编号，但配方/位置/工件不合法 | 保留Rejected终态，无意图；不能用同号改参重试 |
+| 输入未核对或本实例已锁定 | Blocked，无新意图 |
+
+RequestId耗尽不自动回绕到1；PLC代切换也不由某个请求包触发。新的有效PLC启动代需要外部启动/恢复交接。
+
+在真实网络发布层，即使是Busy、Conflict等回复，也应带上对应请求身份并有明确读取/确认规则，不能只发一个短脉冲。本模型的同步返回枚举不等于已实现PLC可读的回复邮箱。
+
+## 5. 怎样把执行结果关联回PLC任务
+
+```csharp
+// 下方均为虚构的已归一化报告，不从SDK返回0直接构造Completed。
+bridge.Observe(new MotionExecutorReport(intent!.Ticket, SampledAt: .04,
+    Kind: MotionReportKind.Running, Qualified: true), now: .04);
+bridge.Observe(new MotionExecutorReport(intent.Ticket, SampledAt: .05,
+    Kind: MotionReportKind.Completed, Qualified: true), now: .05);
+
+HandoffView status = bridge.Read(now: .06);
+// status.Retained.Job.Key仍是原PLC请求，Ticket仍是本次本地动作。
+```
+
+Report必须匹配本次Ticket；派发证据尚未记录时不能先用一个Done报告完成任务。Qualified默认false，需要外部观察器确认其动作身份、采样质量、反馈/目标/停止原因以及本定位任务的完成契约，模型不自行检查真实轴。
+
+这层不要求应用一定收到某次Running回调才允许一个已经合格的Completed报告；快速动作和漏采启动应由专门观察器决定是否具有充分证据，而不是用旧done补齐。本篇只接收归一化结果，不重复实现运动判据。
+
+Stopped、Failed、Unknown保留各自终态并锁定对账，绝不改为Completed。普通网络失效时，已经Completed的历史可以保留，但当前上下文已不允许新任务。
+
+## 6. 终态确认释放不是清错或停止
+
+```csharp
+bool released = bridge.AcknowledgeResult(job.Key,
+    expectedExecutorSession: bridge.ExecutorSession, now: .07);
+// 正常Completed等可释放终态，需要请求Key与PC会话都匹配。
+// 只释放本地保留记录，高水位仍在，不复位轴、PLC、输出或配方。
+```
+
+活动任务不能通过结果确认被取消；Unknown/Stopped/Failed等对账锁定状态也不能走这个普通释放路径继续接单。当前模型没有解除粘性锁定的恢复方法，恢复应重新核对现场及旧任务，而不是调用一个Clear按钮抹掉证据。
+
+释放后旧编号仍返回Stale。PLC应先验证完整结果、身份和会话，再确认释放；丢失结果确认回执时只查询，不自动发一个新编号作为重试。
+
+## 7. PLC摘要的时效和失联规则
+
+默认0.25s最大年龄为教学值，所有时间均为同一主机单调钟域。源时间必须有效、非未来且严格递增；覆盖缺口、旧摘要已经过期后才处理新摘要、PLC代变化、质量/远程自动/工艺许可丢失均锁定本实例。
+
+Receive、TakeIntent、记录派发及普通确认都会再次查当前摘要时效。旧/外来的动作回报不刷新许可时间，因此外层仍需持续Update或Read检测时效，不能用回调当心跳。
+
+尚未Take时失效记NotSubmitted，只说明未通过本模型派发；Take后未明确完成时失效记Unknown。模型不发停止、不撤使能、不修改比较器，也不保证失联时机械会停。设备侧及安全系统的失联责任必须另行设计与验收。
+
+健康输入重新出现不会自动解锁或重放。许可位不是安全认证信号，离散新采样也不证明采样间现场一直满足条件。
+
+## 8. 与现有MC客户端/邮箱怎样衔接
+
+现有 `examples/industrial-handshake/HandshakeClient.cs` 使用固定McpX 0.13.0，其`BatchReadAsync<ushort>`、写字段及Control阶段已有回环验证；但那份邮箱是**PC发请求给模拟PLC执行**，不是本篇PLC发任务给PC。
+
+可以复用[MC对象读写知识](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)和[稳定邮箱契约](/knowledge/industrial/host-computer/communication/csharp-command-mailbox-and-recovery/)的原则，不能直接宣称已接好新的PLC字段。完整适配需要：
+
+```text
+PLC按已定义提交阶段发布候选任务
+  → PC通信层读出并校验稳定载荷/身份/质量
+  → 归一化为PlcHandoffInput与StationMotionJob
+  → Receive / 一次TakeIntent
+  → 尚未实现的真实运动适配器及独立动作观察
+  → 发布带原请求身份、PC会话和一致版本的状态
+  → PLC核对后确认终态
+```
+
+本轮没有新增寄存器布局、二进制编解码、MC连接或状态写入。因此没有可复制到真实PLC即运行的D/DB地址，也没有ST程序。若采用S7或OPC UA，运输接口不同，业务身份与一致性责任仍需分别实现。
+
+## 9. 新实例为什么不能自动接管旧请求
+
+每个新对象有新ExecutorSession，但高水位从0开始、没有保留旧任务。这仅是本轮内存实现的局限，不是允许重启后重新接受PLC保持的旧请求。
+
+真实启动流程应先禁止派发，核对旧PLC请求、PC执行日志、卡/驱动状态及工件去向；必要时按[恢复复核](/knowledge/industrial/host-computer/motion/csharp-recovery-review-and-stale-confirmation/)重新建立计划。持久化和跨设备动作仍不是原子事务，不能声称exactly-once。
+
+本模型没有独立运动总期限，外层动作观察器须按其契约处理期限并回报Unknown/失败；PLC输入持续有效并不意味着运动能无限等待。没有多PC仲裁、掉电恢复、自动重连解锁或安全看门狗。
+
+## 10. 62项检查与下一步
+
+检查覆盖：无有效输入不接单、Accepted/取意图/调用确认/运行/完成分离、重复/冲突/Busy、高水位、拒绝结果、匹配终态确认、跨PC会话与本地Ticket、派发未知、模式/许可/质量/代/时效缺口、旧回报、新实例无持久化历史和白名单复制。
+
+没有真实PLC、网络协议回环、原生SDK、机械定位、停止或恢复验收。既有真实MC回环仍属于旧方向的通信示例，不把它计入本交接模型的实机验证。
+
+下一部分读[六轴机械臂通用基础](/knowledge/industrial/host-computer/motion/six-axis-robot-frames-posture-and-modes/)和 [C#带名坐标变换与上下文复核](/knowledge/industrial/host-computer/motion/csharp-robot-frame-transforms-and-context/)。以发那科/爱普生为背景，暂无型号，具体控制器及远程模式确定后再写SDK适配，不将本模型包装成通用机械臂控制库。

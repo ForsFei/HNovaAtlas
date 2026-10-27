@@ -1,0 +1,165 @@
+---
+id: industrial-halcon-objects-foundations
+title: HALCON 24.11基础：图像、区域、XLD、元组与算子
+description: 从HDevelop的四类算子参数进入HALCON，区分图标对象、对象元组、数值元组与句柄，理解阈值/连通域、空对象、定义域、坐标与复制语义。
+tags: [工业自动化, HALCON, 机器视觉, C#, 基础]
+difficulty: beginner
+status: published
+updated: "2026-10-23"
+order: 0
+prerequisite: [industrial-vision-imaging-foundations, industrial-vision-planar-calibration]
+related: [industrial-csharp-halcon-first-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 这一章从哪里开始
+
+用户选择先按HALCON 24.11学习。本课程以24.11官方算子参考为依据，C#示例固定MVTec官方.NET接口包24113.0.0，即24.11.3对应接口；不把它称为最新版本，也不自动升级现有软件、安装运行库或修改许可。
+
+前面的[视觉基础](/knowledge/industrial/host-computer/vision/imaging-exposure-pixels-and-acquisition/)解决了图像/像素与采集、[坐标与标定](/knowledge/industrial/host-computer/vision/image-coordinates-planar-calibration-and-errors/)解决了坐标域。这一章开始学习实际视觉库：先认识对象，再学习可解释的小处理链，后续分批进入形态学、筛选、定位、测量和C#集成。
+
+本轮原生运行尚未通过：本机只发现一个空的20.11安装目录，未找到可用运行库；真实接口能编译，但调用原生算子遇到DllNotFoundException。下面算子语义来自官方资料，夹具结果为可手算预期，不冒充HALCON实测。
+
+## 1. HALCON、HDevelop与.NET接口各是什么
+
+HALCON提供图像处理与视觉算子。HDevelop是开发、调试算法的环境，可以观察中间对象与参数；它不是C#，也不是每次部署都要在后台打开的界面。
+
+C#通过.NET接口访问原生库，接口程序集本身不等于完整运行环境。项目引用、原生运行库、进程架构和许可要分别核对；“NuGet还原成功”不能推导“相机已打开”或“算法能运行”。本轮不涉及采集设备。
+
+常见落地方式包括直接使用HOperatorSet、使用HImage/HRegion等面向对象接口，以及后续讲的HDevEngine过程调用。本批选择HOperatorSet作为可编译主线，暂不引入引擎或HALCON窗口控件。
+
+## 2. 先读懂算子的四类参数
+
+HDevelop帮助中的形式为：
+
+```text
+operator(输入图标对象 : 输出图标对象 : 输入控制参数 : 输出控制参数)
+```
+
+例如：
+
+```text
+threshold(Image : Region : MinGray, MaxGray : )
+area_center(Regions : : : Area, Row, Column)
+```
+
+实际脚本调用写为threshold(Image, Region, 200, 255)，不在每次调用时写冒号。冒号是帮助签名用于分类的标记。
+
+Image、Region属于图标对象；200、255是控制参数；Area、Row、Column是数值控制输出。翻译成C#后，图标对象通常由HObject或其派生类表示，控制输出经常是HTuple。不要因为名称叫Image就把它当byte[]，也不要因为Area看起来是一个数就直接忽略其元组长度。
+
+## 3. 图像：不仅是一个灰度矩阵
+
+图像包含像素矩阵、通道、类型以及定义域等信息。常见类型有byte、uint2、real等；byte常用于8位图像，但不能把所有相机输入默认当byte。
+
+| 需要核对的维度 | 常用算子 | 典型错误 |
+| --- | --- | --- |
+| 图像对象数量 | count_obj | 一次读多文件，仍按单图处理 |
+| 每张矩阵宽高 | get_image_size | 宽高颠倒或与原图配置不符 |
+| 通道数 | count_channels | 彩图直接套单通道阈值契约 |
+| 通道存储类型 | get_image_type | uint2/real仍套0..255的业务含义 |
+| 有效定义域 | get_domain、reduce_domain | 误以为域外像素已经被清零或裁掉 |
+
+本批程序明确只接收一张8×6、单通道byte夹具，不替任意输入自动转灰度、缩放、解Bayer或归一化。官方[图像尺寸](https://www.mvtec.com/doc/halcon/2411/en/get_image_size.html)、[通道](https://www.mvtec.com/doc/halcon/2411/en/count_channels.html)和[类型](https://www.mvtec.com/doc/halcon/2411/en/get_image_type.html)各有独立接口。
+
+## 4. 区域不是灰度图，也不一定只有一个连通块
+
+区域描述哪些像素位置属于集合，不携带原图的灰度值。[threshold](https://www.mvtec.com/doc/halcon/2411/en/threshold.html)按灰度区间选像素，单一区间得到的一个区域可以有多个不相连部分。
+
+例如左上亮块四个像素与右下白点一个像素都落在200..255区间，它们可以共同属于一个区域对象。count_obj这时数的是对象个数，不是亮点数，也不是连通块数量。
+
+要按连通关系分开，使用[connection](https://www.mvtec.com/doc/halcon/2411/en/connection.html)。它受邻域设置影响，默认8邻域；4邻域与8邻域对对角接触可能得到不同结果。max_connection还可能限制返回数量，不能在共享进程里悄悄改全局设置后忽略其他算法。
+
+```text
+灰度图 → 阈值区域（一个对象，可含多个部分）
+       → Connection → 区域对象元组（多个连通对象）
+       → SelectShape → 满足条件的区域对象元组
+       → AreaCenter → 每个选中区域对应的数值元组
+```
+
+## 5. XLD轮廓与区域为什么要分开
+
+XLD用于表示轮廓/多边形等几何数据，可以有亚像素坐标。HXLDCont表示轮廓对象，不等价于二值区域，也不等价于图像矩阵。
+
+区域偏向像素集合与面积、连通性等分析；轮廓偏向边界、曲线与几何处理。闭合轮廓的面积、区域的像素面积、轮廓点数量不是同一个量，不能互换当尺寸。
+
+区域可以通过[gen_contour_region_xld](https://www.mvtec.com/doc/halcon/2411/en/gen_contour_region_xld.html)生成轮廓，但边界模式与坐标约定需要核对。转换不是免费增加信息，也不能凭“坐标带小数”就宣称达到某种毫米精度。轮廓提取与拟合后续专门展开，本批不创建占位检测轮廓。
+
+## 6. 对象元组与HTuple是两回事
+
+| 内容 | 含义 | C#常见表示 |
+| --- | --- | --- |
+| 图标对象元组 | 多张图、多区域或多轮廓的集合 | HObject或图标派生对象 |
+| 数值/字符串控制元组 | 面积序列、坐标序列、阈值参数等 | HTuple |
+| 句柄控制值 | 模型、采集器等原生资源引用 | 对应句柄类或含句柄的HTuple |
+
+对象元组的长度用CountObj；HTuple的元素数用Length。一个C#变量里可能包含多个HALCON对象，不应该看“只有一个变量”就当成单对象。
+
+SelectObj按官方约定从1开始选图标对象；HTuple的C#索引通常从0开始。例如第一个区域SelectObj(1)，而它对应的面积值在areas[0]。不要把这两套索引混为一谈。[SelectObj官方说明](https://www.mvtec.com/doc/halcon/2411/en/select_obj.html)还指出它创建引用而非重新复制图像/区域存储。
+
+多对象输出的顺序不能直接充当工件身份、左右顺序或“最优目标”。需要时显式定义排序/选择规则；不要永远取第一个区域就称为定位成功。
+
+## 7. 四种“空”必须分清
+
+| 情况 | 意义 | 能否当成“没有目标” |
+| --- | --- | --- |
+| C# null | 没有该包装器引用 | 不能，当输入/程序状态问题处理 |
+| 未初始化的对象包装器 | 尚无可用图标对象 | 不能据此当算法已运行 |
+| GenEmptyObj结果 | 对象元组内没有对象，CountObj=0 | 需按具体输出契约判断 |
+| GenEmptyRegion结果 | 有一个空区域，CountObj=1、面积0 | 不能与零对象元组混淆 |
+
+官方[GenEmptyObj](https://www.mvtec.com/doc/halcon/2411/en/gen_empty_obj.html)和[GenEmptyRegion](https://www.mvtec.com/doc/halcon/2411/en/gen_empty_region.html)明确区分这两种图标结果。HTuple.Length=0又是另一种控制数据状态。
+
+例如模型运行失败、文件不存在、许可无效、没有候选区域，不应该都catch后返回一个空数组。本轮C#例子只在已成功处理且选中对象数量为0时返回NoCandidates；异常走失败出口。
+
+## 8. 定义域缩小不等于裁剪
+
+[ReduceDomain](https://www.mvtec.com/doc/halcon/2411/en/reduce_domain.html)取原定义域与新区域的交集，图像矩阵尺寸不变。不能把它理解成把域外灰度全部置零，也不能假定所有算子都以完全相同方式使用定义域；应查对应算子说明。
+
+[CropDomain](https://www.mvtec.com/doc/halcon/2411/en/crop_domain.html)按定义域外接矩形裁出新矩阵，矩阵大小随之变化。裁剪后的局部坐标需要保留原图偏移，不能直接套原图标定或绘图坐标。
+
+因此优化ROI时要先说明想限制计算范围，还是想真正生成小图，再检查输出尺寸、域和坐标还原。它也不等于相机硬件ROI，不会自动减少原始采集传输。
+
+## 9. C#对象生命周期：引用、共享与物理复制
+
+C#的b=a只是同一包装器别名，不是新图；a.Dispose后继续使用b不是安全交接。[HObject文档](https://www.mvtec.com/doc/halcon/2411/en/HObject.html)说明其资源可在显式Dispose或最终化阶段释放，连续处理不要只依赖GC何时触发。
+
+[CopyObj](https://www.mvtec.com/doc/halcon/2411/en/copy_obj.html)创建对已有存储的引用，不分配新的图像/区域存储；[CopyImage](https://www.mvtec.com/doc/halcon/2411/en/copy_image.html)才对图像各通道生成物理副本。原生库的“Copy/Clone”名字不能直接套用此前Mono8Image的托管深复制语义。
+
+句柄也不是普通整数。现代HALCON句柄有引用管理；[ClearHandle](https://www.mvtec.com/doc/halcon/2411/en/clear_handle.html)可显式清除其内容，使其他引用也不能继续使用。不要清理一个共享模型时，另一个线程仍在Find；具体模型/采集器的结束与释放方式后续按对象说明展开。
+
+## 10. 最小HDevelop算法链
+
+下面是可粘贴学习的算子脚本，路径改为自己的夹具位置；本轮未在HDevelop实际执行：
+
+```text
+FileName := 'F:/HNova/01HNovaAtlas/examples/industrial-vision/fixtures/contrast-target.pgm'
+read_image (Image, FileName)
+get_image_size (Image, Width, Height)
+count_channels (Image, Channels)
+get_image_type (Image, Type)
+threshold (Image, Region, 200, 255)
+count_obj (Region, NumThresholdObjects)
+connection (Region, Connected)
+count_obj (Connected, NumConnected)
+select_shape (Connected, Selected, 'area', 'and', 2, 10)
+count_obj (Selected, NumSelected)
+if (NumSelected > 0)
+    area_center (Selected, Area, Row, Column)
+else
+    Area := []
+    Row := []
+    Column := []
+endif
+```
+
+在8邻域、max_connection=0等约定下，预期阈值区域有5个像素，Threshold对象数1、连通对象数2；面积筛选留下4像素亮块一个，中心(Row=1.5,Column=1.5)。这只是夹具手算预期，运行库未就绪前不能记为已验证。
+
+## 11. 复习与面试追问
+
+1. CountObj=1能说明只有一个连通块吗？不能，一个区域对象可以包含多个不相连部分。
+2. 空区域与空对象元组有什么区别？前者有一个零面积对象，后者没有对象。
+3. ReduceDomain之后Width/Height会变小吗？不会因此改变矩阵尺寸；裁剪另论。
+4. CopyObj能保证独立像素缓冲吗？不能，它与CopyImage的存储语义不同。
+5. HDevelop显示正确，C#就必然正确吗？还需核对参数、输入/输出、坐标、版本、生命周期和环境。
+6. AreaCenter返回的Row/Column能直接给雷赛或机器人吗？不能，它们是像素坐标，仍需具名标定与机械/工艺契约。
+
+下一篇落到[C#真实接口、资源释放与输出验证](/knowledge/industrial/host-computer/halcon/csharp-first-pipeline-and-resource-lifetime/)。接着学习[分割、ROI、形态学与区域筛选](/knowledge/industrial/host-computer/halcon/threshold-roi-morphology-and-region-selection/)，再逐步进入定位/测量、HDevEngine与WPF，而不是一次堆出所有算子。

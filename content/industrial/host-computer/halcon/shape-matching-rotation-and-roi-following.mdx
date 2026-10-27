@@ -1,0 +1,140 @@
+---
+id: industrial-halcon-shape-roi-following
+title: HALCON形状匹配：旋转定位与检测ROI跟随
+description: 从边缘形状建模到旋转定位，区分模型轮廓与参考原图ROI的坐标系，解释两套变换、半像素约定、候选歧义与越界拒绝，再衔接检测统计。
+tags: [工业自动化, HALCON, 形状匹配, 旋转定位, ROI]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 60
+prerequisite: [industrial-halcon-ncc-matching, industrial-csharp-halcon-ncc]
+related: [industrial-csharp-halcon-shape-following, industrial-csharp-planar-calibration]
+---
+
+## 为什么找到位置之后，还需要让ROI跟随
+
+上一批NCC解决“参考纹理出现在哪里”。但工件一旋转，原来固定在图像上的检测框可能就落到背景。典型任务是先找到稳定的定位结构，再把参考图中定义的检测ROI带到当前工件上，之后才检查灰度、孔、边缘或尺寸。
+
+这篇用一个不对称F形亮标记讲形状匹配与ROI跟随，不扩展成完整视觉平台。C#沿用HALCON 24.11.3真实接口；新增代码已编译，原生库仍未就绪，所有匹配与区域变换的数值预期都保留待原生验证。
+
+## 1. 形状匹配关注什么
+
+NCC侧重模板内的灰度结构；形状匹配则通过显著的局部灰度变化建立形状特征。目标内部灰度变化较多、但边缘稳定时，可以尝试这种方向。反过来，边缘模糊、反光导致边界变化或多个零件轮廓相似时，也不保证比NCC可靠。
+
+HALCON经典CreateShapeModel具有Contrast、MinContrast、Metric与Optimization等参数，用来定义模型与查找时需要的特征条件；不是先Threshold得到一个区域，再把整个区域直接当模型。[CreateShapeModel参考](https://www.mvtec.com/doc/halcon/2411/en/create_shape_model.html)
+
+本批使用经典刚性形状模型。缩放、透视、形变和深度变化不属于这一个模型自动覆盖的能力；后续需要按任务选相应方法，不通过放低分数来假装解决。
+
+## 2. 模板选得好，比多加几个参数更重要
+
+优先选稳定、可区分、与工件固连的结构。对称圆环能给出中心，却可能无法提供唯一方向；相同孔阵列也可能给出多个合理位姿。可以适当加入方向性结构，但不要把工装背景或会变化的字符一起记成工件特征。
+
+本例F形有一条竖杆、上横杆和较短中横杆，避免单纯矩形的方向歧义。模型ROI留出背景余量，检测ROI则放在中横杆内部，二者不是同一个框。
+
+| 本例对象 | 原图范围/定义 | 像素意义 |
+| --- | --- | --- |
+| 图像 | 96×96，背景16，标记220 | 单通道byte |
+| 模型ROI | 行24..63、列24..63 | 40×40=1600个中心 |
+| F形亮标记 | 行28..59、列28..59内的三段结构 | 合并后532个亮像素 |
+| 检测ROI | 行46..48、列42..46 | 3×5=15个中心，中心(47,44) |
+
+这些是原创夹具定义，不是相机照片或产品工艺参数。模型domain面积1600、亮区域面积532、检测ROI面积15，不能混成“目标面积”。
+
+## 3. Contrast、MinContrast与模型检查
+
+Contrast用于选择建模特征的局部灰度差；它不是“像素灰度大于30”。复杂情况下可用相应阈值/自动参数策略，但先应检查模型实际保留了哪些结构。MinContrast用于查找侧的最低对比度要求，不等于匹配分数门槛。本例固定30和10，仅用于高对比度夹具。[建模参数说明](https://www.mvtec.com/doc/halcon/2411/en/create_shape_model.html)
+
+InspectShapeModel可以辅助观察指定条件下的模型表示；GetShapeModelContours则读取已创建模型的轮廓表示。两者用途不一样，不能只看原图上画了一个框就确认模型正确。[InspectShapeModel](https://www.mvtec.com/doc/halcon/2411/en/inspect_shape_model.html)
+
+本轮主链调用GetShapeModelContours，没有执行InspectShapeModel或人工查看窗口。真实数据集调参时，仍要在HDevelop检查弱边缘、背景边缘和高层金字塔中是否还保留足够结构。
+
+## 4. 旋转范围、精细定位与搜索策略
+
+创建与查找都要定义角度范围，单位为弧度。AngleExtent是范围长度，不是结束角。形状匹配的SubPixel有自己的模式；本例使用least_squares，不照搬NCC的true/false。Greediness描述搜索启发策略，不是“识别可信度”。[FindShapeModel参考](https://www.mvtec.com/doc/halcon/2411/en/find_shape_model.html)
+
+本例建模范围为-π/2-0.02至+π/2+0.02，角度步长π/180，固定一层与Optimization=none，查找MinScore=0.85、最多2项、MaxOverlap=0.3、Greediness=0。选择较宽范围只是覆盖本轮±90°端点，不能据此声称任意角度、速度或遮挡效果已验收。
+
+候选数量为0时不跟随ROI；返回2项时保守记录歧义；只在当前条件返回1项时继续。本例没有把“只有一项返回”提升为工位唯一性证明，分数也仍不是产品合格概率。
+
+## 5. 两种输入坐标，不能共用错矩阵
+
+GetShapeModelContours返回以模型参考原点归零的XLD轮廓，模型原点位于其(0,0)。这适合使用“模型归零坐标→当前图像”的矩阵叠加。[模型轮廓参考](https://www.mvtec.com/doc/halcon/2411/en/get_shape_model_contours.html)
+
+但是，检测ROI画在参考原图的行46..48/列42..46，它并未归零。如果也直接乘“归零模型→当前图”的矩阵，就把原图位置误当模型局部位置，再额外平移一次。
+
+| 要变换的内容 | 输入坐标 | 应用矩阵 |
+| --- | --- | --- |
+| 已归零的模型轮廓 | 模型局部坐标 | H当前 |
+| 参考原图中的检测ROI | 参考图绝对像素坐标 | H当前 × inverse(H参考) |
+
+其中H参考是模型归零坐标到参考图的变换，H当前是模型归零坐标到当前图的变换。读取矩阵时先说清方向，再讨论数组里的六个数。
+
+## 6. 用参考图自匹配建立一致的坐标链
+
+示例在参考图中查找一次模型，要求恰好返回一个候选，建立H参考；每张当前图再得到H当前。两者都由原始匹配位姿经VectorAngleToRigid构造，而不是凭模板左上角猜原点。
+
+```text
+参考图ROI → inverse(H参考) → 模型归零坐标 → H当前 → 当前图ROI
+
+已归零模型轮廓 ─────────────────────→ H当前 → 当前图叠加轮廓
+```
+
+组合的顺序是H当前乘inverse(H参考)，作用时右侧先执行。它不是inverse(H当前)乘H参考，也不是把两组Row/Column相减后忽略角度。[刚体变换](https://www.mvtec.com/doc/halcon/2411/en/vector_angle_to_rigid.html)、[矩阵组合](https://www.mvtec.com/doc/halcon/2411/en/hom_mat2d_compose.html)、[矩阵求逆](https://www.mvtec.com/doc/halcon/2411/en/hom_mat2d_invert.html)
+
+模型原点固定零偏移，参考自匹配与当前查找使用同一模型和规则。本例不支持换模型后继续复用旧H参考；工程中还需将参考图、模型、原点、配方与帧身份一起管理。
+
+## 7. 半像素约定：不是随手加减0.5
+
+HALCON匹配返回的Row/Column是适于建立图标变换的原始位姿，并非任意旋转下精确的像素点位置。区域/XLD的变换与像素中心还涉及角点坐标约定。[匹配输出说明](https://www.mvtec.com/doc/halcon/2411/en/find_shape_model.html)
+
+若矩阵按行存储为[a,b,tx,d,e,ty]，AffineTransPixel的理解方式是先把像素中心坐标加0.5，进行矩阵运算，再减0.5：
+
+```text
+Row' = a×(Row+0.5) + b×(Column+0.5) + tx - 0.5
+Col' = d×(Row+0.5) + e×(Column+0.5) + ty - 0.5
+```
+
+本例沿用HALCON这一组图像变换的Row/Column顺序，不能把通用绘图里x=Column、y=Row的矩阵不加转换就塞进去。也不要在已经兼容图标变换的矩阵上再盲目补一次0.5。[AffineTransPixel约定](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_pixel.html)
+
+纯C# PixelRigidSnapshot只做这些数值映射与边界检查，不搜索模型、不调用HALCON、不生成栅格区域。它通过不代表HALCON区域变换已经正确执行。
+
+## 8. 跟随ROI：变换区域，不是只移动中心
+
+本例将参考检测ROI通过AffineTransRegion变换到当前图，使用nearest_neighbor。旋转后的区域不能随意换成轴向外接矩形，否则多出的背景会影响统计。四个变换角点是几何检查与后续显示信息，不等于实际栅格区域。[AffineTransRegion](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_region.html)
+
+区域旋转会离散化，可能改变像素面积；不能因为源矩形面积15，就要求任意角度后的区域永远精确15。区域往返变换也不是一般可逆的“还原原图”。
+
+代码先做矩形角点中心的保守边界检查，再检查实际变换区域是否完整位于当前图domain中；若不完整就记录RoiOutsideImage，不把截掉一部分后的ROI当完整目标继续统计。角点检查不是邻域滤波有效范围或机械安全证明。
+
+## 9. 区域统计不等于尺寸测量
+
+本例只读跟随ROI的AreaCenter和灰度均值Intensity，用来核对检测框是否仍落在F形中横杆内。Intensity以传入区域为统计依据，不能假设先前ReduceDomain会自动代替这个区域，因此要显式核对ROI与当前domain。[Intensity参考](https://www.mvtec.com/doc/halcon/2411/en/intensity.html)
+
+得到中心(55,53)和平均灰度220，也不是已经测得某条边的亚像素位置。下一步尺寸测量还要定义边缘方向、测量窗口、标定、误差和公差。本批只输出像素与灰度，没有毫米、抓取点或产品OK/NG。
+
+## 10. 原创夹具的五组待验证预期
+
+参考标记在96×96图内。平移版本向下4、向右6；90°版本先用整数映射(Row,Column)→(95-Column,Row)旋转，再做同样平移，不通过图像插值生成，因此原始亮像素数保持532。
+
+| 场景 | 理想检测ROI中心 | 预期分支 |
+| --- | --- | --- |
+| 参考图 | (47,44) | 一个候选，RoiPrepared |
+| 平移图 | (51,50) | 一个候选，RoiPrepared |
+| +90°并平移 | (55,53) | 一个候选，RoiPrepared |
+| 纯背景图 | 无 | NoMatch，不复用旧ROI |
+| 两个分离的F标记 | 不选择 | Ambiguous，不自动挑第一项 |
+
+原生测试为前三项设定教学容差：角度误差不超过0.04弧度、中心各坐标误差不超过1像素、区域面积12..18、均值至少200；同时要求产生非空模型叠加轮廓。这些是尚待原生执行的夹具断言，不是厂商精度、检测准确率或生产放行条件。
+
+53项纯托管检查验证数值约定、夹具与输出边界；五组原生查找、离散化、释放和长期性能尚未通过。不能把上述表格写成实测报告。
+
+## 11. 调试与面试追问
+
+1. 轮廓叠加对了，ROI为什么可能错？两者输入坐标不同，不能都使用模型归零到当前图的矩阵。
+2. 为什么不是只给ROI中心加平移？工件旋转时区域方向也必须随之改变。
+3. 找到一个候选就能继续工艺动作吗？不等于身份、唯一性、标定和机械条件均成立。
+4. 为什么旋转后面积不总守恒？连续几何与离散像素区域不是同一个对象。
+5. MinScore、Contrast与Greediness分别是什么？分别关联候选门槛、特征对比度与搜索策略，不能互当“可信度”。
+6. 越界后直接裁掉可以吗？必须由任务允许部分ROI；本例拒绝，而不是静默改变检测范围。
+
+接着读[C#形状模型、两套矩阵与ROI跟随](/knowledge/industrial/host-computer/halcon/csharp-shape-model-and-roi-following/)。随后进入[一维测量窗口、边缘方向与宽度](/knowledge/industrial/host-computer/halcon/one-dimensional-edges-pairs-and-measurement/)，再逐步接二维测量、HDevelop导出/HDevEngine和WPF。

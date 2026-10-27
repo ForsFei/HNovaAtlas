@@ -1,0 +1,138 @@
+---
+id: industrial-halcon-one-dimensional-measurement
+title: HALCON一维测量：窗口、边缘方向、配对与像素宽度
+description: 从一维灰度剖面理解边缘提取，区分半长度、扫描方向、幅值阈值、相邻距离与对内/对间距，说明亚像素、标定和真实测量精度的边界。
+tags: [工业自动化, HALCON, 边缘测量, 尺寸测量, 标定]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 80
+prerequisite: [industrial-halcon-shape-roi-following, industrial-csharp-halcon-shape-following]
+related: [industrial-csharp-halcon-one-dimensional-measurement, industrial-csharp-planar-calibration]
+---
+
+## 从ROI跟随到真正找边
+
+上一批把检测ROI跟随到工件上，读回区域面积和均值。但“这个框平均灰度为220”不等于已经找到产品边界，更不等于测得真实尺寸。现在沿一个明确方向找出边缘，再讨论哪两条边构成要测的宽度。
+
+本批聚焦HALCON 24.11的一维矩形测量：GenMeasureRectangle2、MeasurePos与MeasurePairs。采用原创条带图，实际接口已编译，原生环境仍缺运行库，下面位置与距离是待原生验证的夹具预期，不是精度报告。
+
+## 1. 一维测量不是只读一行像素
+
+矩形测量窗口有一个扫描主轴。算子在垂直于主轴的条带上平均灰度，形成一维剖面，再从剖面的变化中定位边缘。横向跨过竖直边界，就是常见的宽度测量配置。
+
+这种平均有助于抑制随机变化，但窗口跨得太宽，也可能把倾斜、弯曲或不属于目标的结构平均到一起。一维测量假设所测局部边缘近似直线，且与扫描主轴尽量垂直；并非对任意曲线都成立。[HALCON一维测量概念](https://www.mvtec.com/doc/halcon/2411/en/toc_1dmeasuring.html)
+
+不要把窗口画得很大就认为证据更多。先确认目标边的方向、是否有倒角/毛刺、照明能否形成稳定跳变，再决定剖面的覆盖范围。
+
+## 2. 窗口的中心、方向与两个半长度
+
+GenMeasureRectangle2接收中心Row/Column、Phi、Length1/Length2、图像Width/Height及插值模式，返回测量句柄。两个Length是半长度，不是完整宽高；图像尺寸也不是WPF控件尺寸。[窗口参数参考](https://www.mvtec.com/doc/halcon/2411/en/gen_measure_rectangle2.html)
+
+| 本例参数 | 数值 | 意义 |
+| --- | --- | --- |
+| 图像Width / Height | 128 / 96 | 单通道byte原图矩阵 |
+| Row / Column | 48 / 64 | 测量窗口中心 |
+| Phi | 0 | 主轴沿列增加方向扫描 |
+| Length1 | 40 | 主轴两侧各延伸40 |
+| Length2 | 8 | 垂直主轴的平均范围半长度 |
+| Interpolation | bilinear | 窗口采样使用的插值模式 |
+
+默认扫描覆盖列约24..104，平均范围位于图像内部。插值还需要窗口外的采样余量；本例校验整个矩形外再留1像素的bilinear余量。官方还说明中心会被内部取整，因此示例中心限定整数，而不是假装任意小数中心都原样生效。
+
+## 3. 正边缘、负边缘取决于扫描方向
+
+沿主轴扫描时，暗→亮为正边缘，亮→暗为负边缘；不是“图像左边永远为正、右边永远为负”。MeasurePos的Transition可选positive、negative或all，Select决定取所有、第一或最后边缘。[MeasurePos参考](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)
+
+本例Phi=0时从左向右：暗背景上的亮条先正后负；亮背景中的暗槽则先负后正。Phi=π/2时扫描方向朝上，先遇到的是较大的Row，因此返回Row下降并不意味着输出顺序错误。
+
+在本例坐标约定中，主轴方向可写成：
+
+```text
+主轴单位方向 = (Row方向 -sin(Phi), Column方向 cos(Phi))
+```
+
+记录方向比事后把坐标升序排序更可靠。排序可能破坏幅值、距离和配对之间的对应关系，还可能把暗槽宽度误认成两个亮条之间的间隙。
+
+## 4. Sigma、Threshold与插值各控制什么
+
+MeasurePos根据一维剖面及高斯导数定位边缘；Sigma关联平滑尺度，Threshold是边缘幅值门槛，不是“灰度大于20”。返回Amplitude带有符号，也不应该直接当作两个平台灰度的差值。[边缘提取原理](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)
+
+Sigma太小可能把噪声也当边缘，太大可能影响相邻窄结构的区分。增大Threshold可能漏掉弱边缘，降低则可能引入额外候选；参数还要与曝光、焦点、运动模糊和实际边缘形态一起检查。
+
+示例固定Sigma=1、Threshold=20。窗口/平滑/阈值的允许范围属于教学策略，不能照抄成所有工件的推荐参数。特别是亚像素输出带小数，只说明用了相应定位过程，不等于真实误差已经小于一个像素。
+
+## 5. MeasurePos返回哪些量
+
+MeasurePos提取独立边缘，返回RowEdge、ColumnEdge、Amplitude以及相邻边缘Distance。返回点位于测量主轴上，不是窗口里所有局部边缘点的集合。
+
+| 边缘数N | 行/列/幅值长度 | Distance长度 | 是否已有宽度 |
+| --- | --- | --- | --- |
+| 0 | 0 | 0 | 没有边缘，不返回零宽度 |
+| 1 | 1 | 0 | 只有一条边，宽度不完整 |
+| 2 | 2 | 1 | 还需确认两边的身份和极性 |
+| 4 | 4 | 3 | 相邻距离不一定都是同一种产品尺寸 |
+
+N≥1时Distance[i]对应第i条到第i+1条边。不能要求四个输出元组等长；也不能拿图像CountObj当边缘数。[Distance对应关系](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)
+
+## 6. MeasurePairs：对内宽度与对间空隙
+
+MeasurePairs在边缘提取基础上配对。Transition=positive时，一对先暗→亮、后亮→暗；negative时相反。Select=all保留所有配对，first/last只保留相应选择，不证明工位中只有一个目标。[MeasurePairs参考](https://www.mvtec.com/doc/halcon/2411/en/measure_pairs.html)
+
+| 输出 | 含义 | M对边缘时的长度 |
+| --- | --- | --- |
+| First行/列/幅值 | 每对第一个边缘 | M |
+| Second行/列/幅值 | 每对第二个边缘 | M |
+| IntraDistance | 同一对First→Second | M |
+| InterDistance | 上一对Second→下一对First | max(0,M-1) |
+
+因此只有一对边缘时，InterDistance为空是正常的，不是漏算；它不是“这对边缘的宽度”。同极性连续边缘、strongest模式等还有自己的配对规则，真实工艺应检查全部候选；本批固定positive/negative与all，不扩展这些模式的可执行实现。
+
+## 7. 原创亮条：为什么宽度不是31
+
+夹具背景16，亮条为220，行16..79、列48..79。沿Row=48从左向右看，列48..79包含32个亮像素中心；理想阶跃边界位于47.5和79.5，距离为32像素。
+
+把最后一个亮中心79减去第一个亮中心48得到31，算的是两个像素中心的间距，不是这条带的理想外边界宽度。HALCON提取的实际边缘还会受剖面、滤波和采样影响，不能把手算边界当作已经测得的原生位置。
+
+双亮条改为列32..47和72..87，理想边缘为31.5、47.5、71.5、87.5。MeasurePos的相邻距离应接近16、24、16；MeasurePairs的两个Intra应接近16，唯一Inter应接近24。把中间的24误当成第二件产品宽度，就是混淆了距离含义。
+
+## 8. 七组待原生验证场景
+
+| 场景 | 全边缘预期 | 配对预期 | 本例输出 |
+| --- | --- | --- | --- |
+| 亮条，positive | 2 | 1，宽32px | WidthMeasured |
+| 暗槽，negative | 2 | 1，宽32px | WidthMeasured |
+| 横亮条，Phi=π/2，positive | 2 | 1，宽32px | WidthMeasured |
+| 纯背景 | 0 | 0 | NoEdges |
+| 窗口内只有一个阶跃 | 1 | 0 | NoPair |
+| 亮条却要求negative先配对 | 2 | 0 | NoPair |
+| 两个亮条，positive | 4 | 2，宽16/16，间隙24 | Ambiguous |
+
+当前原生库加载失败，这七组尚未执行通过。原生test里的0.75像素位置/距离容差只是教学断言，不是厂商精度指标。56项托管检查验证的是参数、数组对应、方向算术和夹具，不执行高斯滤波或边缘检测。
+
+## 9. Reduced domain不能代替测量窗口
+
+MeasurePos及相关剖面测量为效率会忽略图像domain；不能把上一批变换得到的HRegion当成测量句柄，也不能以为先ReduceDomain就限制了扫描范围。测量对象有自己的中心、方向、半长度与图像尺寸。[domain边界说明](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)、[剖面参考](https://www.mvtec.com/doc/halcon/2411/en/measure_projection.html)
+
+工件移动后，应在同一帧与同一模型/配方上下文中更新测量窗口并校验完整采样余量。上一批的区域跟随有助于理解坐标链，但本批尚未把形状匹配输出自动接到测量窗口，不将两份独立案例冒充完整定位测量流水线。
+
+## 10. 像素距离、毫米与精度分开记录
+
+WidthPixels=32只是图像上的距离。如果已在适用平面、方向和工况中确认统一比例0.02mm/px，算术上32×0.02=0.64mm；这里的比例只是举例，没有实际标定来源，代码不输出这个毫米值。
+
+存在透视、镜头畸变或方向相关比例时，不能用一个常数覆盖整张图。通常需用经过验证的标定模型将两个边缘点转换到具名测量平面，再计算物理距离；HALCON的ImagePointsToWorldPlane需要相机内参与世界平面位姿，不是传入“相机分辨率”就得到毫米。[平面转换参考](https://www.mvtec.com/doc/halcon/2411/en/image_points_to_world_plane.html)
+
+再分别评估重复性、与量具/标准件的偏差、视野位置变化、温漂、光照和工件高度变化。显示四位小数、同一张图反复算得一样，都不能代替真实精度验收。复习[坐标与独立标定检查](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)。
+
+## 11. 调试顺序与面试追问
+
+先看原图、窗口方向和覆盖，再看剖面与全部边缘，最后看配对与单位。不要一开始就只打印一个宽度。
+
+1. Threshold=20为什么不是选灰度大于20的像素？这里是边缘幅值门槛，不是区域阈值算子。
+2. 换扫描方向后为什么正负边缘会变？正负定义依赖沿主轴观察的明暗变化。
+3. 只有一个边缘时应返回0宽度吗？不应，应保留未配对或不完整证据状态。
+4. 四条边为何有三个Distance、两组Intra和一组Inter？它们分别对应相邻边、对内和对间关系。
+5. ROI跟随成功，尺寸就一定正确吗？还需测量窗口、边缘规则、标定与独立误差验证。
+6. 什么时候考虑二维Metrology？需要沿多处局部边缘拟合直线、圆、矩形等几何对象时，通常不应把一个一维条带结果当完整几何形状。[二维Metrology概念](https://www.mvtec.com/doc/halcon/2411/en/toc_2dmetrology.html)
+
+接着读[C#一维测量对象、边缘/配对读回与释放](/knowledge/industrial/host-computer/halcon/csharp-measure-objects-edge-pairs-and-width/)，然后进入[直线、圆与二维Metrology模型](/knowledge/industrial/host-computer/halcon/lines-circles-and-metrology-models/)。后续再补HDevelop导出/HDevEngine和WPF集成。

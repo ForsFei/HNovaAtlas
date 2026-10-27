@@ -7,9 +7,10 @@ import { Mermaid } from "@/components/knowledge/Mermaid";
 import { Quiz } from "@/components/interactive/Quiz";
 import { FlashCard } from "@/components/interactive/FlashCard";
 import { Stepper } from "@/components/interactive/Stepper";
+import { IndustrialLearningRoadmap } from "@/components/knowledge/IndustrialLearningRoadmap";
 
 const components: MDXComponents = {
-  Callout, Accordion, Tabs, Tab, Mermaid, Quiz, FlashCard, Stepper,
+  Callout, Accordion, Tabs, Tab, Mermaid, Quiz, FlashCard, Stepper, IndustrialLearningRoadmap,
   pre: CodeBlock,
   hr: () => <hr className="my-8 border-border" />,
 };

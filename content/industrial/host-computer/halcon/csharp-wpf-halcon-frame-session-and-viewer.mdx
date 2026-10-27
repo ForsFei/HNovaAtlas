@@ -1,0 +1,135 @@
+---
+id: industrial-csharp-halcon-wpf
+title: C#实践：WPF单次HALCON调用、同帧显示与资源排空
+description: 用独立WPF示例捕获当前图像像素，在单后台任务中创建原生图并调用HDevEngine，按显示版本隔离迟到结果，关闭时等待任务结束；26项会话与实际位图检查。
+tags: [工业自动化, C#, WPF, HALCON, HDevEngine]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 150
+prerequisite: [industrial-halcon-wpf-integration, industrial-csharp-halcon-engine]
+related: [industrial-csharp-wpf-vision-viewer, industrial-csharp-inspection-pipeline]
+---
+
+## 交付与验证边界
+
+新增examples/industrial-halcon-wpf/，.NET10-windows/x64/UseWPF，引用既有industrial-halcon项目与固定24113.0.0接口，不引入新的MVVM/视觉包。窗口只有切图、执行和清空三个动作。
+
+Release编译零警告零错误，26项会话/实际WPF位图检查通过。检查中的算法返回值是测试替身，不调用HALCON；原生桥接实际尝试因缺运行库返回DllNotFoundException/退出3。未打开可见窗口做人工作业验收，未验证真实算法、过程语法、原生释放、相机或工位。
+
+## 1. 文件与启动
+
+| 文件 | 内容 |
+| --- | --- |
+| FrameSession.cs | 单在途任务、不可变图像快照、显示版本与关闭状态 |
+| NativeFrameRunner.cs | 托管像素→独占HALCON图像→引擎过程→托管结果 |
+| MainWindow.cs | 普通WPF图像/中心点/状态、三个按钮与异步关闭 |
+| SessionChecks.cs | 26项门闩控制会话与实际BitmapSource检查 |
+| App.cs | 普通窗口、self-test和native-test入口 |
+
+```powershell
+dotnet restore examples/industrial-halcon-wpf/IndustrialHalcon.Wpf.csproj
+dotnet build examples/industrial-halcon-wpf/IndustrialHalcon.Wpf.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon-wpf/IndustrialHalcon.Wpf.csproj -c Release --no-build -- --self-test
+
+# 打开交互窗口；图像可查看，执行仍需匹配的原生环境与合法许可。
+dotnet run --project examples/industrial-halcon-wpf/IndustrialHalcon.Wpf.csproj -c Release --no-build
+
+# 无窗口的真实原生桥接检查；当前未通过。
+dotnet run --project examples/industrial-halcon-wpf/IndustrialHalcon.Wpf.csproj -c Release --no-build -- --native-test
+```
+
+self-test成功退出0、失败1；参数错误2；native-test失败3。窗口入口没有自动执行算法，不安装运行库、不改许可或系统PATH，不启动调试服务器。
+
+## 2. 在会话中保存什么
+
+```csharp
+public sealed record FrameView(long Revision, Mono8Image? Image,
+    bool Busy, bool Closing, BlobReport? Report, string? Error);
+```
+
+Image是拥有独立像素的Mono8Image，Report是只读托管数值。会话不保存HObject、HTuple、HDevProcedureCall、相机指针或WPF控件。
+
+Load只接受固定8×6图，递增Revision并清空结果。Clear不换图，但同样递增版本，表示旧结果已经不再有资格覆盖当前画面。状态由内部gate保护，不要求后台线程直接进入Dispatcher才能完成清理。
+
+Revision只是本地显示意图，不包含真实采集、工件或配方身份。它也不是算法准确性或结果新鲜度期限；本例不提供持久化追溯。
+
+## 3. 提交前同步占位
+
+```csharp
+if (!session.TryRun(out Task pending)) return;
+Render();
+await pending;
+if (!draining) Render();
+```
+
+TryRun在锁内检查有图、未关闭且没有未完成任务，然后捕获当前图像和Revision并启动Task.Run。没有“先await再标记忙”的空隙，也没有等待队列。
+
+后台委托只运行同步算法和输出验证，不访问控件；窗口事件中的await返回UI上下文后再Render，Render还调用Dispatcher.VerifyAccess核对线程。不要把ConfigureAwait(false)随意加到这里，然后继续写控件。[WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+正式高吞吐系统可能需要常驻执行器，本例没有这种优化，也不保证线程池两次调用使用同一条线程。
+
+## 4. 后台真正使用当前像素
+
+NativeFrameRunner复制捕获图的48个字节，按行列生成HTuple，并写入新独占图像：
+
+```csharp
+HOperatorSet.GenImageConst(out HObject image, "byte", 8, 6);
+using (image)
+{
+    HOperatorSet.SetGrayval(image, rows, columns, gray);
+    return EngineDemo.AnalyzeImage(image, 200);
+}
+```
+
+SetGrayval只修改本次新建且不共享的图。不会去写UI正在显示的缓冲，也不使用相机借用指针。这种小数组搬运用于解释所有权，不是大图或高帧率推荐方案。[新建图像](https://www.mvtec.com/doc/halcon/2411/en/gen_image_const.html)、[像素写入与共享数据注意事项](https://www.mvtec.com/doc/halcon/2411/en/set_grayval.html)
+
+EngineDemo新增AnalyzeImage(HObject,double)同步借用入口，保留原来的文件Analyze(double)供CLI使用。文件入口仍先检查Low，再读图；借用入口检查8×6/byte/单通道，不释放调用者的image。
+
+引擎在借用范围内加载固定过程、传图和Low=200、Execute、读回、复制，再释放自己的call/输出包装。外层NativeFrameRunner最后释放image；图像不会在原生执行结束前被释放。
+
+## 5. 不把不可信DTO直接发给UI
+
+后台返回BlobReport后，会话再次核对8×6尺寸，并用BlobReadback重新复制面积/中心、检查数量/范围/有限性和Outcome一致性。只有合法独立快照才可能发布。
+
+这不是再次运行算法，而是业务交接边界校验。测试替身或未来适配器即使错误地返回“Candidates但列表为空”，也会得到ArgumentException失败状态，而不是悄悄画出一个默认点。
+
+异常只保留类型名用于教学显示，不把原生对象或完整敏感源码带到UI。没有正常结果就不显示中心点；DLL失败不变成NoCandidates，也不会切换到托管分割回退。
+
+## 6. 完成时再检查发布资格
+
+后台完成后，在gate内检查当前Revision仍等于捕获值并且没有Closing。任一不符，丢弃本次显示交付，不改变当前Report/Error；原生资源早已由算法函数正常收尾。
+
+因此切换图像后，不但旧成功结果不能覆盖，旧异常也不能覆盖。Clear同样生效。新的像素和新版本独立于旧任务，忙碌状态则由真实任务是否完成决定。
+
+当前过期任务没有额外历史列表或持久化，只抑制显示。正式检测结果不能随意丢弃，应与工件结果存储、确认和预览分流分开处理；不要把这个查看器直接当生产流水线的结果可靠交付机制。
+
+## 7. 显示与中心点叠加
+
+MainWindow在UI线程用BitmapSource.Create生成Gray8图并Freeze；图像和叠加层都固定400×300，每像素50DIP。NearestNeighbor方便看清8×6夹具，不表示算法采用最近邻测量。
+
+每个候选只绘制一个12DIP红色中心点，坐标为(Column+0.5, Row+0.5)乘50。没有画真实分割区域、形状模型或Metrology轮廓；不能把这个圆点当作拟合圆或检测ROI。
+
+26项检查实际读取BitmapSource像素，核对它和源夹具一致，并检查Gray8/Freeze。没有验证可见窗口布局、多DPI、屏幕渲染、按钮人工操作或叠加位置的截图效果。[位图接口](https://learn.microsoft.com/en-us/dotnet/api/system.windows.media.imaging.bitmapsource.create)
+
+## 8. 关闭时等待，不强行取消
+
+CloseAsync在gate内设置Closing并清空发布结果，返回同一份在途任务或已完成任务。关闭后TryRun/Load/Clear全部拒绝，不会因为清空了结果就把仍在执行的工作误记成空闲。
+
+窗口第一次Closing设置e.Cancel=true，调用CloseAsync并await，再通过Dispatcher.InvokeAsync排队执行第二次Close。allowClose使第二次事件真正退出；重复点击关闭只观察同一次排空，不启动新工作。
+
+没有Wait/Result阻塞UI，也没有超时后提前Dispose原生对象。原生调用不返回时会继续等待，这是边界而不是完整故障恢复方案。应用进程被强制终止、操作系统关机以及厂商永久卡住的行为，本批未验收。[关闭事件与重入约束](https://learn.microsoft.com/en-us/dotnet/api/system.windows.window.closing)
+
+## 9. 26项检查如何避免假验证
+
+测试用门闩控制后台进入与释放，不靠随机延迟猜测时序。覆盖无图拒绝、正常发布、单在途拒绝、切图后迟到成功、清空后迟到失败、失败无回退、错误结果拒绝、关闭等待/重复关闭/拒绝新请求/禁止发布，以及固定尺寸约束。
+
+其中模拟DllNotFoundException只是验证失败分类，不是原生环境检测。真正--native-test另行调用NativeFrameRunner与引擎，预期原图面积4/中心(1.5,1.5)；实际仍DllNotFoundException/退出3，因此真实像素桥接、过程加载与结果均未通过原生验证。
+
+未自动打开可见窗口，不报告Closing事件/UI人工验收完成。测试门闩等待有界，但示例原生调用没有教学超时后取消功能。还需补异常释放、长时间调用/内存、切配方与相机接入验收。
+
+## 10. HALCON主线与下一阶段
+
+本轮完成HALCON基础教学的WPF桥接环节，不等于HALCON部署/原生算法/现场质量都完成。合法原生环境、手写过程格式/HDevelop对照、图像数据集与实际精度/性能仍保留待验收。
+
+接下来读[OpenCvSharp Mat、类型、stride与所有权](/knowledge/industrial/host-computer/opencvsharp/mat-pixel-types-stride-roi-and-ownership/)，结合 [C#容器与真实原生检查](/knowledge/industrial/host-computer/opencvsharp/csharp-mat-creation-pixel-access-roi-and-lifetime/)，再分批做阈值、形态学、轮廓、几何和显示。保持相同输入/结果边界，比较实现与证据，不以一种库的分数或像素结果直接替代另一种库的质量验收。

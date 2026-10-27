@@ -4,6 +4,7 @@
 @import "./search.css";
 @import "./mdx-components.css";
 @import "./interactive.css";
+@import "./industrial-roadmap.css";
 
 @theme inline {
   --color-background: var(--background);

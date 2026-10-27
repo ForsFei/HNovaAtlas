@@ -1,0 +1,28 @@
+<Window x:Class="IndustrialTcpSession.Wpf.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="TCP 长连接教学 · 仅本机模拟器" Width="840" Height="560"
+ MinWidth="680" MinHeight="420" Closing="OnClosing">
+ <Grid Margin="20">
+  <Grid.RowDefinitions>
+   <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+   <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+  </Grid.RowDefinitions>
+  <StackPanel Orientation="Horizontal">
+   <ComboBox x:Name="Scenario" Width="190" AutomationProperties.Name="设备故障场景"/>
+   <Button x:Name="Start" Content="启动本机监控" Click="OnStart" Padding="16,7" Margin="12,0"/>
+   <Button x:Name="Stop" Content="停止" Click="OnStop" IsEnabled="False" Padding="16,7"/>
+  </StackPanel>
+  <TextBlock Grid.Row="1" TextWrapping="Wrap" Margin="0,12">
+   默认 Normal；DropOnce 首次正常采样后断线再恢复，SilentPing 模拟心跳无响应。
+   所有场景只访问内置 127.0.0.1 临时端口，不操作现场设备。
+  </TextBlock>
+  <StackPanel Grid.Row="2">
+   <TextBlock x:Name="State" Text="Stopped · 未启动" FontSize="19"/>
+   <TextBlock x:Name="Detail" TextWrapping="Wrap" Margin="0,6"/>
+   <TextBlock x:Name="Temperature" Text="温度：—（无有效读数）" FontSize="27" Margin="0,8"/>
+  </StackPanel>
+  <TextBlock Grid.Row="3" x:Name="Metrics" Text="连接尝试 0 · 会话代次 0" Margin="0,8,0,12"/>
+  <ListBox Grid.Row="4" ItemsSource="{Binding History}" FontFamily="Consolas" AutomationProperties.Name="监控记录"/>
+ </Grid>
+</Window>

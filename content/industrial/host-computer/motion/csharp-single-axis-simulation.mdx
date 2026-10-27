@@ -1,0 +1,164 @@
+---
+id: industrial-csharp-single-axis-simulation
+title: C# 单轴模拟：回零、定位、点动、停止和故障恢复
+description: 无驱动和原生 DLL 的 .NET 10 单轴教学示例，以命令身份、参考有效性、反馈证据和故障注入验证运动状态边界。
+tags: [工业自动化, 运动控制, C#, 状态机, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 20
+prerequisite: [industrial-motion-axis-units-coordinates]
+related: [industrial-leadshine-e3032-sdk-basics, industrial-csharp-command-mailbox-recovery, wpf-ui-thread-and-async]
+---
+
+## 本例运行什么，不运行什么
+
+仓库 `examples/industrial-motion/` 是 .NET 10 控制台项目，没有第三方包，没有原生 DLL、驱动、网络或硬件调用。目标是先验证运动命令的生命周期，不是模拟 E3032 固件、EtherCAT 协议或真实伺服。
+
+已经通过 68 项离线断言；`--demo` 演示从模拟位置 20 mm 回零，再定位到 25 mm。所有运动发生在内存模型中，运行时不会执行真实的驱动使能或移动机械轴。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --demo
+```
+
+正常 demo 输出包括：
+
+```text
+Home: Ready, completed=True, machine=0.000 mm
+Move: Completed, completed=True, feedback=25.000 mm
+Simulated only. No driver/DLL/card/servo enable executed.
+```
+
+## 1. 文件和对象先看这里
+
+| 文件/类型 | 责任 |
+| --- | --- |
+| `MotionMath.cs` / `UnitScale` | 明确的 count/mm 换算、取整与溢出检查 |
+| `MotionMath.cs` / `TrapezoidPlan` | 零起末速的理想梯形/三角轨迹采样 |
+| `SimAxis.cs` / `SimAxis` | 单轴状态、动作前提、指令身份、停止和故障处理 |
+| `AxisSettings` | 行程、速度/加速度、超时、误差与点动限制 |
+| `AxisInputs` | 已归一化的总线、驱动、报警、限位与到位输入 |
+| `AxisSnapshot` | 一次读取得到的状态快照与完成证据 |
+| `SelfChecks.cs` | 可重复断言和故障注入 |
+| `Program.cs` | 自检与最小演示入口 |
+
+这些是本项目自己的类型，不是 `LTDMC` 属性。所有调用由一个调用者串行执行；没有为当前示例引入多线程调度框架或 WPF 操作面板。
+
+### 主要配置
+
+`AxisSettings` 默认行程 -10～100 mm，最大速度 20 mm/s，加减速度各 100 mm/s²；回零速度 5 mm/s、回零超时 8 s，定位超时 30 s；到位容差 0.01 mm，跟随误差上限 0.5 mm；手动点动速度上限 2 mm/s，续期租约 0.25 s。**这些只是内存教学数字，不是 E3032 或实际机械的推荐参数。**
+
+所有量先检查有限值和范围。这里的 `Acceleration/Deceleration` 是加速度值，而雷赛 `dmc_set_profile_unit` 的 Tacc/Tdec 是时间参数；未来适配必须显式转换和核对，不可按参数顺序照抄。
+
+## 2. 开启、使能、回零分别改变什么
+
+```text
+Disconnected --Open--> Disabled --Enable--> Ready（尚无参考）
+Ready --Home--> Homing --模拟原点事件与完成检查--> Ready（Homed）
+Ready --MoveAbsolute/Relative--> Moving --> Settling --> Ready
+Ready --Jog--> Jogging --RequestStop/租约过期--> Stopping --> Ready
+活动动作 --故障--> Faulted --条件恢复且ResetFault--> Disabled
+```
+
+`Open()` 只建立模拟会话，数据有效、但未使能也未回零。`Enable()` 在模型中立即确认；真实 E3032 要请求后读取驱动实际状态，两者不能混为一个瞬时结果。
+
+`Home()` 在本模型中要求起点位于零点正侧，以恒定负速度寻找理想零点。找不到传感器会超时或越过模型行程边界；中途停止不会设置 `Homed`。它没有快慢复寻、退出已压住传感器、索引、抱闸或驱动器回零方法，不是可直接用于实机的回零实现。
+
+## 3. 完整最小流程
+
+以下代码与 `Program.cs` 使用同一组对象；可在项目内替换演示逻辑后运行。类型当前为示例内部类型，不是独立 NuGet 公共库。
+
+```csharp
+using IndustrialMotion;
+
+using var axis = new SimAxis();
+axis.Open();
+axis.Enable();
+
+CommandKey home = axis.Home();
+while (axis.Read().Busy)
+    axis.Tick(.01);
+if (!axis.Read().CompletedFor(home) || !axis.Read().Homed)
+    throw new InvalidOperationException("Simulated homing failed.");
+
+CommandKey move = axis.MoveAbsolute(25, 10); // mm、mm/s
+while (axis.Read().Busy)
+    axis.Tick(.01);
+if (!axis.Read().CompletedFor(move))
+    throw new InvalidOperationException("Simulated positioning failed.");
+
+axis.Disable();
+axis.Close();
+```
+
+`Tick(.01)` 表示推进 0.01 秒**模拟时间**，不表示等待了 10 ms，不保证 100 Hz 调度，也不是发送 EtherCAT 周期。这里的同步循环只对内存模型使用，不能照搬到 WPF UI 等待真实卡，更不能把运行耗时作为机械性能测试。
+
+模型自带动作超时；测试辅助 `Finish` 另加最大步数防止测试卡死。真实设备等待需使用单独的时钟期限、取消与设备状态，不能简单把 `Tick` 替换为 `Thread.Sleep` 就认为已实现适配。
+
+## 4. 常用方法与快照属性
+
+| 方法 | 模型中的含义 | 约束 |
+| --- | --- | --- |
+| `Open / Close / Dispose` | 建立、正常关闭或释放模拟会话 | Close 拒绝活动动作；Dispose 不证明实际停止 |
+| `Enable / Disable` | 修改模拟使能状态 | Disable 拒绝运动中使用，也不能代替停止 |
+| `Home` | 启动简化回零并返回命令身份 | 不等于把位置写零 |
+| `MoveAbsolute(target, velocity)` | 按机械坐标定位 | 已使能、有参考、空闲、目标与速度合法 |
+| `MoveRelative(distance, velocity)` | 当前机械位置加距离 | 不重复加工作偏置 |
+| `SetWorkOffset(offset)` | 设置工作零点偏置 | 只允许空闲且有参考时，不使轴运动 |
+| `Jog(direction, velocity)` | 有限速度的模拟点动 | direction 为 -1/+1；必须续期或停止 |
+| `RenewJog(key)` | 为当前点动续期 | 只接受仍在活动的相同身份 |
+| `RequestStop` | 进入减速停止 | 发出请求不等于已经停下 |
+| `Read` | 读取快照 | 消费者判断 DataValid 与所需状态 |
+| `SetInputs / InjectFollowingOffset` | 注入状态/反馈故障 | 只为测试，不对应真实 SDK 写入 |
+| `ResetFault` | 故障条件恢复后回到 Disabled | 不自动使能、回零、重放或改写旧结果 |
+
+快照中的重要属性：
+
+- `State/Busy`：当前动作阶段；`Ready` 还要联合 `Enabled/Homed` 判断能力。
+- `Key/Result`：命令身份与结果；`Active/Completed/Stopped/Faulted/Uncertain` 分开。
+- `DataValid`：模型会话和总线条件是否有效；真实适配还需要采样时间和新鲜度判断，本模型未提供现场新鲜度机制。
+- `CommandPosition/FeedbackPosition/WorkPosition`：指令、可空的反馈、按偏置换算的工作位置。
+- `Velocity/Target/Fault/Evidence`：当前模型速度、目标、故障原因、完成证据来源。
+
+`AxisInputs` 的布尔量已经按“true 表示该条件成立”归一化，不是接线的高低电平，不是状态字位号，也不是所有卡共享的 IO 定义。真实读入需要先经过型号与接线适配。
+
+## 5. 为什么每条命令都返回 Key
+
+`CommandKey` 由会话代次和命令序号组成；开启新会话递增代次，启动新动作递增序号，整数溢出被拒绝。`CompletedFor(key)` 联合检查数据有效、身份相同、结果 Completed 和状态 Ready。
+
+上一条已完成后，新动作开始会清除旧的完成结果。重开会话后，旧 Key 也不能满足新命令。这样可防止“先看到一个残留 Done，于是刚发出的定位被当成完成”。这个身份只存在于模型，不代表实际雷赛 SDK 提供相同的设备端事务去重。
+
+真正失联时，应用 Key 只能帮助记录，不能证明设备没有执行。真实 SDK 适配仍需查询设备状态和业务上下文；不能据此重发相对运动或宣称 exactly-once。
+
+## 6. 指令完成与反馈完成的区别
+
+定位先经历 `Moving`，轨迹结束后进入 `Settling`。有反馈配置时，还要求 `InPosition` 和位置差满足容差才能完成；只有规划结束却不到位，会等到超时。超过跟随误差上限则进入故障，而不是完成。
+
+默认反馈只是“指令位置减去人为注入的偏差”，没有真实电机动态、惯量、振荡、噪声和迟滞。`SimulatedFeedback` 必须读成**模拟反馈证据**。当 `HasFeedback=false` 时，反馈位置为 null，完成证据为 `CommandOnly`，不伪造编码器值。
+
+`UnitScale` 是独立换算教学工具；`SimAxis` 内部采用 double 毫米值，没有隐含调用计数换算，也没有模拟硬件分辨率和量化误差。
+
+## 7. 停止、点动和退出
+
+`RequestStop()` 之后先进入 `Stopping`，继续推进模拟时间才减速到零。减速仍产生位移，结束结果是 `Stopped` 而非 `Completed`，所以不满足原目标的 `CompletedFor`。被中断的回零也不能保留已回零状态。
+
+点动使用保守的速度上限和当前命令续期机制：租约过期发起受控停止，过期后的旧 Key 不能复活原点动。但是租约**只有在 Tick 继续推进时才会检查**；程序崩溃或卡住后它不会自己运行，不能作为真实控制卡的失联看门狗。点动启动是理想恒速模型，也没有模拟完整加速曲线。
+
+`Close()` 拒绝活动动作，使数据与参考失效；`Dispose()` 若发生在运动中，将结果标为 Uncertain。关闭/析构只是清理模型，绝不能从“软件退出了”推出现场轴已停止。实际停机需另行设计卡/驱动侧失联策略及安全系统。
+
+## 8. 故障恢复为什么不顺便继续执行
+
+可以注入驱动报警、急停输入、正负限位、驱动未就绪、总线失联、跟随偏差及未到位。模型统一禁止后续动作，清除参考；总线失联还将数据置无效并将结果标为 Uncertain。
+
+故障时模型把速度冻结为零，这是内存模型的处理方式，**不是对实际故障时机械停止的预测**。软件行程只在离散 Tick 中检查，也没有提前计算制动余量，不是安全额定行程保护。
+
+`ResetFault()` 要求输入和偏差恢复，但只回到 Disabled，保留旧动作的失败/未知结果。后续是否能使能、怎样重新建立参考、是否重新安排工件任务，都应由明确流程决定，不能暗中自动继续上一条运动。
+
+## 9. 本批检查覆盖与缺口
+
+68 项断言覆盖：当量/正负取整/溢出，长短和非对称曲线，开启/使能/参考前提，命令身份与旧结果隔离，绝对相对和工作偏置，非法参数与行程，普通停止、回零超时/传感器缺失/中断，点动续期，反馈超差/不到位，无反馈证据，六类输入故障与复位，关闭和异常释放。
+
+尚未覆盖：真实 E3032 驱动与 SDK ABI、EtherCAT 拓扑和 PDO、伺服状态字、真实回零方法、机械制动和限位接线、多轴插补、长时间性能，以及 WPF 人工操作。这些会分批交付，不将本例包装成通用运动框架或数字孪生。
+
+继续读 [E3032 总线接入、状态与轴映射](/knowledge/industrial/host-computer/motion/e3032-ethercat-commissioning-and-axis-mapping/)，再用 [C# 只读诊断采样层](/knowledge/industrial/host-computer/motion/csharp-e3032-readonly-diagnostics/)验证身份、单位与数据有效性。该层目前只有测试替身，没有原生 SDK 后端；配套资料齐备后再逐步接入真实库及受控回零/定位验收，脉冲卡另补脉冲模式、卡侧回零和反馈对照。

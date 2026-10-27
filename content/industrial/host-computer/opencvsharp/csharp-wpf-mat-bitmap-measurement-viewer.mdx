@@ -1,0 +1,164 @@
+---
+id: industrial-csharp-opencvsharp-wpf-viewer
+title: C#实践：WPF测量查看器、Mat位图桥接与关闭排空
+description: 新建独立WPF项目，复用像素宽度算法，以冻结位图和本地版本隔离后台结果，说明常用对象成员、等比坐标及Mat归还，并验证离屏叠加。
+tags: [工业自动化, C#, WPF, OpenCvSharp, BitmapSource]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 130
+prerequisite: [industrial-opencvsharp-wpf-display, industrial-csharp-opencvsharp-stripe-measurement]
+related: [industrial-csharp-opencvsharp-mat, industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 项目与运行方式
+
+新增examples/industrial-opencvsharp-wpf/，.NET10 Windows/WPF、x64、警告作为错误；ProjectReference复用既有OpenCvSharp项目，并链接Mono8Image.cs。没有新增第三方包，传递依赖仍为固定4.13.0.20260627及本项目锁文件；没有引用HALCON或改系统PATH/注册表。
+
+```powershell
+dotnet restore examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build -- --native-test
+# 无参数启动可见离线窗口，需要Windows桌面；本轮未人工操作验收。
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build
+```
+
+锁模式还原通过，Release零警告零错误；36项WPF/会话检查、26项真实OpenCV/WPF检查通过。self-test退出失败1，用法错误2，native-test失败3；成功0。两个测试入口使用STA/Dispatcher且不Show可见窗口，不能把离屏检查写成人工UI通过。
+
+## 1. 文件与对象对应关系
+
+| 文件 | 对象/常用成员 | 责任 |
+| --- | --- | --- |
+| BitmapBridge.cs | BitmapBridge.FromOwned/FromMat、NativeFrameRunner.Analyze | 像素复制、Freeze与独占Mat范围 |
+| FrameSession.cs | FrameSelection、FrameView、FrameFactory | 不可变图像/配方、本地显示快照与4张夹具 |
+| FrameSession.cs | Load、TryRun、Clear、CloseAsync、View | 单在途、版本隔离与关闭排空 |
+| MeasurementViewer.cs | ImageViewport、Present、OnRender | 同一Uniform映射绘制图像和叠加 |
+| MainWindow.cs | Button.Click、Window.Closing、Render | 三个操作与异步事件边界 |
+| App.cs | STAThread、Application.Run/Shutdown | GUI与测试入口 |
+| SessionChecks/NativeChecks.cs | 两类显式验证 | 测试替身与真实原生检查分开 |
+
+报告复用上一批StripeReport：Outcome、WidthPixels、First/SecondImagePoint、Edges、Pairs和两份Profile。显示层不把null尺寸补成0，也不增加产品OK属性。
+
+## 2. Mat到BitmapSource：先逐行复制
+
+```csharp
+public static BitmapSource FromMat(Mat gray)
+{
+    byte[] packed = MatBasics.CopyMono8(gray);
+    return Freeze(gray.Cols, gray.Rows, packed);
+}
+
+private static BitmapSource Freeze(int width, int height, byte[] packed)
+{
+    BitmapSource bitmap = BitmapSource.Create(width, height, 96, 96,
+        PixelFormats.Gray8, null, packed, width);
+    bitmap.Freeze();
+    return bitmap;
+}
+```
+
+MatBasics.CopyMono8检查非空二维CV_8UC1、正步长与教学容量，按Ptr(row)读有效列，支持窄ROI非连续行距。BitmapSource.Create接收的是已压紧字节数组，所以stride传width，不传原Mat.Step；这是Gray8单通道，不是任意位深通道的通用转换器。
+
+常用位图成员包括PixelWidth/PixelHeight、Format、IsFrozen、Freeze()及CopyPixels()。本例用CopyPixels核对像素，证明Mat或原ROI生命周期结束后显示数据独立。没有调用指针重载、WritePixels、WriteableBitmap或额外的OpenCvSharp WPF扩展包。[BitmapSource.Create接口](https://learn.microsoft.com/en-us/dotnet/api/system.windows.media.imaging.bitmapsource.create?view=windowsdesktop-10.0)
+
+## 3. 后台Mat由谁创建、谁释放
+
+NativeFrameRunner.WithOwnedMat是本项目内部边界：
+
+```csharp
+using Mat image = new(frame.Height, frame.Width, MatType.CV_8UC1);
+byte[] packed = frame.CopyPixels();
+for (int row = 0; row < frame.Height; row++)
+    Marshal.Copy(packed, row * frame.Width, image.Ptr(row), frame.Width);
+return process(image);
+```
+
+Mat为OpenCV自有内存，不包装托管数组地址，不需要调用方pin数组或手动FreeHGlobal。回调只借用Mat，不能保存给UI或跨出此范围；方法在成功和异常时都Dispose。[Mat数据与视图说明](https://docs.opencv.org/4.13.0/d3/d63/classcv_1_1Mat.html)
+
+实际Analyze从同一Mat构建冻结位图并调用StripeDemo.Measure，返回RenderedMeasurement(Bitmap,Report)。原测量方法不改写输入，本批不在原图上DrawLine；测量叠加是独立显示图形，不会污染下一次算法输入。
+
+FromOwned则不调用OpenCV，用于加载预览。真实处理即使因缺库失败，也不会阻止已经拥有的离线像素预览，更不会退回人工报告。
+
+## 4. FrameSelection与版本捕获
+
+FrameSelection包含Name、不可变Mono8Image和StripeRecipe。工厂生成128×96的亮条/暗槽/双条带/空白，默认窗口(16,16,96,64)，灰度20/220；暗槽配方显式为Dark，不是检测失败后自动反转极性。
+
+Load验证配方/图像范围后创建冻结预览，Revision加1，清空旧报告/错误。Clear也增加Revision，但保留当前图。配方更新本例通过重新Load完成，因此改变ROI、极性或方向也会失去旧结果的显示资格。
+
+Revision是本地显示意图，不是相机帧号、曝光时间或工件身份。图像与配方都由一次Load一起替换，本例没有让UI字段在后台运行中随意改变配方。
+
+## 5. TryRun不是创建一个无限任务队列
+
+关键逻辑为：
+
+```csharp
+if (closing || selected is null || work is { IsCompleted: false })
+    return false; // 实际实现还设置out completion
+
+FrameSelection captured = selected;
+long identity = revision;
+work = Task.Run(() =>
+{
+    // analyze(captured) + 输出验证；异常转明确错误类型
+    lock (gate)
+    {
+        if (closing || revision != identity) return;
+        // 只在仍匹配时发布独立结果和冻结位图
+    }
+});
+```
+
+完整方法同时返回供UI await的Task，后台不持锁执行原生算法。View在锁内给出一致快照，Busy表示当前工作Task尚未结束；按钮禁用只是交互提示，真正拒收条件仍在会话内。
+
+事件处理在UI线程先Render显示Busy，await完成后再Render；后台从不修改控件。测试明确捕获UI Dispatcher，再从worker await InvokeAsync，验证确实回到UI线程，而不是在worker里取一个新Dispatcher。[WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+## 6. Detach复核后再发布
+
+后台输出必须满足：位图IsFrozen、Gray8、尺寸等于捕获输入，并且CopyPixels与捕获的Mono8像素逐字节相同；报告配方和轮廓长度一致。然后复制轮廓，重新调用纯托管StripeAnalysis.Analyze，比较Outcome、尺寸、点、Edges和Pairs。
+
+报告的轮廓为扫描顺序，Analyze的参数为正轴顺序，因此Reverse时先Array.Reverse恢复，再由Analyze按配方处理。这不是重新执行Gaussian，更不验证外部算法的原始图像来源；只是使本地后端报告自洽且发布副本不受外部集合修改影响。
+
+若报告声称WidthPixels=999而轮廓只能推导32，或位图与输入同尺寸但像素不同，都被拒绝并记录ArgumentException。真实后端故障记录异常类型，不改成NoEdges；过时任务的成功或错误都不进入当前View。
+
+## 7. 同一OnRender绘制，避免两套Stretch
+
+MeasurementViewer是FrameworkElement，Present在UI Dispatcher上替换FrameView并InvalidateVisual，OnRender统一画黑底、图像、青色ROI和可选橙色跨度。当前报告不是WidthMeasured时不画橙线，但青框仍显示当前预设采样窗口。
+
+ImageViewport用Uniform居中布局：
+
+```csharp
+double scale = Math.Min(areaWidth / width, areaHeight / height);
+// Bounds的Left/Top为居中留白
+Point p = new(Bounds.Left + (imageX + .5) * Scale,
+              Bounds.Top + (imageY + .5) * Scale);
+Rect roi = new(Bounds.Left + window.X * Scale,
+               Bounds.Top + window.Y * Scale,
+               window.Width * Scale, window.Height * Scale);
+```
+
+点坐标与ROI面积边界的半像素约定不同；橙线是平均轮廓的代表中心线，不宣称逐行实际测到了相同边缘。绘制被裁在图像范围内，线宽/端点圆半径使用DIP，不回写像素宽度。RenderOptions.NearestNeighbor只影响显示，不改变算法采样或实际精度。
+
+128×96图在500×300离屏视区中的黑边各50DIP，ROI范围(100,50,300,200)，32px跨度显示为100DIP，端点(175,150)/(275,150)。本机真实RenderTargetBitmap像素检查与这组坐标一致。
+
+## 8. 关闭的完整顺序
+
+第一次Closing设e.Cancel=true，调用session.CloseAsync后Render清空当前画面，等待任务结束，再Dispatcher.InvokeAsync排队设置allowClose并再次Close。即便没有在途任务，也排队二次关闭，避免在Closing处理栈里同步重入。
+
+CloseAsync在锁中设置Closing并撤下图像/报告，返回当前Task；拒绝后续Load/Clear/TryRun。它不从UI释放Mat，也不强制终止原生调用。真实调用持有Mat的门闩检查中，关闭时IsDisposed仍为false；放行并await排空后，实际IsDisposed为true且未重新发布图像或结果。
+
+这段代码没有实现强制取消、关闭超时、进程隔离或卡死恢复。原生不返回则窗口继续等待；Task.Run和async并不自动提供上述能力。
+
+## 9. 实际检查与生成物
+
+36项self-test包含实际BitmapSource/Freeze/CopyPixels/Dispatcher和布局数值检查，但处理函数为明确的纯托管测试替身，不执行OpenCV。验证空输入拒收、单在途、换图/清空迟到成功和错误、显式重试、位图/报告错配、反向复核、输出分离及关闭排空。
+
+26项native-test实际执行独占Mat、投影/高斯/配对、位图桥接、非连续ROI、成功/异常Dispose及离屏绘制，验证橙线/青框/留白、换图/清空/多候选撤线和真实在途调用关闭。不是26次按钮人工操作，也不因IsDisposed通过而声称全部原生缓存或WPF内存已长期稳定。
+
+测试用PngBitmapEncoder在本项目忽略的bin输出目录verification/生成唯一文件名PNG，FileMode.CreateNew防止覆盖。该图是代码离屏渲染结果，不是可见窗口截图；本轮已查看并核对位置。不会保存用户图片或修改相机文件。
+
+## 10. 后续边界
+
+当前是离线、单任务、无排队的查看器。没有连续相机采集、生产结果持久化/PLC回执、毫米和质量判定、WPF人工窗口/多DPI验收，也没有长期吞吐或内存测试；冻结位图和复制校验带来额外成本，不能直接当成高帧率实现。
+
+接着读[有界处理与结果责任](/knowledge/industrial/host-computer/opencvsharp/bounded-measurement-preview-and-resource-observation/)及 [C#账本、收据与预览槽](/knowledge/industrial/host-computer/opencvsharp/csharp-channel-ledger-receipts-and-preview-slot/)：显示可以更新得更快，但被接收的检测任务仍需明确终态、资源容量与交接规则，不能简单用“只保留最新结果”丢掉生产责任。

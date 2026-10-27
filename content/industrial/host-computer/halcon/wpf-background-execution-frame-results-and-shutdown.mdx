@@ -1,0 +1,113 @@
+---
+id: industrial-halcon-wpf-integration
+title: HALCON与WPF：后台执行、同帧结果和关闭排空
+description: 从无窗口算法入口接入WPF，明确像素所有权、单次后台调用、显示版本与迟到隔离，区分等待超时和原生取消，以及关闭窗口时的排空顺序。
+tags: [工业自动化, HALCON, WPF, 异步, 图像显示]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 140
+prerequisite: [industrial-halcon-procedure-integration, industrial-csharp-halcon-engine]
+related: [industrial-csharp-halcon-wpf, industrial-csharp-wpf-vision-viewer, industrial-csharp-inspection-pipeline]
+---
+
+## 从CLI接到窗口，并不是把调用放进Click就结束
+
+上一批的HDevEngine入口同步执行，适合先核对接口。直接把Execute放到WPF按钮事件里，会让耗时算法占用UI线程；随意Task.Run后又可能遇到切图串帧、后台访问控件和关闭时过早释放的问题。
+
+本批新增独立examples/industrial-halcon-wpf/：只读离线夹具，三个按钮为切换原图/反相、执行HALCON、清空结果。不接相机、PLC或运动控制，不增加MVVM框架和插件平台。
+
+真实HALCON调用已编译，但当前原生环境仍缺运行组件。可打开窗口看图、运行离线会话检查；点击执行不会偷偷使用托管算法回退。原生算法、窗口人工操作与长期资源验收仍单列待验证。
+
+## 1. UI线程、后台调用和显示对象分开
+
+| 位置 | 负责什么 | 不负责什么 |
+| --- | --- | --- |
+| WPF UI线程 | 按钮、图像Source、结果文字、叠加中心点 | 不同步执行HALCON算法 |
+| 单个后台调用 | 创建原生图像、传参、执行、读回、释放 | 不访问Image/Canvas/TextBlock |
+| 托管会话 | 有界提交、显示版本、迟到隔离、关闭状态 | 不假装能强制取消原生算子 |
+
+WPF控件通常有线程亲和性。后台做计算，结果回到Dispatcher所属线程更新界面；不能因为结果已经是double就让后台线程直接设置TextBlock。[微软线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+这是一条最小的教学分工，不要求每个小项目都先建立复杂消息总线。当前一个窗口、一个会话、一份在途工作，足够暴露主要边界。
+
+## 2. 显示图和算法图必须来自同一份像素
+
+常见错误是：UI显示了内存中处理过的图，后台却再次ReadImage读取原始文件。文件名相同也不能证明像素相同，反相、裁剪或磁盘文件变化都会破坏对应关系。
+
+本例先用既有PlainPgm解析8×6夹具，得到拥有像素的Mono8Image。切换反相会创建新的不可变图像，后台提交时捕获这张图像引用；执行时复制其像素，创建自己独占的HALCON byte图，再将该HObject借给EngineDemo.AnalyzeImage。
+
+因此显示和算法输入在内存数据来源上对应，不依赖重复读取同名文件。它仍不是实际相机的触发/工件关联证明；接相机后要使用真实帧身份和采集会话，不能用显示版本代替设备FrameID。
+
+## 3. 一个在途调用，不设置隐藏队列
+
+FrameSession只允许一个正在执行的后台请求，满载直接拒绝第二次提交。按钮禁用是操作提示，会话检查才是实际边界；即使重复触发事件，也不会排入第二份算法任务。
+
+当前没有队列、自动重试、固定线程常驻引擎或预热。每次调用创建自己的原生图像和过程包装，便于学习资源归属，但不是高帧率优化示范。Task.Run也不保证下一次在同一条线程上执行。
+
+正式项目如果要常驻模型/引擎，应再设计独立工作线程或受控执行器、配方切换和排空，不要把这个单次例子扩展成多个并行Execute共享同一个call。
+
+## 4. 显示版本与“当前结果”
+
+本例Revision是本窗口的显示意图版本。加载新图或清空结果都会递增；提交时保存版本，完成时只在版本仍相同且未关闭时发布结果。
+
+| 事件 | 图像/版本 | 结果 |
+| --- | --- | --- |
+| 显示原图A | Revision=1 | 未运行 |
+| 提交A | 捕获A与版本1 | 后台执行 |
+| 用户切到反相B | Revision=2 | 立即清空旧证据 |
+| A返回成功或失败 | 捕获版本1已过期 | 不覆盖B |
+| 用户显式运行B | 捕获B与版本2 | 完成后才可能显示B结果 |
+
+清空不是取消：它只撤销这次结果对当前画面的发布资格。旧算法继续执行并正常释放；界面不把旧图的异常也贴到新图上。忙碌状态仍保持，直到真正的后台任务结束。
+
+当前只有进程内显示版本，没有工件号、相机代、配方版本和持久化。正式工位应保留完整身份信封，复习[结果与预览分流](/knowledge/industrial/host-computer/vision/bounded-processing-preview-and-result-handoff/)。
+
+## 5. 同步算法的异步包装不等于原生取消
+
+Execute是同步调用。Task.Run使它离开UI线程，但并没有把算法改造成可响应CancellationToken的异步原生过程。
+
+若对等待做超时，超时后后台任务仍可能在使用HObject、模型和引擎；此时不能Dispose这些资源，不能直接启动下一份共享资源的调用，更不能把超时当作设备动作已停止。
+
+本例没有超时后强制释放或Thread.Abort。关闭时等待真实任务完成；如果厂商调用一直不返回，窗口会保持等待状态。这是已知限制，不承诺关闭期限。需要硬期限时，应独立评估厂商支持的机制或进程隔离，而不是凭空加一个取消按钮。
+
+## 6. 关闭的顺序
+
+第一次Closing事件先取消本次关闭，进入关闭中状态，禁止新提交/切图/清空，并获取当前任务。异步等待任务完成后，再通过Dispatcher排队触发第二次Close；第二次才允许窗口真正关闭。
+
+微软说明Closing可以取消关闭，且不能在Closing尚未结束时直接再次Close。本例排队二次关闭，避免无在途任务时同步重入同一个Closing处理。[Closing事件](https://learn.microsoft.com/en-us/dotnet/api/system.windows.window.closing)
+
+原生资源由后台函数自己释放，不由Closing处理器越权清理。关闭等待期间的结果不再发布；这里只排空应用自身的工作，不代表相机停止、PLC复位或机械设备进入安全状态。
+
+## 7. 普通WPF显示与HALCON窗口控件
+
+本例使用BitmapSource显示托管Gray8像素，Canvas只标出区域中心。没有使用HWindowControl/HSmartWindowControlWPF，不把厂商窗口句柄当作算法输入，也不调用dev_display。
+
+BitmapSource.Create使用8×6、96DPI、PixelFormats.Gray8、stride=8。绘制到固定400×300显示区，每个像素50DIP，行列中心换算为：
+
+```text
+显示X = (Column + 0.5) × 50
+显示Y = (Row + 0.5) × 50
+```
+
+红点直径12DIP仅供观察中心，不是圆拟合结果、区域轮廓或精度范围。图像/Canvas尺寸固定且比例一致，因此没有额外留白换算；改变布局或改成Uniform时必须重新处理缩放与偏移，不能沿用50这个常数。[BitmapSource.Create](https://learn.microsoft.com/en-us/dotnet/api/system.windows.media.imaging.bitmapsource.create)
+
+本例在UI线程创建BitmapSource并Freeze，像素仍为独立托管副本。Freeze并不让Image控件变成可由任意线程访问的对象。[Freezable说明](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/freezable-objects-overview)
+
+## 8. 缺环境不是正常无候选
+
+| 情况 | 显示 |
+| --- | --- |
+| 尚未点击执行 | 未运行，只看图 |
+| 原生正常返回无区域 | NoCandidates，不是产品OK |
+| 返回候选区域 | Candidates及中心点，不是产品合格 |
+| DLL/过程/执行异常 | 调用失败，无结果，不回退 |
+| 过期调用完成 | 当前画面不发布，忙状态随后解除 |
+
+26项检查使用明确的托管测试替身，验证交接逻辑，并实际创建/读取WPF位图；它们不在用户界面提供伪装成HALCON的算法路径。当前原生桥接实际尝试仍为DllNotFoundException/退出3。
+
+## 9. 本阶段结束后还要验什么
+
+HALCON第9步的基础教学现在覆盖对象、分割、匹配、ROI、一二维测量、过程集成与WPF桥接，但不是原生和现场验收完成。仍需匹配运行组件/合法许可、过程格式与HDevelop对照、算法数据集效果、异常释放、长期内存/吞吐和人工UI操作。
+
+接着读[C# WPF单次会话、像素桥接与测试](/knowledge/industrial/host-computer/halcon/csharp-wpf-halcon-frame-session-and-viewer/)。后续按原计划进入OpenCvSharp：先Mat、图像类型与生命周期，再处理/测量和WPF显示，不重复堆叠交互界面。

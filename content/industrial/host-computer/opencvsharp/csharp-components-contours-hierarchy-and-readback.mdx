@@ -1,0 +1,133 @@
+---
+id: industrial-csharp-opencvsharp-regions
+title: C#实践：连通域统计、轮廓层级与区域筛选
+description: 使用固定OpenCvSharp接口读取标签统计/质心和Tree轮廓，保存只读点与层级，按像素面积/触边筛选并还原ROI坐标；18项托管和24项原生检查。
+tags: [工业自动化, C#, OpenCvSharp, 连通域, 轮廓]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 50
+prerequisite: [industrial-opencvsharp-regions-foundations, industrial-csharp-opencvsharp-segmentation]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline]
+---
+
+## 交付边界
+
+沿用examples/industrial-opencvsharp/和4.13.0.20260627包/锁文件，新增RegionContracts.cs、RegionDemo.cs和RegionChecks.cs。没有增加依赖或修改系统环境。
+
+锁模式还原及Release编译零警告零错误；新增18项纯托管配方/父链检查、24项真实原生区域/轮廓检查通过。没有跟踪、轮廓与标签自动对应、亚像素测量、标定毫米、WPF/设备或产品判定。
+
+## 1. 文件和命令
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --regions-contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --regions-native-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --regions-demo
+```
+
+托管入口不创建Mat，原生test执行真实算子和断言，demo打印组件/轮廓的原始数字。不打开窗口、相机或写文件；原生失败仍退出3，无回退。原有Mat和分割入口保留。
+
+## 2. 配方与输入契约
+
+RegionRecipe默认Connectivity=8、MinimumArea=2、MaximumArea=1000、OriginX/Y=0、RejectBorder=false。校验连通性仅4/8、正面积区间且最大不超过1048576、偏移各轴在±1000000内。
+
+这些是教学策略，不是OpenCV所有合法参数。最大256个前景组件/轮廓、总轮廓点65536是输出处理上限，超过就失败而不截断；检查发生在原生返回之后，不是算子硬实时或峰值内存保证。
+
+Analyze同步借用非空二维CV_8UC1，通过前篇逐行拷贝限制图像规模，并严格要求0/255。OpenCV某些接口可将任意非零视为前景，本适配器仍拒绝灰度16等输入，要求前一步明确二值化。
+
+输入Clone为局部source，调用者仍需保证复制/处理期间不并发改写或释放输入。当前没有直接把上一批Report自动串成队列，主例子使用独立原创二值夹具。
+
+## 3. ConnectedComponentsWithStats怎么读
+
+```csharp
+using Mat source = mask.Clone(), labels = new(), stats = new(), centroids = new();
+int n = Cv2.ConnectedComponentsWithStats(source, labels, stats, centroids,
+    PixelConnectivity.Connectivity8, MatType.CV_32SC1);
+```
+
+正式代码根据recipe选择4/8邻域；输出labels是标签图，不是显示用灰度图。返回n含背景，循环从label=1开始，不能从0开始生成产品候选。
+
+stats核对n行5列、CV_32SC1；centroids核对n行2列、CV_64FC1，再按类型读取：
+
+```csharp
+int area = stats.At<int>(label, (int)ConnectedComponentsTypes.Area);
+double x = centroids.At<double>(label, 0);
+double y = centroids.At<double>(label, 1);
+```
+
+其他统计列为Left/Top/Width/Height。每个前景框需完全在输入范围内，像素面积1..框面积，质心有限且在框内；所有前景区域面积之和核对CountNonZero。[统计布局参考](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+## 4. 前景组件、筛选和状态
+
+ComponentInfo保存Label、PixelArea、Bounds、CentroidX/Y和TouchesImageBorder。Origin只平移框与质心，不改变PixelArea；触边在输入局部坐标判断。
+
+| Outcome | 条件 | 含义 |
+| --- | --- | --- |
+| NoForeground | 原始前景组件为0 | 合法空掩膜，不是产品OK |
+| NoSelectedComponents | 有前景，但没有组件满足配方 | 与空图不同，原始证据仍保留 |
+| SelectedComponents | 至少一个组件满足配方 | 保留全部候选，不默认唯一 |
+
+默认面积2..1000使夹具3个组件中保留2个。RejectBorder可以另外排除触边组件，但不自行生成“完整产品”的结论。
+
+筛选只作用于组件列表，不改写source。Contours始终描述原始source，不能把Selected.Count与Contours.Count直接做一一对应校验。
+
+## 5. FindContours与托管数组
+
+```csharp
+Cv2.FindContours(source,
+    out Point[][] contours, out HierarchyIndex[] hierarchy,
+    RetrievalModes.Tree, ContourApproximationModes.ApproxSimple,
+    new Point(recipe.OriginX, recipe.OriginY));
+```
+
+本例选择托管点数组重载，不使用返回Mat[]的重载；后者涉及额外原生包装释放责任。每条轮廓是一组Point，每个hierarchy元素对应同一数组索引的轮廓。
+
+OpenCV4.13文档说明该函数自3.2起不修改源图；固定包装XML中仍可见修改源图的旧描述。本例以版本文档、局部Clone隔离与实际输入不变检查为依据，不把旧描述泛化为当前行为。[FindContours当前说明](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+offset对所有返回点平移，后续BoundingRect/面积/周长基于这些点计算。面积和周长不因平移改变；连接组件统计则需自己平移，别漏一套或重复加两次。
+
+## 6. 层级和深度验证
+
+固定接口的HierarchyIndex提供Next、Previous、Child、Parent；不存在用−1表示。RegionContracts.Depths对Parent逐级访问，验证范围和循环，支持父节点排在数组后面。
+
+深度0是根，1为其子，2为孙级。不能把Parent!=−1全部当孔：嵌套白岛可以是深度2的前景边界。当前主链固定Tree；External、CComp、ApproxNone在原生测试中单独对照，List未执行。
+
+Next/Previous/Child只核对索引范围，没有完成任意外部层级的兄弟互反等完整证明。输出来自同次真实FindContours；不把纯托管父链测试当轮廓提取测试。
+
+## 7. 几何读回与只读点
+
+```csharp
+double area = Cv2.ContourArea(points);
+double perimeter = Cv2.ArcLength(points, true);
+Rect bounds = Cv2.BoundingRect(points);
+```
+
+检查面积/周长有限且非负，然后独立复制Point数组并包成只读列表。ContourInfo保留数组Index、四个层级字段、Depth、多边形面积、闭合周长、外接框与点。
+
+单点轮廓允许面积/周长0，不能因为没包围几何面积就当成空轮廓；也不在这里除以面积计算中心。本批没有Moments中心、圆度、旋转框或拟合线的实现。
+
+标签和轮廓都保留本次原始索引，测试按面积/框定位目标，不依赖“轮廓0一定是工件”。需要跨帧身份时应另建关联规则，不能复用索引当跟踪号。
+
+## 8. 原创夹具和真实数字
+
+大目标为x3..12/y4..13，共100像素，减x6..8/y7..9的9像素黑孔，得到91。像素质心约(7.54945,8.54945)，而外矩形几何中心为(7.5,8.5)，两者因孔的位置不同而不完全相同。
+
+另一目标5×4=20，孤点1，总前景112；默认筛选保留91和20。Tree4条轮廓分别包含外框、孔、另一矩形和孤点，外大框ContourArea81/ArcLength36，孔ContourArea14/周长约13.65685，孤点面积0。
+
+这些是实际原生结果，不用像素面积91替换轮廓面积81，也不用孔轮廓14替换黑孔像素9。若要统计孔黑像素，应明确分离背景连通性/所属关系和边界，再计数；本批没有实现这个独立孔面积算法。
+
+## 9. ROI坐标与完整性
+
+原生测试从夹具裁Rect(2,3,12,12)，其局部坐标通过Origin=(2,3)还原：组件框和根轮廓框都回到(3,4,10,10)。另用(100,200)验证质心/框/点整体平移且面积不变。
+
+Origin不是标定模型，不可将平移后的Point直接当机器人坐标。ROI可能截断物体，TouchesImageBorder只反映当前输入边界接触；实际完整性、工件身份和图像/配方关联仍未建立。
+
+## 10. 资源和检查范围
+
+source、labels、stats、centroids在局部using结束时Dispose；输出只有值类型、只读托管列表和Recipe，不传Data/Mat。当前不返回标签图，不保留逐帧缓存，也没有结果持久化。
+
+18项托管检查验证配方和父链索引/循环/空树。24项原生检查覆盖组件面积/质心/筛选、黑白掩膜、0/255拒绝、4/8邻域、触边、Tree/External/CComp与嵌套岛、ApproxNone、面积方向、原图不变/只读点，以及ROI/偏移。
+
+既有95项Mat/分割检查回归通过。没有长期压力/内存、真实工件质量、跟踪、WPF或设备验证。继续读[C#旋转框、凸包与形状候选](/knowledge/industrial/host-computer/opencvsharp/csharp-rotated-boxes-hulls-and-shape-features/)，再逐步进入显示和有界处理。

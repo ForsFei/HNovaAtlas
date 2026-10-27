@@ -1,0 +1,119 @@
+---
+id: industrial-csharp-opencvsharp-shapes
+title: C#实践：旋转框、凸包、轮廓矩与形状候选
+description: 调用MinAreaRect、ConvexHull、ApproxPolyDP和Moments读回几何特征，以16项托管与20项原生检查验证无向长轴、正方形歧义、退化保护及带孔候选筛选。
+tags: [工业自动化, C#, OpenCvSharp, 几何特征, 形状筛选]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 70
+prerequisite: [industrial-opencvsharp-shape-foundations, industrial-csharp-opencvsharp-regions]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline]
+---
+
+## 本轮交付
+
+沿用examples/industrial-opencvsharp/，包仍固定4.13.0.20260627，无新依赖。新增ShapeRules.cs、ShapeDemo.cs和ShapeChecks.cs；结果为只读托管特征与候选理由，不含Mat、设备指令或产品OK/NG。
+
+Release编译零警告零错误，新增16项托管规则/角度检查、20项真实原生几何检查通过。使用已知点集和前篇真实提取轮廓，不是人工填写一组特征冒充原生输出。
+
+## 1. 命令
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --shapes-contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --shapes-native-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --shapes-demo
+```
+
+contract-test仅验证规则和角度公式；native-test执行真实接口及断言；demo从RegionDemo夹具重新提取轮廓，输出每条轮廓的理由和特征。原生失败仍独立退出3，无回退、窗口或文件保存。
+
+## 2. 规则属性和范围
+
+| 属性 | 默认值 | 用途 |
+| --- | --- | --- |
+| MinimumArea | 10 | 最小轮廓多边形面积，不是组件像素数 |
+| MinimumSolidity | 0.9 | 轮廓面积/凸包面积门槛 |
+| MinimumBoxFill | 0.85 | 轮廓面积/旋转框面积门槛 |
+| MaximumAspect | 5 | 长边/短边上限 |
+| EpsilonRatio | 0.02 | ApproxPolyDP的周长比例 |
+| SquareRatio | 1.05 | 长轴角度歧义策略 |
+| RejectChildren | true | 拒绝有直接子轮廓的根 |
+
+Validate检查有限数及教学范围：面积正且不超过1000000，两个比值门槛0..1，Aspect上限1..100，epsilon比例大于0且不超过0.1，SquareRatio为1..1.2。这不是厂商对所有工件的推荐配方。
+
+输入点数1..65536，各坐标绝对值不超过3000000。接口要求有序简单轮廓或已知简单多边形，不替任意手工点序列做自交证明，也不把不完整拓扑当成完整工件。
+
+## 3. 原始几何调用
+
+```csharp
+double area = Cv2.ContourArea(points);
+double perimeter = Cv2.ArcLength(points, true);
+Point[] hull = Cv2.ConvexHull(points);
+Point[] approximation = Cv2.ApproxPolyDP(points,
+    rules.EpsilonRatio * perimeter, true);
+RotatedRect box = Cv2.MinAreaRect(points);
+Point2f[] corners = box.Points();
+Moments moments = Cv2.Moments(points);
+```
+
+使用点数组重载，不新建长期Mat缓存；返回数组进一步包为只读快照。IsContourConvex检查的是approximation，而不是“原始组件一定凸”。原始点、凸包和近似边界有不同责任，不互相覆盖。
+
+本例没有调用MatchShapes、FitEllipse、MinEnclosingCircle或模板匹配；这些只在任务确有需要时再分批扩展。[形状接口参考](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+## 4. 先保护分母
+
+Describe首先计算面积和闭合周长；少于3点、面积或周长不大于1e−8时返回null。之后再确认凸包面积、旋转框短边和M00非退化，才计算比值与中心。
+
+所以null表示本例没有可发布的非退化面积几何，不是“面积0的合格产品”。原生测试覆盖单点、两点线和三点共线；没有把它们补成某个默认角度或无穷长宽比。
+
+最终核对几何量均为有限值，不静默夹取异常比值。这个数值检查仍不等于任意自交/异常点序列都已得到正确几何解释。
+
+## 5. 长短边与无向轴
+
+代码另存RawBoxAngleDegrees，同时用Math.Max/Min得到长短边。为得到本例统一的长轴方向，从四角相邻边中选最长边，按图像x向右/y向下计算：
+
+```csharp
+double angle = Math.Atan2(dy, dx) * 180 / Math.PI;
+```
+
+AxisDegrees函数将度数按180°周期归一到[−90,90)。Direction先检查长短边/向量，再在Aspect≤SquareRatio时返回null；不是把原生Angle的度数直接当弧度用。
+
+这份方向没有头尾。顶点起点或长边反向不会改变无向轴，但原生宽高/Angle表示仍可能等价变化，故原始值也保留。测试用整数顶点(10,10)、(18,18)、(16,20)、(8,12)，实测长轴45°、长宽比4，长边约8√2。
+
+图像中的45°不是已经标定的机械角度。点坐标带小数、MinAreaRect输出浮点，也不表示已经完成亚像素找边或实际精度验收。[旋转矩形的度与角点](https://docs.opencv.org/4.13.0/db/dd6/classcv_1_1RotatedRect.html)
+
+## 6. 只读结果保存什么
+
+ShapeFeatures保存多边形面积、周长、凸包面积、实心度、矩形度、长宽比、圆形度、轮廓矩中心，以及原生Angle、长短边、可空AxisDegrees和只读角点/凸包/近似点。
+
+中心来自moments.M10/M00与M01/M00，不是MinAreaRect.Center，也不是组件像素质心；两者可在特定对称例子中一致，但不在接口里混为一个概念。
+
+正方形仍有完整特征，只是AxisDegrees缺失。应用层不得把这个null转换成0后发给PLC，也不要将null理解成计算过程一定异常。
+
+## 7. 候选理由与原始树
+
+Select接收前篇RegionReport，逐条保留ContourIndex及特征，按顺序返回首个理由：NestedContour、Degenerate、HasChildren、Area、Solidity、BoxFill、Aspect、NotConvexQuadrilateral或Candidate。
+
+主示例报告来自RegionDemo的完整Tree。不能将External输出包装成“没有Child”的记录再声称无孔；该方法也不负责校验任意外部RegionReport的全部层级一致性。
+
+Select不读取RegionReport.Selected组件筛选列表，而是对原始Contours独立做教学形状筛选。它没有将Label与ContourIndex配对，不会继承前一步像素面积阈值或工件身份。
+
+默认夹具中仅小矩形为Candidate；带孔大根轮廓为HasChildren，孔本身为NestedContour，孤点Degenerate。将RejectChildren=false后有两个Candidate，原生测试明确证明这个差别。
+
+## 8. 实测特征与对照
+
+水平矩形顶点(0,0)..(10,4)的多边形面积40、闭合周长28、矩中心(5,2)、长宽比2.5，实心度/矩形度1，近似4点且凸。它不是在图像中填充后计数得到的像素面积。
+
+L形点集的面积28、凸包46、最小框面积64，实心度约0.6087、矩形度0.4375，近似非凸；这说明“框能包住”不代表实际形状就是矩形。
+
+平移点集后，质心平移而面积保持；反向点序保留几何与无向轴；正方形抑制唯一长轴。圆形度仅核对公式，不输出“是圆的概率”。
+
+## 9. 验证范围和下一步
+
+16项纯托管检查覆盖规则范围、角度环绕/180°等价、正/反向轴、近方形歧义与退化向量。20项原生检查覆盖真实MinAreaRect/凸包/近似/矩、旋转点集、L形、退化轮廓、只读角点、空结果和Tree筛选差别。
+
+未做真实噪声/毛刺/多批工件数据集、通用自交检测、模板识别、跨帧身份、标定/毫米、原生长时间内存或设备验收。候选不是产品OK，几何方向不是动作授权。
+
+接着读[边缘、Hough候选与直线/圆拟合](/knowledge/industrial/host-computer/opencvsharp/edges-hough-line-and-circle-fitting/)与 [C#检测、FitLine和圆最小二乘](/knowledge/industrial/host-computer/opencvsharp/csharp-canny-hough-fitline-and-circle-least-squares/)，继续区分包围几何、拟合结果、实际尺寸和工艺标准，再逐步接WPF显示与有界处理。

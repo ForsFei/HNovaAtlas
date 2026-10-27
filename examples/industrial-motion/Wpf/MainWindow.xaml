@@ -1,0 +1,55 @@
+<Window x:Class="IndustrialMotion.Wpf.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="工业单轴手动操作 · 仅内存模拟" Width="800" Height="650" MinWidth="660" MinHeight="540"
+        Loaded="OnLoaded" Activated="OnContextChanged" Deactivated="OnDeactivated"
+        Closing="OnClosing" Closed="OnClosed">
+    <Window.Resources>
+        <Style TargetType="Button">
+            <Setter Property="Margin" Value="0,0,8,8" />
+            <Setter Property="Padding" Value="12,7" />
+        </Style>
+        <Style TargetType="CheckBox">
+            <Setter Property="Margin" Value="0,4,20,8" />
+        </Style>
+    </Window.Resources>
+    <ScrollViewer VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24">
+            <TextBlock Text="单轴手动操作" FontSize="24" FontWeight="SemiBold" />
+            <TextBlock Margin="0,8,0,16" TextWrapping="Wrap"
+                       Text="仅模拟：无雷赛 DLL、驱动或硬件入口。所有参数和报警都是内存数据；本面板不是设备安全系统。" />
+            <StackPanel x:Name="Operations">
+                <WrapPanel>
+                    <CheckBox x:Name="ManualMode" Content="手动模式" IsChecked="True" Click="OnContextChanged" />
+                    <CheckBox x:Name="Interlocks" Content="模拟互锁满足" IsChecked="True" Click="OnContextChanged" />
+                    <CheckBox x:Name="Alarm" Content="模拟报警" Click="OnAlarmChanged" />
+                </WrapPanel>
+                <WrapPanel>
+                    <Button x:Name="OpenButton" Content="1. 打开模拟会话" Tag="Open" Click="OnAction" />
+                    <Button x:Name="EnableButton" Content="2. 模拟使能" Tag="Enable" Click="OnAction" />
+                    <Button x:Name="HomeButton" Content="3. 简化回零" Tag="Home" Click="OnAction" />
+                </WrapPanel>
+                <TextBlock Text="4. 鼠标左键按住点动，速度固定 0.5 mm/s；松开、丢失捕获或窗口失焦后请求停止。" TextWrapping="Wrap" Margin="0,8,0,10" />
+                <WrapPanel>
+                    <Button x:Name="NegativeJog" Content="按住 −" Tag="-1" Focusable="False" Width="130"
+                            PreviewMouseLeftButtonDown="OnJogDown" PreviewMouseLeftButtonUp="OnJogUp" LostMouseCapture="OnLostCapture" />
+                    <Button x:Name="PositiveJog" Content="按住 +" Tag="1" Focusable="False" Width="130"
+                            PreviewMouseLeftButtonDown="OnJogDown" PreviewMouseLeftButtonUp="OnJogUp" LostMouseCapture="OnLostCapture" />
+                    <Button x:Name="StopButton" Content="普通停止（模拟）" Tag="Stop" Click="OnAction" />
+                </WrapPanel>
+                <WrapPanel>
+                    <Button x:Name="ResetButton" Content="显式复位模拟故障" Tag="Reset" Click="OnAction" />
+                    <Button x:Name="DisableButton" Content="取消模拟使能" Tag="Disable" Click="OnAction" />
+                    <Button x:Name="CloseButton" Content="关闭模拟会话" Tag="Close" Click="OnAction" />
+                    <Button x:Name="RebuildButton" Content="重建内存轴（1 mm）" Tag="Rebuild" Click="OnAction" />
+                </WrapPanel>
+            </StackPanel>
+            <Border BorderBrush="#C8CDD2" BorderThickness="1" Padding="14" Margin="0,10,0,12">
+                <TextBlock x:Name="StatusText" FontFamily="Consolas" TextWrapping="Wrap" LineHeight="24" />
+            </Border>
+            <TextBlock x:Name="NoticeText" TextWrapping="Wrap" Foreground="#8B4513" Margin="0,0,0,12" />
+            <TextBlock TextWrapping="Wrap" Foreground="#555555"
+                       Text="本模型回零只支持正侧向零点的单阶段搜索。若当前已在零位或负侧，需要再次演示回零，可在静止时重建内存轴；重建不是设备复位。只支持鼠标点动，不支持键盘、触摸或手柄点动。UI 计时器不提供实时控制或失联安全保证。" />
+        </StackPanel>
+    </ScrollViewer>
+</Window>

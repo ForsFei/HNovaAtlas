@@ -1,0 +1,145 @@
+---
+id: industrial-csharp-opencvsharp-segmentation
+title: C#实践：滤波、二值阈值、开闭运算与分步读回
+description: 用真实OpenCvSharp接口建立可解释的分割前处理流水线，验证配方、隔离ROI邻域、保存只读二值快照，并以21项托管和28项原生检查区分参数/像素与工艺验收。
+tags: [工业自动化, C#, OpenCvSharp, 阈值, 形态学]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 30
+prerequisite: [industrial-opencvsharp-segmentation-foundations, industrial-csharp-opencvsharp-mat]
+related: [industrial-csharp-halcon-segmentation, industrial-csharp-inspection-pipeline]
+---
+
+## 交付边界
+
+沿用examples/industrial-opencvsharp/与4.13.0.20260627托管/Windows原生包和锁文件，不增加依赖。新增SegmentationRecipe、SegmentationFixture、SegmentationDemo和SegmentationChecks。
+
+Release编译零警告零错误，新增21项纯托管配方/夹具检查、28项真实原生检查通过。输出仅是像素掩膜和前景数量，不含组件数量、产品OK/NG、毫米、相机/WPF或设备控制；长期内存和质量未验收。
+
+## 1. 入口与命令
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --segmentation-contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --segmentation-native-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --segmentation-demo
+```
+
+contract-test不创建Mat；native-test执行真实算子与断言；demo打印三组实际中间数量。原有Mat入口保留，原生失败仍退出3且不回退。程序不写图像文件、不打开窗口或相机。
+
+## 2. 配方属性不是Cv2的全局设置
+
+```csharp
+public sealed record SegmentationRecipe(
+    SmoothingMode Smoothing = SmoothingMode.None,
+    int FilterSize = 3, double Sigma = 1, int Threshold = 200,
+    int MorphSize = 3, bool Opening = true, bool Closing = false);
+```
+
+SmoothingMode有None、Mean、Gaussian、Median。Validate要求已知枚举，FilterSize为3..9奇数，Sigma有限且0.1..10，Threshold整数0..255，MorphSize为1..9奇数。所有配方字段都校验，即便当前分支不使用其中某个值。
+
+这些是本例可解释、有界的配方策略，不是OpenCV全参数合法范围。MorphSize=1允许恒等形态学，默认Closing=false避免隐式填孔；应用不会根据有没有前景自动降低阈值或扩大核。
+
+## 3. 输入先验证并隔离邻域
+
+Analyze(Mat image, SegmentationRecipe recipe)同步借用输入，要求非空、二维CV_8UC1且不超过1048576像素，不自动转灰度或缩放。
+
+```csharp
+using Mat source = image.Clone();
+using Mat filtered = new(), binary = new(), opened = new(), closed = new();
+```
+
+source深复制使输入ROI的邻域不继续从父图读取。本轮原生对照确认直接Blur视图可能使用父图外侧像素，Clone后的独立图不受影响。复制期间调用者仍必须保证输入存活且不并发改写。
+
+这里明确选择隔离ROI，不宣称所有算法都应该先Clone。需要整图上下文的任务可先整图滤波再取ROI，但两种语义应写入处理契约，不能靠内存是否恰好连续决定。
+
+## 4. 三种滤波的真实调用
+
+```csharp
+Cv2.Blur(source, filtered, size, borderType: BorderTypes.Reflect101);
+Cv2.GaussianBlur(source, filtered, size, recipe.Sigma,
+    recipe.Sigma, BorderTypes.Reflect101);
+Cv2.MedianBlur(source, filtered, recipe.FilterSize);
+```
+
+主链按枚举只选一种，不是依次调用三种。None用CopyTo，保留独立输出；高斯显式设置两个方向Sigma，中值没有任意borderType参数可传，按其接口内置边界处理。
+
+输入输出分开持有，保留原图。核尺寸表示宽高像素，不是物理毫米；没有根据标定自动换算核大小，也没有使用双边滤波或自定义Filter2D。[OpenCV滤波参数参考](https://docs.opencv.org/4.13.0/d4/d86/group__imgproc__filter.html)
+
+## 5. 全局Binary与独立阈值例子
+
+```csharp
+Cv2.Threshold(filtered, binary, recipe.Threshold, 255, ThresholdTypes.Binary);
+```
+
+binary为0/255；比较是严格大于Threshold。返回double不是前景数，统计使用CountNonZero。原生检查用199/200/201验证等号位置，同时对照BinaryInv和InRange包含端点的差别。
+
+Otsu独立例子为：
+
+```csharp
+double chosen = Cv2.Threshold(bimodal, otsu, 0, 255,
+    ThresholdTypes.Binary | ThresholdTypes.Otsu);
+```
+
+已知10/220两级图得到chosen=10和4个前景像素。chosen不作为Score；没有将Otsu自动接入当前配方，也没有对真实直方图质量作验收。
+
+自适应独立例子为：
+
+```csharp
+Cv2.AdaptiveThreshold(uniform, adaptive, 255,
+    AdaptiveThresholdTypes.MeanC, ThresholdTypes.Binary, 3, 2);
+```
+
+blockSize=3、C=2在均匀100图上全部输出255；C=0时全部输出0。演示的是局部均值减C的规则，不是自动找到了物体。此处只执行MeanC小例子，GaussianC仅作接口概念导读。[阈值参考](https://docs.opencv.org/4.13.0/d7/d1b/group__imgproc__misc.html)
+
+## 6. 建核、开闭运算和禁用阶段
+
+```csharp
+using Mat kernel = Cv2.GetStructuringElement(MorphShapes.Rect,
+    new Size(recipe.MorphSize, recipe.MorphSize));
+
+Cv2.MorphologyEx(binary, opened, MorphTypes.Open, kernel,
+    iterations: 1, borderType: BorderTypes.Constant, borderValue: new Scalar(0));
+```
+
+Closing=true时再对opened用MorphTypes.Close写closed；false时CopyTo。Opening=false同理。因此阶段名称不表示算子一定执行，必须结合输出中的Recipe查看开关。
+
+锚点未显式传入，使用接口默认中心；核限定奇数避免本例引入偶数锚点歧义。iterations固定1，边界明确Constant/0，不把其等同于省略borderValue时的特殊默认形态学边界。
+
+CountNonZero不负责连通域或孔洞语义。本批的闭运算确实将单像素暗孔填成白色，是否允许这种变化仍要依据任务，而不是看到面积变大就认为处理更好。
+
+## 7. 三份二值快照怎样读回
+
+```csharp
+public sealed record MaskStage(string Name, int ForegroundPixels,
+    IReadOnlyList<byte> Pixels);
+public sealed record SegmentationReport(int Width, int Height,
+    SegmentationRecipe Recipe, MaskStage Thresholded,
+    MaskStage Opened, MaskStage Closed);
+```
+
+Snapshot先使用前篇CopyMono8逐行取得独立像素，再CountNonZero，并核对像素只能是0/255、255计数与原生统计相同，最后发布只读集合。
+
+本例最多1048576像素，复制三份掩膜明确有内存开销；这是为了教学追溯，不是长流水线应无条件保留全部大图。没有实时帧率/长期内存或结果持久化验收。
+
+输出不携带Mat、Data或指针。调用者得到的是独立托管结果；source、过滤图、阶段图和kernel在作用域内Dispose，不转交UI拥有。原图不被修改，已由原生检查核对。
+
+## 8. 原创图与分步实测
+
+32×24源像素由SegmentationFixture原创生成：16×12亮矩形减去1暗孔，加1亮孤点，T=200初始前景192。默认不开平滑与闭运算，真实结果为192→191→191；开启闭运算为192→191→192；中值配方为188→188→188。
+
+原生检查还分别读取孤点和孔的位置：开运算移除孤点，暗孔仍黑；闭运算后孔变白。初始/闭后同为192却像素不同，所以测试不仅比较计数，也比较掩膜。
+
+当前没有逐对象区域筛选，不知道这些白像素代表几件工件；没有轮廓周长/角度/位置测量、缺陷判定或设备动作。黑图产生0前景是正常输出，不是异常或产品OK。
+
+## 9. 检查覆盖
+
+21项托管检查只验证枚举、配方边界、默认开关和夹具像素布局，不运行滤波。28项原生检查实际执行四种滤波路径、Threshold/BinaryInv/InRange、Otsu、自适应MeanC、腐蚀/膨胀/开闭、1×1恒等核、原图不改写、只读快照和输入类型拒绝。
+
+还验证两种易漏边界：常数0/复制边界对贴边白图腐蚀的1/9差别，以及ROI视图受父邻域影响而主链Clone隔离。当前不是随机噪声/多工件数据集、检测准确率、真实工艺或长期性能测试。
+
+## 10. 下一批怎样接
+
+继续读[C#连通域统计与轮廓层级](/knowledge/industrial/host-computer/opencvsharp/csharp-components-contours-hierarchy-and-readback/)：对象数与像素数、区域面积与ContourArea、孔洞层级、外接框和ROI坐标分别解释，并保留真实算子结果对照。不要在这个前处理函数里顺手增加PLC写入或将掩膜非空当作产品OK。

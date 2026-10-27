@@ -1,0 +1,222 @@
+---
+id: industrial-csharp-trigger-frame-evidence
+title: C# 触发与图像证据：雷赛比较锁存接口和单拍配对
+description: 查用雷赛低速/高速比较及锁存的配置读取清理接口，标明返回语义歧义，并用57项离线检查区分比较计数、锁存位置和相机帧身份。
+tags: [工业自动化, C#, 雷赛, 机器视觉, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-21"
+order: 160
+prerequisite: [industrial-e3032-compare-latch-trigger]
+related: [industrial-csharp-e3032-positioning-cycle, industrial-csharp-interpolation-geometry, industrial-csharp-e3032-motion-observation]
+---
+
+## 两部分代码的边界
+
+常用接口导读依据[雷赛官方固定手册](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)7.16/7.17及9.21～9.24节核对，但**未针对用户配套LTDMC.cs编译或执行**。其中锁存读取返回值的原文存在歧义，本文不提供猜测性的原生适配。
+
+可运行部分是 `examples/industrial-motion/ShotEvidence.cs` 和 `ShotChecks.cs`。它们只接收虚构的归一化记录，不读写卡、不产生脉冲、不采集图像，不持有图像缓冲，也没有新的WPF或相机框架。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --shot-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --shot-demo
+```
+
+共57项离线检查。以下SDK片段只说明调用形态，不包含设备运行入口。
+
+## 1. 资源打开关闭与独占所有权
+
+雷赛仍通过`dmc_board_init`、卡清单和`dmc_board_close`管理板卡资源，不为每个比较点重复初始化/关闭。相机的打开、触发配置、采集与关闭属于具体相机SDK，当前尚未选型，因此不编造通用`Camera.Open()`或图像回调属性。
+
+比较器、锁存器、对应IO、辅助编码器和相机采集会话分别明确唯一所有者。多个线程读取同一个连续锁存器，可能消费不同数据；多个业务写复用输出，也可能破坏触发波形。
+
+结束时先禁止新工件/任务并按规程处理运动、比较输出及相机状态，最后释放各资源。`board_close`不是停止，取消PC等待不是撤销电气触发；不能靠退出程序来证明本次未拍照。
+
+## 2. 一维低速比较常用方法
+
+| 方法 | 常用参数/输出 | 说明 |
+| --- | --- | --- |
+| `dmc_compare_set_config` / `get_config` | axis、enable、cmp_source | 0指令、1编码器源；读取返回码和ref分别检查 |
+| `dmc_compare_clear_points` | Card、axis | 清除已加点，不当成关闭输出或停止运动 |
+| `dmc_compare_add_point_cycle_unit` | pos、dir、bitno、cycle、level | pos为unit，dir为≤/≥条件；cycle为总线周期数 |
+| `dmc_compare_get_current_point_unit` | ref double位置 | 当前比较点会在比较后清除，不能当永久历史 |
+| `dmc_compare_get_points_runned` | ref int已处理数 | 处理计数，不是图像数 |
+| `dmc_compare_get_points_remained` | ref int可加入数 | 可加容量，不是还没触发的点数 |
+
+下面全部参数由审核后的点位表与计划提供，没有默认真实输出编号；实际调用前需受控隔离触发源，核对卡与资源。逐条失败都应停止后续操作，不自动重跑整段：
+
+```csharp
+// SDK调用形态，未编译/执行；cycle不能与高速接口的us互换。
+short rc = LTDMC.dmc_compare_set_config(card, reviewedAxis, 0, reviewedSource);
+if (rc != 0) throw new InvalidOperationException($"Disable/configure comparison: {rc}");
+
+rc = LTDMC.dmc_compare_clear_points(card, reviewedAxis);
+if (rc != 0) throw new InvalidOperationException($"Clear comparison points: {rc}");
+
+rc = LTDMC.dmc_compare_add_point_cycle_unit(
+    card, reviewedAxis, reviewedPosition, reviewedCondition,
+    reviewedOutputBit, reviewedCycleCount, reviewedLevel);
+if (rc != 0) throw new InvalidOperationException($"Add point failed/uncertain: {rc}");
+// 不在此自动使能或启动运动；完整配置读回、现场条件和资源核对后另行装载。
+
+ushort enabled = 0, source = 0;
+rc = LTDMC.dmc_compare_get_config(card, reviewedAxis, ref enabled, ref source);
+if (rc != 0) throw new InvalidOperationException($"Read comparison config: {rc}");
+
+int processed = 0, freeSlots = 0;
+rc = LTDMC.dmc_compare_get_points_runned(card, reviewedAxis, ref processed);
+if (rc != 0 || processed < 0) throw new InvalidOperationException("Invalid comparison count.");
+rc = LTDMC.dmc_compare_get_points_remained(card, reviewedAxis, ref freeSlots);
+if (rc != 0 || freeSlots < 0) throw new InvalidOperationException("Invalid comparison capacity.");
+```
+
+禁用、clear、add和读回并非事务。中途失败不能认定配置自动回滚，下一次恢复也不能盲目再装载一次。手册旧例子中的位置清零与UI忙等不复制进本课程；运行中清零会改变后续比较意义。
+
+## 3. 一维高速比较配置、添加与状态
+
+| 方法 | 关键字段 | 注意 |
+| --- | --- | --- |
+| `dmc_hcmp_set_mode` / `get_mode` | hcmp、cmp_mode | 0禁止；1等于、2小于、3大于、4队列、5线性 |
+| `dmc_hcmp_set_config` / `get_config` | 辅助编码器通道、source、logic、time | 本基线source固定1；time为μs，仅队列/线性使用 |
+| `dmc_hcmp_clear_points` | hcmp | 清点不证明电平复原 |
+| `dmc_hcmp_add_point_unit` | hcmp、double位置 | 队列添加；其他模式语义不同 |
+| `dmc_hcmp_set_liner_unit` / `get_liner_unit` | Increment、Count | 名称确为liner；位置增量不是时间间隔 |
+| `dmc_hcmp_get_current_state_unit` | ref int容量、ref double当前点、ref int处理数 | 含不同语义字段，分别保存 |
+
+固定手册中hcmp为0～5，对应本地OUT2～OUT7；编码器参数是本地辅助编码器通道，不把总线轴号传进去冒充反馈源。time用Windows C long宽度对应的C#类型按同包声明核对，不能当作C#64位long随意写P/Invoke。
+
+```csharp
+// SDK形态，未编译/执行；本段只核对/准备，不启用比较。
+short rc = LTDMC.dmc_hcmp_set_mode(card, reviewedComparator, 0);
+if (rc != 0) throw new InvalidOperationException($"Disable high-speed compare: {rc}");
+rc = LTDMC.dmc_hcmp_set_config(card, reviewedComparator,
+    reviewedAuxiliaryEncoder, 1, reviewedActiveLevel, reviewedWidthMicroseconds);
+if (rc != 0) throw new InvalidOperationException($"High-speed config failed/uncertain: {rc}");
+
+ushort encoder = 0, source = 0, logic = 0;
+int widthUs = 0;
+rc = LTDMC.dmc_hcmp_get_config(card, reviewedComparator,
+    ref encoder, ref source, ref logic, ref widthUs);
+if (rc != 0) throw new InvalidOperationException($"High-speed config read: {rc}");
+// 与审核计划比较；禁止状态下的配置并不证明输出是安全电平。
+
+int freeSlots = 0, processed = 0;
+double currentPoint = 0;
+rc = LTDMC.dmc_hcmp_get_current_state_unit(card, reviewedComparator,
+    ref freeSlots, ref currentPoint, ref processed);
+if (rc != 0 || freeSlots < 0 || processed < 0 || !double.IsFinite(currentPoint))
+    throw new InvalidOperationException("High-speed comparison status invalid.");
+```
+
+队列装载按配套资料先选定模式、清点、加入审核位置并建立基线；选择非零模式可能改变比较行为，不将其作为普通轮询操作。线性模式的`dmc_hcmp_set_liner_unit`及FIFO批量接口在本篇只作查用说明，未提供在线追加/触发实现。
+
+## 4. 高速锁存：配置与读取返回语义分开
+
+| 方法 | 参数/意义 | 本批处理 |
+| --- | --- | --- |
+| `dmc_ltc_set_mode` / `get_mode` | latch、mode、edge、filter | 配置/读回按错误码接口导读 |
+| `dmc_ltc_set_source` / `get_source` | latch、辅助编码器、source固定1 | 不映射为任意总线反馈轴 |
+| `dmc_ltc_reset` | latch | 受控复位锁存状态，不复位机械位置 |
+| `dmc_ltc_get_number` | 读取锁存数量 | 返回说明与常规错误码范式不同，原生适配待确认 |
+| `dmc_ltc_get_value_unit` | 获取锁存位置 | 声明/返回说明有歧义，不猜返回码或数值宽度 |
+
+固定手册mode包含0单次、1连续和3触发延时停止；本课只讲前两类捕获。mode=3会涉及停止行为，不在示例中调用，也不是安全功能替代。边沿0下降、1上升、2双边沿；filter单位μs，不与普通输入接口的滤波字段混用。
+
+```csharp
+// SDK形态，未编译/执行；配置也有副作用，需先固定资源与受控触发条件。
+short rc = LTDMC.dmc_ltc_set_mode(card, reviewedLatch, 0, reviewedEdge, reviewedFilterUs);
+if (rc != 0) throw new InvalidOperationException($"Latch config: {rc}");
+rc = LTDMC.dmc_ltc_set_source(card, reviewedLatch, reviewedAuxiliaryEncoder, 1);
+if (rc != 0) throw new InvalidOperationException($"Latch source config: {rc}");
+
+ushort mode = 0, edge = 0;
+double filterUs = 0;
+rc = LTDMC.dmc_ltc_get_mode(card, reviewedLatch, ref mode, ref edge, ref filterUs);
+if (rc != 0) throw new InvalidOperationException($"Latch config read: {rc}");
+// 审核读回后，reset应在本次装载准备流程中执行一次，不在轮询中反复调用。
+```
+
+原文9.24节将`dmc_ltc_get_value_unit`声明为返回C long并有double输出指针，却把返回值说明为“锁存值”；`dmc_ltc_get_number`有int输出指针，返回说明又是数量。旧示例中还存在锁存值类型与函数声明不一致的写法。因此本篇不编造下面这种判断：
+
+```csharp
+// 不这样猜：short rc = LTDMC.dmc_ltc_get_value_unit(...);
+// if (rc == 0) 就认定double输出有效。
+// 也不这样猜：把函数返回的整数直接当作完整的工程单位double位置。
+```
+
+需要用户同包头文件、LTDMC.cs、DLL/固件说明及厂商确认后，再通过原生适配器统一输出“是否有效、数量、位置、消费/溢出状态”。本轮没有这份适配器；纯模型直接接收已归一化测试记录。
+
+连续读取可能消费记录并改变数量，单次读取则不能自行代表下一次捕获。复位前先保存需保留的证据，不能为“让界面归零”清掉尚未归档的数据。
+
+## 5. 软件锁存与二维扩展查用边界
+
+软件锁存有`dmc_softltc_set_mode/get_mode`、`set_source/get_source`、`reset`、`get_number`、`get_value_unit`：配置输入口、边沿、模式与源，读取捕获数量和unit位置。它由控制卡实现，不是用C#事件到达后现读位置。
+
+二维低速/高速比较各有独立接口，不能只把一维数组加长。固定手册中二维低速添加函数的示例/接口表与9.21节存在命名、参数形态差别；二维高速设置与读取说明对源/保留字段也有不一致。当前未核对用户配套包装，不拼接成一个“兼容所有版本”的调用。本轮主线是一维概念与单拍证据，二维和软件锁存实测分别留待对应硬件环境。
+
+## 6. 单拍模型不是比较器或相机模拟器
+
+`ShotEvidence`只管理一次拍摄的证据历史，调用者串行使用。主要成员如下：
+
+| 成员 | 表达什么 |
+| --- | --- |
+| `ShotBaseline` | 本次装载代、相机采集代、比较计数与FrameId基线、期望相机触发序号 |
+| `ContractsConfirmed` | 调用者声明已确认下述外部契约；夹具直接给true，不由代码证明 |
+| `ObserveCompare` | 检查计数相对基线只增加1，不推导电气边沿 |
+| `ObserveLatch` | 接收已经关联本次单拍且坐标契约成立的位置记录 |
+| `ObserveFrame` | 接收带可靠相机触发身份的完整帧元数据 |
+| `ComparisonObserved` / `LatchedPosition` / `MatchedFrameId` | 三份独立证据，缺哪份就留空 |
+| `EvidenceCorrelated` | 三份合格输入满足模型契约，不是图像算法判定或机械验收 |
+| `CheckDeadline` / `Invalidate` | 结束本地等待，不停止运动、不取消曝光、不补拍或重新装载 |
+
+`ContractsConfirmed`要求外层至少确认：唯一比较/锁存/触发所有者；本次只计划一个事件；资源映射与旧数据清理/装载基线；锁存与被监测信号的确定关联；目标和锁存位置在相同单位/方向/参考/补偿表现下可比较；相机帧元数据中真实存在已验证的触发身份及其期望值。
+
+`ArmEpoch`为每次装载/复位更新的应用标识，不是雷赛事件自带的事务ID。`CameraEpoch`对应采集/计数重启边界，和ArmEpoch是不同域。适配器不能给旧记录重新贴当前代，也不能仅收到回调时就自动认定它属于当前工件。代码没有硬件发现或清理旧事件的能力。
+
+工件标签也是调用者提供的名字，不是模型识别出来的实物身份；要与产线交接契约共同维护。
+
+## 7. 一次完整的虚构证据注入
+
+```csharp
+Guid arm = Guid.NewGuid(), camera = Guid.NewGuid();
+var baseline = new ShotBaseline(
+    SampledAt: 0, ArmEpoch: arm, CameraEpoch: camera,
+    CompareCount: 7, FrameId: 100, ExpectedCameraTrigger: 42,
+    ContractsConfirmed: true); // 全部是教学夹具，不是现场已验收结论。
+
+var shot = new ShotEvidence("part-A", baseline,
+    target: 10, tolerance: .05, now: 0);
+
+shot.ObserveCompare(new CompareEvidence(.1, arm, ProcessedCount: 8), now: .1);
+// Waiting：比较处理了一次，不代表电平或图像出现。
+
+shot.ObserveLatch(new LatchEvidence(.2, arm, EngineeringPosition: 10,
+    SingleShotAssociationConfirmed: true), now: .2);
+// Waiting：外部已确认这条锁存记录属于本次；仍没有图像。
+
+shot.ObserveFrame(new FrameEvidence(.3, camera, FrameId: 101,
+    CameraTriggerOrdinal: 42, Complete: true), now: .3);
+// EvidenceCorrelated：仅声明这三份合格输入在本模型中已关联。
+```
+
+这里的`CameraTriggerOrdinal`是应用归一化字段，不是本课程承诺所有相机SDK都有的属性。没有该身份时传null，模型进入Unknown，不根据到达顺序猜测。帧可先于锁存/比较状态读回到达，只要身份和契约独立成立，模型不强行要求回调顺序等于物理事件顺序。
+
+当前模型要求比较增量恰为1；跳增、倒退或溢出均未知，不自动展开计数回绕。旧FrameId或明确较早触发号忽略，缺少身份、意外较后触发、帧不完整或同一触发对应两张不同FrameId则未知，不把图像列表补位。
+
+## 8. 时间和终态怎样解释
+
+所有时间为主机同一单调时钟域的秒数。比较/锁存的SampledAt表示外层获取证据的时间，帧的ObservedAt是主机观察到该帧元数据的时间，不是硬件边沿或曝光时刻。旧缓存重新送到上层时不能篡改源信息来伪造“本轮新数据”。
+
+默认总预算1s、证据最大年龄0.25s，均为教学策略。每类已接收记录的时间需严格递增；不同证据流可使用同一时刻，调用主机now不允许倒退。预算不因迟到旧帧或新轮询而延长，边界到时再来成功记录仍是未知。
+
+本模型没有连续总线/相机健康监控，也不要求每个事件流持续产生记录；外层发现断线、失效或关联丢失应调用Invalidate，并持续驱动CheckDeadline。进程卡死时没有独立看门狗。
+
+三种状态为Waiting、EvidenceCorrelated、Unknown，后两者保留为历史，不通过后续好数据修复或重新开始。成功后收到别的状态不再改写历史，不能拿它当当前机械/相机健康许可。未知后也不自动清点、复位、重发触发或补拍。
+
+## 9. 57项检查与未完成范围
+
+检查覆盖：三份证据不互相推导、乱序到达但身份明确、计数增量/重置/额外事件、代/质量/溢出、锁存关联与位置差、旧帧与旧触发、缺身份拒绝配对、帧号有间隔但身份正确、不完整图像、单触发多帧、重复时间、过期/未来时间、总预算与不可自动恢复。
+
+没有调用原生SDK或相机，不测试电气脉冲、LTC真实捕获、驱动运动、曝光、图像内容和缓冲释放，也没有测试多工件并行/连续队列/掉电持久化。真实流式场景还需额外的有界队列、溢出记录、消费所有权和跨工件身份设计，不由本单拍对象自动提供。
+
+继续读[运动工艺的暂停、停止和恢复交接](/knowledge/industrial/host-computer/motion/e3032-process-pause-stop-and-recovery/)和 [C#恢复复核与过期确认](/knowledge/industrial/host-computer/motion/csharp-recovery-review-and-stale-confirmation/)，结合工件状态、参考有效性与已发生的触发，解释哪些情况只能核对后重新建立计划，不能直接续走或自动重拍。单拍对象未被恢复复核模型自动重启；视觉相机采集将按具体SDK单独实现。

@@ -1,0 +1,224 @@
+---
+id: industrial-csharp-halcon-metrology
+title: C#实践：Metrology模型、直线与圆结果读回
+description: 固定HALCON 24.11.3真实接口创建线和圆测量对象，设置卡尺及拟合参数，执行、按索引读取几何/分数/诊断并释放；58项托管检查与原生验收分别记录。
+tags: [工业自动化, C#, HALCON, Metrology, 尺寸测量]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 110
+prerequisite: [industrial-halcon-two-dimensional-metrology, industrial-csharp-halcon-one-dimensional-measurement]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 本轮交付边界
+
+继续使用examples/industrial-halcon/，MVTec.HalconDotNet固定24113.0.0，锁文件/.NET10/x64不变。新增真实Metrology算子调用，没有用自写找边、RANSAC或圆拟合冒充HALCON回退。
+
+| 验证项 | 实际状态 |
+| --- | --- |
+| 锁模式还原、真实接口Release编译 | 通过，零警告零错误 |
+| 本批输出/几何/像素契约 | 58项纯托管检查通过 |
+| 既有五批托管检查 | 34＋27＋35＋53＋56项回归通过 |
+| metrology-native-test | DllNotFoundException，退出3，未通过 |
+| 五组原生拟合、HDevelop对照、释放与精度 | 待合法原生环境和真实数据验证 |
+
+不安装原生运行库、不修改PATH/注册表/许可、不写模型文件。输出仅为像素几何快照，不接相机、WPF、PLC、运动控制或产品OK/NG。
+
+## 1. 新增文件与运行入口
+
+| 文件 | 责任 |
+| --- | --- |
+| MetrologyFixture.cs | 128×128原创直线阶跃、暗圆盘和缺失场景 |
+| MetrologyContracts.cs | 直线/圆实例、诊断快照、几何计算与结果状态 |
+| MetrologyDemo.cs | 创建模型、加对象、设置参数、执行、读回与释放 |
+| MetrologyChecks.cs | 58项不调用HALCON的检查 |
+
+坐标复用项目中的ImagePixel类型；完整项目一起编译，不是只复制一个cs文件就能运行。
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --metrology-contract-test
+```
+
+只有在厂商配置好的24.11.3原生运行库、x64和合法许可环境中，再运行：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --metrology-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --metrology-native-test
+```
+
+demo只处理线＋圆，test还断言四种缺失/范围场景。退出0表示所选路径完成，1托管失败，2参数错误，3原生路径失败。DLL加载失败不等于许可证失效，也不能转换成正常NoResult。
+
+## 2. 常用对象和方法怎么对应
+
+HALCON既有HMetrologyModel专用对象风格，也有HOperatorSet静态风格。本例统一后者，用HTuple持有返回句柄；不是相机连接，不需要Open/Close/Read/Write那套通信会话。
+
+| 方法/对象 | 本例用途 |
+| --- | --- |
+| CreateMetrologyModel | 新建空模型容器 |
+| SetMetrologyModelImageSize | 设置图像矩阵尺寸，在加对象前调用 |
+| AddMetrologyObjectLineMeasure | 加入近似直线，返回对象Index |
+| AddMetrologyObjectCircleMeasure | 加入近似圆，返回另一个Index |
+| SetMetrologyObjectParam | 设置指定对象的采样/拟合参数 |
+| ApplyMetrologyModel | 对当前图像执行模型，更新结果 |
+| GetMetrologyObjectResult | 按对象和实例读取参数、分数等 |
+| GetMetrologyObjectMeasures | 取得采样区轮廓和候选边缘 |
+| GetMetrologyObjectResultContour | 取得最终拟合轮廓 |
+| AlignMetrologyModel | 移动/旋转模型，本批仅导读 |
+| ClearMetrologyModel | 显式删除整个模型及其对象，本例不重复强制调用 |
+| Dispose | 归还自己拥有的包装器/句柄引用 |
+
+SetMetrologyObjectParam里的num_measures等是算子参数名，不是本例C# record上自动绑定的属性。不要虚构一个设置Radius后就自动重建并执行的传感器对象。[创建模型](https://www.mvtec.com/doc/halcon/2411/en/create_metrology_model.html)、[设置尺寸](https://www.mvtec.com/doc/halcon/2411/en/set_metrology_model_image_size.html)
+
+## 3. 先建图，再建模型和两个对象
+
+Analyze首先用GenImageConst/SetGrayval创建并填充自己独占的128×128单通道byte图。16384项数组是有界夹具输入，不是高吞吐相机缓冲接入示范。
+
+以下是完整函数中的核心片段，empty是using HTuple empty = new()，输出变量在外围声明并于finally释放：
+
+```csharp
+HOperatorSet.CreateMetrologyModel(out model);
+HOperatorSet.SetMetrologyModelImageSize(model, 128, 128);
+
+HOperatorSet.AddMetrologyObjectLineMeasure(
+    model, 24, 40, 104, 40,
+    6, 3, 1, 20, empty, empty, out lineIndex);
+
+HOperatorSet.AddMetrologyObjectCircleMeasure(
+    model, 64, 88, 20,
+    6, 2, 1, 20, empty, empty, out circleIndex);
+```
+
+每个Add的后四个数分别为MeasureLength1、MeasureLength2、MeasureSigma、MeasureThreshold，之后才是通用参数名/值和输出Index。两个empty表示添加时不附加通用参数，后面逐项Set，便于看清每个参数的责任。[直线签名](https://www.mvtec.com/doc/halcon/2411/en/add_metrology_object_line_measure.html)、[圆签名](https://www.mvtec.com/doc/halcon/2411/en/add_metrology_object_circle_measure.html)
+
+SetMetrologyModelImageSize接收Width/Height，不是Row/Column。默认夹具是正方形，代码里的128/128无法暴露宽高写反，改成非正方形时仍须认真核对；不能把正方形样例通过当作所有尺寸组合已验证。
+
+## 4. 设置卡尺与拟合参数
+
+```csharp
+HOperatorSet.SetMetrologyObjectParam(model, index, "num_measures", measures);
+HOperatorSet.SetMetrologyObjectParam(model, index, "num_instances", 2);
+HOperatorSet.SetMetrologyObjectParam(model, index, "measure_transition", "all");
+HOperatorSet.SetMetrologyObjectParam(model, index, "measure_select", "all");
+HOperatorSet.SetMetrologyObjectParam(model, index, "measure_interpolation", "bilinear");
+HOperatorSet.SetMetrologyObjectParam(model, index, "min_score", 0.8);
+HOperatorSet.SetMetrologyObjectParam(model, index, "distance_threshold", 1.5);
+HOperatorSet.SetMetrologyObjectParam(model, index, "max_num_iterations", 500);
+HOperatorSet.SetMetrologyObjectParam(model, index, "rand_seed", 42);
+```
+
+Configure对线设20处、圆设32处。允许最多两个实例，是为了保留歧义而不是预先强迫只有一个结果。all/all保留局部候选；真正目标的极性与边缘身份，仍需按工艺约束。
+
+Threshold=20控制边缘幅值，distance_threshold=1.5控制几何内点距离，两者不能相互替代。固定种子只服务可重复调试，不证明精度、跨版本逐位一致或硬实时。[对象参数参考](https://www.mvtec.com/doc/halcon/2411/en/set_metrology_object_param.html)
+
+本例没有SetSystem全局修改，没有自动调参和失败重试。使用这些值并不意味着已经适合现场图像。
+
+## 5. 执行后按对象索引读取
+
+```csharp
+HOperatorSet.ApplyMetrologyModel(image, model);
+HOperatorSet.GetMetrologyObjectResult(
+    model, index, "all", "result_type", "all_param", out parameters);
+```
+
+这里index选哪个对象，紧接着的all选该对象所有实例。all_param返回扁平的几何参数元组，不是一个带Row属性的对象列表；不同形状必须分开解析。
+
+| 对象 | 未设置相机/测量平面时每实例参数 | K实例的长度 |
+| --- | --- | --- |
+| 直线 | RowBegin, ColumnBegin, RowEnd, ColumnEnd | 4K |
+| 圆 | Row, Column, Radius | 3K |
+
+本例逐对象读回，不混用Index=all把不同参数布局拼在一个数组中。先用Numbers复制有效Length；参数为空时直接返回空实例和空Score，不强行读取不存在实例的分数。非空再读取：
+
+```csharp
+HOperatorSet.GetMetrologyObjectResult(
+    model, index, "all", "result_type", "score", out scores);
+```
+
+注意参数名是result_type，值是score，不能只凭自然语言猜一个名为score的参数名。每个实例对应一个分数，ReadLines/ReadCircles核对参数长度与分数数量。[参数布局和枚举](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_result.html)
+
+## 6. 从HTuple变成独立只读快照
+
+Numbers先TupleReal，确认容量/教学上限，再复制DArr的0..Length有效前缀。不能直接把整个DArr交给业务，固定包的底层数组可能比有效Length更长。
+
+ReadLines与ReadCircles将复制数组转换成只读实例集合，检查有限数、形状步长、Score在0.8..1、最多2实例，以及本夹具范围。线段端点不能重合，圆半径为正且不超过48，并要求整圆位于图内。
+
+这些是固定128×128、未标定、完整圆夹具的适配器策略：对象索引0..31、半径上限48不是HALCON通用限制。合法的世界坐标结果、图外圆心或部分可见圆，不能直接送进该适配器；应另建相应契约。
+
+```csharp
+public sealed record FittedLine(ImagePixel Begin, ImagePixel End, double Score);
+public sealed record FittedCircle(ImagePixel Center, double RadiusPixels, double Score);
+public sealed record LineInstances(int ObjectIndex, IReadOnlyList<FittedLine> Instances);
+public sealed record CircleInstances(int ObjectIndex, IReadOnlyList<FittedCircle> Instances);
+```
+
+业务沿ReadLines/ReadCircles入口构造快照。record声明本身不是不可信输入验证器，不应绕过入口手动拼接无效记录，再假定Combine会重跑全部校验。
+
+## 7. 诊断读回不等于拟合残差
+
+```csharp
+HOperatorSet.GetMetrologyObjectMeasures(
+    out measures, model, index, "all", out rows, out columns);
+
+// 本例只在这个对象有拟合结果时调用。
+HOperatorSet.GetMetrologyObjectResultContour(
+    out result, model, index, "all", 1.0);
+```
+
+ReadDiagnostics保留ObjectIndex、测量框图形对象数、候选边缘点列表和结果轮廓数。候选点最多256，超出就报错，不截断后继续算尺寸。图形用完在局部释放，输出不带HObject。
+
+候选点不保证全参与某一个拟合实例，所以本例没有拿这些点计算“内点RMS”。需要真实内点时应按实例查询used_edges/row、column等，再验证对应关系与残差定义；该路径本批只作导读。[采样诊断](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_measures.html)、[结果接口](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_result.html)
+
+轮廓采样1.0是显示/诊断的采样间隔，不是1像素测量精度。CountObj是轮廓对象数量，不能当圆周点数、有效卡尺数或产品数。[轮廓接口](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_result_contour.html)
+
+## 8. 合并状态：不把第一条候选当答案
+
+| Outcome | 条件 | Dimensions |
+| --- | --- | --- |
+| NoResult | 线和圆都无实例 | null |
+| MissingObject | 其中一个无实例，另一个只有1实例 | null |
+| Ambiguous | 任一对象多于1实例，即使另一个缺失 | null |
+| DimensionsMeasured | 两个对象各恰好1实例 | 三个像素几何量 |
+
+Combine先检查两个对象索引不同、诊断对象身份相符。多实例优先保留Ambiguous，不排序挑最高分，也不取数组第0项计算一个貌似正常的尺寸。
+
+恰好一线一圆时，设直线端点A/B、圆心C、半径R，计算：
+
+```text
+dr = B.Row - A.Row
+dc = B.Column - A.Column
+d = abs(dr*(C.Column-A.Column) - dc*(C.Row-A.Row)) / sqrt(dr²+dc²)
+DiameterPixels = 2R
+CenterToInfiniteLinePixels = d
+SignedCircleLineClearancePixels = d - R
+```
+
+这里d是到无限直线的垂距，不把垂足限制在线段内。d−R允许为负，表示直线穿过圆；不能取绝对值或截成0。代码不计算有限线段最短距离、不计算两条工件轮廓的最小间隙，也不做公差判定。
+
+## 9. 模型所有权与释放
+
+每次Analyze创建自己的图像和模型，不跨帧缓存。lineIndex/circleIndex只是整数元组，不是两个独立模型；不能通过释放Index来期待模型中的对象也被删除。
+
+图像、测量/结果轮廓、数字输出元组由创建它们的局部函数在finally释放。model使用固定24113.0.0包的HTuple.Dispose归还存储句柄引用，不再额外强制ClearMetrologyModel。这个策略基于固定包说明，不能任意推广到所有版本、借用句柄或别名场景。
+
+ClearMetrologyModel会删除模型及其测量对象，显式删除后句柄不再有效；如果其他位置仍在使用它，就不能在一次读取结束时擅自清除。Apply也会修改模型状态，未来跨线程复用需明确同步和单一所有者。[删除模型](https://www.mvtec.com/doc/halcon/2411/en/clear_metrology_model.html)、[执行状态与同步](https://www.mvtec.com/doc/halcon/2411/en/apply_metrology_model.html)
+
+当前原生第一步加载失败，因此没有验证实际释放、异常中途清理、跨帧复用或长期内存。写了finally不等于这些项目已验收。
+
+## 10. 58项托管检查与五组原生预期
+
+纯托管检查覆盖不同Index、4/3参数步长、空/缺失/多实例、Score/有限值/上限、退化直线、圆范围、只读复制、诊断身份/长度/计数和原创像素布局。手工几何检查直径40、垂距48.5、净距28.5，含端点反向、垂足在线段外与负净距；它们不运行找边或拟合。
+
+native-test在真实调用后才断言：线＋圆各1实例；只有线、只有圆、纯背景和半径8小圆场景保留正确缺失状态。正常图允许直线端点列、圆心各轴和半径与理想值相差1px，直径/垂距2px、净距3px，并要求有结果轮廓；这些只是合成图教学断言，不是厂商精度指标。
+
+当前真实尝试为DllNotFoundException/退出3，五组原生预期没有通过。多实例只做了人工输出契约检查，没有原生双目标案例；没有噪声/圆弧/畸变/标定、内点残差、HDevelop对照、长期吞吐或实际尺寸验收。
+
+## 11. 接入上位机前还差什么
+
+目前结果没有帧号、工件身份、配方版本、超时和持久化。它只属于一次同步Analyze，不能直接放到前面的工位流程里充当完整检测信封；后续应与[有界处理和结果交接](/knowledge/industrial/host-computer/vision/csharp-bounded-inspection-and-latest-preview/)约定一致。
+
+本批也未自动接形状定位。正式对齐时，需先统一模型参考系、原点和当前帧姿态，再使用AlignMetrologyModel；ReduceDomain不会替代模型位置更新。模型标定后坐标/单位可能改变，像素适配器不能原封不动复用。[对齐说明](https://www.mvtec.com/doc/halcon/2411/en/align_metrology_model.html)
+
+接着读[C# HDevEngine过程调用](/knowledge/industrial/host-computer/halcon/csharp-hdevengine-procedure-call-and-lifetime/)：哪些变量是输入/输出、过程如何调用、依赖与资源由谁拥有，后续再补WPF集成。继续将“能编译”“能调用原生算法”“能对照数值”“达到工艺精度”分别验收。

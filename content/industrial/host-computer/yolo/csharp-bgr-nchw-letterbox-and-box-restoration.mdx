@@ -1,0 +1,184 @@
+---
+id: industrial-csharp-yolo-preprocessing
+title: C#实践：BGR缓冲、NCHW输入数组与Letterbox框还原
+description: 沿用无依赖.NET10项目，用自有BGR小图实现固定画布缩放填充、RGB float32平面数组和ROI框还原，新增76项纯托管检查并保留既有69项评价回归。
+tags: [工业自动化, C#, YOLO, NCHW, Letterbox]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 30
+prerequisite: [industrial-yolo-preprocessing]
+related: [industrial-csharp-yolo-evaluation, industrial-opencvsharp-wpf-display]
+---
+
+## 运行与范围
+
+沿用examples/industrial-yolo/的net10.0项目，没有增加第三方包，不改变第一批数据评价。新增ImagePreprocessing.cs、PreprocessingChecks.cs和PreprocessingDemo.cs；Program.cs增加两个显式入口：
+
+```powershell
+dotnet build examples/industrial-yolo/IndustrialYolo.csproj -c Release
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --preprocess-test
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --preprocess-demo
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --self-test
+```
+
+Release零警告零错误，新增76项预处理/几何检查通过，包含一项36组往返；既有69项评价检查回归通过。成功0，输入/检查失败1，用法错误2。没有模型、ONNX Runtime或图像编解码依赖，demo只打印自有像素的实际处理结果，不写文件、不开窗口。
+
+## 1. 常用对象、属性与方法
+
+| 对象 | 主要成员 | 用法与边界 |
+| --- | --- | --- |
+| Bgr24Image | Create、Width、Height、Stride、Get(x,y,c) | 创建自有BGR缓冲并按stride访问 |
+| ImageRegion | X、Y、Width、Height | 原图内整数ROI，宽高非右下坐标 |
+| LetterboxTransform | Create、Region、SourceWidth/Height、InputWidth/Height | 为本次尺寸/ROI创建不可变变换 |
+| LetterboxTransform | ResizedWidth/Height、PadLeft/Top/Right/Bottom、IdealScale、ScaleX/Y、AllowUpscale | 核对取整、填充及实际比例 |
+| LetterboxTransform | ToInput(original)、Restore(input) | 面积边界框的正向/逆向几何 |
+| ImagePreprocessor | Prepare(image,transform,paddingValue) | 生成本例RGB float32 NCHW数组，默认padding114 |
+| PreparedInput | Transform、Shape、PaddingValue、Values、Get、CopyValues | 变换与输入一起保留；只读查看或明确复制 |
+| RestoredBox | Original、WasClipped | 可空原图框与是否发生内容裁剪 |
+
+这些是教学项目自有API，不是ONNX Runtime或某个YOLO包装库的接口。Values是ReadOnlySpan，不能把它当OrtValue；如何创建实际运行时输入、执行会话和Dispose会在固定模型后编译验证。[ONNX Runtime C#官方入门](https://onnxruntime.ai/docs/tutorials/csharp/basic_csharp.html)
+
+## 2. 创建BGR缓冲，不借相机的临时内存
+
+```csharp
+Bgr24Image image = Bgr24Image.Create(2, 1, 8,
+    new byte[] { 0, 0, 255, 255, 0, 0, 77, 77 });
+```
+
+两个像素分别为红和蓝，最后77、77只是行填充。Create验证尺寸、正stride及完整缓冲长度，再ToArray深复制，所以调用方后来覆盖原byte数组不会改变image。
+
+图像宽高每边1..8192，像素总量不超过16,777,216，完整缓冲不超过64MiB，stride至少width×3。缓冲必须恰好stride×height；不悄悄忽略尾部，也不接受缺失最后一行padding。负stride、Mono8、Bayer和BGRA需要另做明确转换，本入口不猜测。
+
+这是普通托管像素数组，不持有Mat、BitmapSource、相机SDK指针或文件流，无需Dispose。不代表可以无限保存图像；同时保留很多自有副本仍会占内存。
+
+## 3. 创建变换，先看尺寸而不是先分配数组
+
+```csharp
+LetterboxTransform transform = LetterboxTransform.Create(
+    width: 2, height: 1,
+    region: new ImageRegion(0, 0, 2, 1),
+    inputWidth: 4, inputHeight: 4);
+PreparedInput input = ImagePreprocessor.Prepare(image, transform);
+```
+
+结果内容尺寸4×2，左/上/右/下padding为0/1/0/1，Shape=[1,3,4,4]。ROI必须完整包含在原图中，不能是零面积；坐标加宽高用long检查以防溢出，不能用整数溢出绕过边界。
+
+输入画布每边1..2048，最大float数组3×2048×2048，约48MiB。这只是单次主数组上限，不含输入复制、CopyValues、GC待回收对象或并发请求。示例没有缓冲池、并发调度或吞吐承诺。
+
+Prepare核对image尺寸与transform的源尺寸相等，但无法核对真实帧身份；不同内容、相同尺寸的图并不会被认为“非法”。调用方要保留对应关系，不可把尺寸检查当同帧资格证明。
+
+## 4. 保留完整变换，避免后处理重算
+
+构造内部关键计算：
+
+```csharp
+double ratio = Math.Min((double)inputWidth / region.Width,
+                        (double)inputHeight / region.Height);
+IdealScale = allowUpscale ? ratio : Math.Min(ratio, 1);
+ResizedWidth = Math.Max(1, (int)Math.Round(region.Width * IdealScale,
+    MidpointRounding.ToEven));
+ResizedHeight = Math.Max(1, (int)Math.Round(region.Height * IdealScale,
+    MidpointRounding.ToEven));
+PadLeft = (inputWidth - ResizedWidth) / 2;
+PadTop = (inputHeight - ResizedHeight) / 2;
+```
+
+ToEven在中点取最近偶数，不等于所有人的日常“四舍五入”，例如2.5→2、3.5→4。这里显式指定，不能在另外的语言/库里随手换成AwayFromZero。[Math.Round官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.math.round?view=net-10.0)
+
+本例ScaleX与ScaleY来自已取整的内容宽高，用于本例的栅格边界几何。参考模型若使用理想统一ratio的标签/输出语义，需要明确替换或适配并对照，不能只因为这个类名叫Letterbox就直接复用。
+
+## 5. 实际插值顺序
+
+Prepare先分配连续float数组，整块填padding/255f，再遍历缩放内容。每个目标像素计算源采样中心：
+
+```csharp
+double sx = Math.Clamp((x + .5) / transform.ScaleX - .5,
+    0, transform.Region.Width - 1);
+int x0 = (int)Math.Floor(sx);
+int x1 = Math.Min(x0 + 1, transform.Region.Width - 1);
+double fx = sx - x0;
+```
+
+Y同理。先将采样点夹到ROI边界内，再加ROI原点读取原图，保证缩放小ROI时不会借到外面相邻工件的颜色。x1/y1等于边缘时自然复制边缘，不读取行padding。
+
+```csharp
+double top = (1 - fx) * Pixel(x0, y0, bgr) + fx * Pixel(x1, y0, bgr);
+double bottom = (1 - fx) * Pixel(x0, y1, bgr) + fx * Pixel(x1, y1, bgr);
+byte resized = (byte)Math.Clamp(Math.Round((1 - fy) * top + fy * bottom,
+    MidpointRounding.ToEven), 0, 255);
+```
+
+这是独立C#的double双线性、复制边缘、ToEven字节量化策略，不执行Cv2.Resize，也不宣称其内部取整与OpenCV逐位相同。它适合把步骤展开理解；真实部署先对照参考图/张量，再决定采用哪个库及规则。
+
+## 6. 写入NCHW：RGB换序与索引一起核对
+
+```csharp
+int bgr = 2 - rgb;
+int index = rgb * plane +
+    (y + transform.PadTop) * transform.InputWidth +
+    x + transform.PadLeft;
+values[index] = resized / 255f;
+```
+
+plane=InputWidth×InputHeight；rgb为0时读取BGR通道2，即红，写第一个平面。padding已经提前以相同数值范围写好，不再重复除255。Shape只描述[1,3,H,W]，改变Shape不会自动重排Values。
+
+通过Get(rgbChannel,y,x)读取局部值，Values只读查看连续数据；CopyValues()明确创建新可写数组，修改它不会影响PreparedInput。Shape也用只读数组包装。Prepare运行时图像/变换不可变，输出不借调用方byte缓冲，不需要本地句柄释放。
+
+这不保证调用者通过低级内存手段修改底层存储仍安全，也没有把复制成本消除。后续固定运行时后，输入缓冲的保留期限、复用和Dispose必须随真实API明确，而不是先做无证据的零拷贝优化。
+
+## 7. demo中的张量可逐项手算
+
+红/蓝两像素放大成4×2，再上下各填1行。demo实际输出R平面：
+
+```text
+0.4471 0.4471 0.4471 0.4471
+1.0000 0.7490 0.2510 0.0000
+1.0000 0.7490 0.2510 0.0000
+0.4471 0.4471 0.4471 0.4471
+```
+
+中间两行的G全0，B为0、0.2510、0.7490、1。因为中间采样权重分别为0.25/0.75，191.25和63.75按本例规则成为191与64，再除255。padding三平面都为114/255，不是图中额外的绿色目标。
+
+检查另有“红绿/蓝白”2×2完整黄金数组、二维四邻域插值及黑白缩小中点。黑白平均127.5取字节128后归一化，与直接float0.5并非完全相同，这就是必须固定取整位置的原因。
+
+## 8. 框正向变换：输入原图全局坐标
+
+```csharp
+LetterboxTransform roi = LetterboxTransform.Create(640, 480,
+    new ImageRegion(100, 50, 320, 200), 640, 640);
+Box original = new(120, 70, 220, 120);
+Box network = roi.ToInput(original); // (40,160,240,260)
+RestoredBox restored = roi.Restore(network);
+```
+
+ToInput验证原图框有限、正面积、位于当前ROI中，再做“减ROI原点→乘实际比例→加padding”。输入是原图全局xyxy，不是ROI局部坐标；该框宽高按面积边界计算，无+1。
+
+同一Box类型在两条方法中有不同空间语义，所以参数命名、注释和调用顺序很重要。当前未做通用坐标类型体系，先保持接口小而明确；不要在字段名为Box的地方默认所有坐标都可互换。
+
+## 9. Restore先裁内容，再还原
+
+Restore要求已解码的网络画布xyxy，允许框跨出画布，但有限、端点有序且各坐标绝对值不超过1,000,000；这是本例算术边界，不是模型输出规范。输入为NaN、颠倒或零宽时直接拒绝，不交换/补零。
+
+先与[left,top,left+resizedW,top+resizedH]求交：
+
+- 完全落在padding、画布外或只有边接触：Original=null、WasClipped=true。
+- 部分重叠：明确裁剪后还原，WasClipped=true。
+- 完整位于内容：保留几何，WasClipped=false。
+
+```csharp
+originalX = (inputX - PadLeft) / ScaleX + Region.X;
+originalY = (inputY - PadTop) / ScaleY + Region.Y;
+```
+
+还原后约束数值舍入在ROI边界内，并再次验证正面积；极小框在加ROI原点后若丢失可表示宽度，会明确失败，不发布退化框。null表示没有内容交集，不能补成(0,0,0,0)加入检测评价。
+
+本例ROI中输入(-20,100,100,200)被裁为(0,120,100,200)，还原成(100,50,150,90)。输入(0,0,20,20)完全在顶部padding，无原图框。两者均实际检查；几何裁剪不授予目标发布或产品OK/NG资格。
+
+## 10. 检查证据与下一批
+
+新增76项包括：stride/颜色/完整黄金数组、行padding不入张量、自有输入和独立输出副本、双线性及ToEven量化、奇数padding/禁止放大/薄图/矩形画布、ROI采样隔离、独立正反黄金坐标、padding空交集/部分裁剪、实际比例差别、尺寸/溢出/非法框与退化还原拒绝。其中一项包含36个不同尺寸/画布的往返，不能当36个真实模型案例。
+
+既有69项评价检查仍通过。没有文件图像编解码、参考库逐像素兼容、模型输入对照、原生推理、NMS、GPU、WPF人工操作、相机或现场准确性/速度验收。
+
+第三批继续读[YOLOX-Nano固定模型与CPU契约](/knowledge/industrial/host-computer/yolo/yolox-nano-model-contract-and-cpu-runtime/)及 [C# ONNX Runtime会话、OrtValue与释放](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)。真实产物采用不同BGR/填充约定，另建模型专属输入，不直接沿用本批教学策略；先完成真实原始推理与数值对照，框解码/后处理继续分批。

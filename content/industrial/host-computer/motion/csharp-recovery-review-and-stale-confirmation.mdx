@@ -1,0 +1,172 @@
+---
+id: industrial-csharp-recovery-review
+title: C# 恢复复核：停止证据、工件处置与过期确认
+description: 对照雷赛停止与状态接口，以59项离线检查实现恢复证据摘要、显式复核、依据版本变化和过期确认失效，不自动续走或补拍。
+tags: [工业自动化, C#, 雷赛, 故障恢复, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 180
+prerequisite: [industrial-e3032-process-recovery]
+related: [industrial-csharp-e3032-motion-observation, industrial-csharp-e3032-positioning-cycle, industrial-csharp-trigger-frame-evidence]
+---
+
+## 运行入口：只复核，不执行恢复动作
+
+沿用 `examples/industrial-motion/` 新增 `RecoveryReview.cs`、`RecoveryChecks.cs`，无新依赖、后台线程或界面。它记录外部已归一化的复核摘要，不实现自动流程引擎。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --recovery-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --recovery-demo
+```
+
+59项检查为纯状态/值检查，不调用SDK，不发送停止、清错、回零、使能、运动或触发，也不生成新计划。既有WPF、单轴模拟、定位工步与单拍对象没有被这个复核对象自动驱动。
+
+SDK说明核对[官方固定EtherCAT手册](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)时，以正文V2.0的9.7和9.16节为准。下方SDK调用形态**未针对用户配套LTDMC.cs编译或执行**。
+
+## 1. 停止、状态、诊断分别怎样查用
+
+| API | 参数/返回契约 | 本篇用途 |
+| --- | --- | --- |
+| `dmc_stop` | Card、axis、stop_mode；返回错误码 | 单轴/PVT请求停止，不等于机械已停 |
+| `dmc_stop_multicoor` | Card、Crd、stop_mode；返回错误码 | 基本插补请求组停止 |
+| `dmc_emg_stop` | Card；返回错误码 | 卡级广范围动作，不在本示例调用 |
+| `dmc_check_done` | 0运行、1停止 | 单轴/PVT状态，不是0成功 |
+| `dmc_check_done_multicoor` | 0使用中、1正常停止 | 插补状态，不直接映射为资源已交接 |
+| `dmc_read_current_speed_unit` / `dmc_read_vector_speed_unit` | 错误码与ref double速度 | 轴/合速度；单次0读数不是完整停止证据 |
+| `dmc_get_stop_reason` | 错误码与ref int原因 | 保留本次及原始诊断上下文 |
+| `dmc_clear_stop_reason` | 返回错误码 | 只清停止原因，不修复机械或故障源；本示例不调用 |
+
+`dmc_conti_pause_list/start_list`属于固定手册9.7节不适用于E1000/E3000的连续插补范围，本课不拿它实现E3032恢复。停止与资源核对采用对应基本模式接口，不借共享头文件跳过型号边界。
+
+## 2. SDK调用形态：请求与观察不要混成成功
+
+下面是插补停止请求形态；只应由独占所有者在审核后的停止流程中调用，不放在UI状态刷新里反复发送：
+
+```csharp
+// SDK形态，未编译/执行。仅表示一次审核后的组停止尝试。
+short stopRc = LTDMC.dmc_stop_multicoor(card, reviewedCoordinate, 0);
+// 保存尝试时间和stopRc。0不表示机械停止，非0也不自动解释为“肯定未停止”。
+// 不在这里继续调用原目标或自动清错。
+```
+
+单轴/PVT独立动作应使用`dmc_stop(card,reviewedAxis,0)`，不是把某一个轴停止当成整组已停。卡级停止影响的其他轴和IO责任也需单独评估，不能作为通用catch收尾。
+
+观察层继续检查状态和有效性，SDK状态读数不直接成为完整复核事实：
+
+```csharp
+// SDK形态，未编译/执行；在独占采样层使用，不在UI线程忙等。
+short state = LTDMC.dmc_check_done_multicoor(card, reviewedCoordinate);
+bool sdkCoordinateStopped = state switch
+{
+    0 => false,
+    1 => true,
+    _ => throw new InvalidOperationException($"Unexpected coordinate state: {state}")
+};
+
+int reason = 0;
+short rc = LTDMC.dmc_get_stop_reason(card, reviewedAxis, ref reason);
+if (rc != 0) throw new InvalidOperationException($"Stop reason read failed: {rc}");
+// 保留reason原值。13/14是命令立即/减速停止，不是目标完成。
+// 还要采集相关轴、反馈/速度、报警、参考与资源状态，并按设备判据归一化。
+```
+
+读取失败时外层使证据失效，不使用上一次读数继续确认。停止请求、动作完成和恢复前复核是三个不同流程；既有[动作观察器](/knowledge/industrial/host-computer/motion/csharp-e3032-motion-observation/)仅承担其声明的观察范围，不自动成为真实组停止/安全判据。
+
+## 3. 九项事实是应用摘要，不是卡寄存器
+
+`RecoveryFact`用九个位表达外部已确认的事实，`AllRequired`为这九位的并集。未确认或未知的项不置位；不把SDK bitmask直接强制转换进来。
+
+| 值 | 意义 |
+| --- | --- |
+| `AxesObservedStopped` | 相关轴满足外部停止/稳定证据契约 |
+| `CoordinateReleased` | 旧任务/坐标系资源满足交接条件，不仅是done=1 |
+| `FaultsReviewed` | 故障源、诊断和处置已复核 |
+| `ReferenceConfirmed` | 当前参考与坐标契约已确认 |
+| `TriggerQuiescent` | 旧触发链已受控，不能继续无意产生旧事件 |
+| `ShotReconciled` | 已发生/可能发生的拍摄及其工件处置已对账 |
+| `WorkpieceAccounted` | 标签与实物去向已核对 |
+| `OutputsReviewed` | 输出按负载规程处理，不是统一全OFF |
+| `OwnersExclusive` | 资源所有者和手动/自动交接明确 |
+
+工具并不采集、证明这些事实。原生SDK、PLC、相机和现场程序需要先建立各自证据，过期或失效就撤销对应项或整帧有效性。不得把一个条件为true复制成其他条件。
+
+## 4. 旧运行、当前摘要与复核记录分开
+
+| 对象/成员 | 用途 |
+| --- | --- |
+| `InterruptedRun` | 旧RunId、工件标签及当时动作/拍摄可能已发生的历史 |
+| `RecoveryFrame` | 当前连接代、配置/参考修订、工件、事实集合、处置决定、有效性和时间 |
+| `RecoveryReview.Update` | 接收一个新摘要，必要时更换复核依据Key并撤销当前确认 |
+| `Read(now)` | 在使用时检查时效，返回缺项、处置及是否可提供新计划复核 |
+| `AcknowledgeForNewPlanReview` | 对匹配且仍有效的依据记录一次显式确认 |
+| `Invalidate` | 清除当前复核状态，不停止设备、不修改输出 |
+| `LastAcknowledgement` | 最后一条复核历史，不是当前许可或持久化审计日志 |
+
+`RetainForNewPlan`记录旧工件保留供新计划审核；`RemovedOrQuarantined`记录旧工件已移除/隔离；`Unresolved`不能提供新计划复核。选择枚举不会自动移动工件或创建下一工件任务。
+
+工件字符串、连接代和修订号都是调用者提供的归一化信息，不是实物识别、硬件证明或设备事务ID。配置/参考修订号非零也不等于当前有效，事实集合仍需独立确认。
+
+## 5. 最小可运行的复核形态
+
+```csharp
+var original = new InterruptedRun(Guid.NewGuid(), "part-A",
+    MotionMayHaveExecuted: true, ShotMayHaveOccurred: true);
+var review = new RecoveryReview(original);
+
+var frame = new RecoveryFrame(
+    SampledAt: .1, ConnectionEpoch: Guid.NewGuid(),
+    ConfigurationRevision: 1, ReferenceRevision: 1, Workpiece: "part-A",
+    Facts: RecoveryReview.AllRequired, // 夹具直接声明，不代表真实设备已满足。
+    Disposition: WorkpieceDisposition.RetainForNewPlan);
+review.Update(frame, now: .1);
+
+RecoveryView view = review.Read(now: .1);
+bool recorded = view.Key.HasValue &&
+    review.AcknowledgeForNewPlanReview(view.Key.Value, now: .11);
+// recorded=true只表示这次显式复核已记录。
+// 没有Resume、Start、Enable、Home、Trigger或新计划生成调用。
+```
+
+若`ShotReconciled`缺失，即使其他项全有，仍只返回缺项；不会自行补拍或把旧Unknown改成NotExecuted。所有测试中的事实都是虚构输入，不是该模型完成了原生停止验收。
+
+## 6. Key解决哪种过期确认问题
+
+复核Key包含实例标识和当前实质依据标识，仅用于本进程内关联。另一实例、旧连接/配置/参考、旧工件处置或变化前事实的Key不能确认当前摘要。它不是鉴权令牌、安全许可，也不是设备命令ID。
+
+更新时比较除SampledAt以外的完整摘要：连接代、配置/参考修订、事实、工件处置等任一实质项变化，就生成新Key并撤销当前确认。即使先缺项、再恢复成原值，也要重新确认，不能复用变化前的Key。
+
+同一实质依据在连续有效的新采样中保持时，Key不变，避免正常刷新让复核永远失效。但如果旧摘要到新摘要之间已经有超时缺口，即使数值未变，也更换Key，不把恢复后的新采样当成中间一直健康。
+
+```csharp
+RecoveryReviewKey oldKey = review.Read(.12).Key!.Value;
+review.Update(frame with { SampledAt = .2, ReferenceRevision = 2 }, now: .2);
+bool acceptedOldConfirmation = review.AcknowledgeForNewPlanReview(oldKey, now: .21);
+// false：新的参考依据需要重新复核；历史记录仍可保留。
+```
+
+这段没有实现UI。实际界面必须把操作者看到的Key带回，而不是点击时偷偷替换为最新Key。方法被调用也不能证明操作者资质或真正完成人工核对，本轮不新增账号/权限系统。
+
+## 7. 时间和数据质量怎样失效
+
+默认最大年龄0.25s，仅为教学策略。使用同一主机单调时钟；now不倒退，源摘要时间严格递增且不在未来。NaN/Infinity、质量无效、工件不匹配、空连接代、零修订号、未知位或非法枚举都会清掉当前摘要和确认。
+
+多源汇总时，SampledAt应保守反映所依赖证据的时间，例如最早相关源采样时间；各事实先由上游按其时效维护。不能只更新汇总对象时间、把旧锁存/旧位置/旧工件结论一起伪装成新证据。顺序读取不自动成为原子现场快照，离散采样也不证明采样间机械连续稳定。
+
+`Read`和确认调用都再次查年龄。显示时可复核、点击时已过期，就拒绝该确认。没有持续调用时，也不会在真实时间中自主运行；UI/进程卡死后本对象不提供独立看门狗或设备停止保证。
+
+## 8. 复核历史不能当新动作许可
+
+失效后`LastAcknowledgement`可以继续保留，供查看当时用了什么依据；`CurrentReviewAcknowledged`已经清除。新采样和新Key不会自动继承确认，必须另行显式记录。
+
+相同依据连续保持时，历史中保存的是最初确认时的摘要，当前视图反映后续新摘要的维护状态；两者不是同一份时间戳。`LastAcknowledgement`只保存最后一条，不是完整事件日志、数据库或掉电恢复机制。
+
+新计划的几何、速度、工件策略、参考、互锁、当前资源和动作身份仍需独立审核，派发前再次确认条件。本对象没有提交API，所以它既不会续走旧轨迹，也不会自动启动新计划。只关闭旧工件记录、不准备任何新计划的流程，应按自己的审计责任处理，不靠伪造九项事实来通过这里的复核。
+
+## 9. 59项离线检查与未完成范围
+
+检查覆盖：九项分别缺失、未决定工件处置、完整依据不自动确认、显式一次确认、重复/外来Key、连续同值更新、连接/配置/参考/处置/事实变化、无效数据、旧UI过期、时效边界与缺口、跨实例隔离、历史保留及输入恢复不自动确认。
+
+没有验证真实停止/制动、原生阻塞或取消、故障复位、重新回零、空间避障、工件实际去向、相机残留事件、操作员流程、安全回路或持久化审计，也没有实现新计划派发。WPF只按既有范围编译，不声明已做恢复窗口人工验收。
+
+继续读[PLC与雷赛运动任务交接](/knowledge/industrial/host-computer/motion/plc-and-leadshine-motion-task-handoff/)和 [C#一次意图与结果关联](/knowledge/industrial/host-computer/motion/csharp-plc-motion-task-handoff/)，在既有通信/命令握手基础上明确执行所有者、状态回报和恢复边界。复核对象没有被新交接模型自动用来解锁或派发；机械臂按具体控制器再扩展。

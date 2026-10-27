@@ -1,0 +1,151 @@
+---
+id: industrial-csharp-mono8-buffer-lifetime
+title: C# 图像采集基础：Mono8回放、行跨度、ROI与缓冲释放
+description: 用原创P2灰度图和纯.NET离线源演示Open、Acquire、复制、Close、Dispose，验证图像行布局、资源归还和跨会话旧租约隔离。
+tags: [工业自动化, C#, 机器视觉, 图像缓冲, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 10
+prerequisite: [industrial-vision-imaging-foundations]
+related: [industrial-csharp-trigger-frame-evidence, industrial-csharp-robot-task-session]
+---
+
+## 运行入口与实现边界
+
+`examples/industrial-vision/`是独立.NET 10控制台项目，无第三方包、相机驱动、原生库或网络。它真实读取仓库中的P2灰度文件，但采集对象是教学回放源，不是任何厂商SDK。
+
+```powershell
+dotnet build examples/industrial-vision/IndustrialVision.csproj -c Release
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --demo
+```
+
+新增63项离线检查，demo输出全图均值51.3125和阈值计数5。没有真实相机枚举/连接、曝光设置、硬触发、算法准确率或WPF验收。
+
+## 1. 先认识这几个C#对象
+
+| 对象 | 常用属性/方法 | 作用 |
+| --- | --- | --- |
+| PlainPgm | Parse、LoadFixture | 读取限定P2格式 |
+| Mono8Image | Width、Height、GetPixel、CopyPixels、Crop、Measure | 自有、紧凑、只读语义的托管图像 |
+| OfflineFrameSource | Open、Acquire、Close、Dispose | 同步单调用者回放源 |
+| FrameLease | Stamp、Width、Height、Stride、CopyToOwned、Dispose | 一次借用缓冲的生命周期 |
+| OwnedFrame | Stamp、Image | 保留身份与深复制后的图像 |
+| PixelRoi / PixelStatistics | 区域、均值、范围和计数 | 像素坐标和诊断统计 |
+
+这些都是本项目类型。相机通用路线意味着先明确相同职责，不意味着所有SDK都有这些名字、签名或关闭行为。这里的Acquire只同步复制固定夹具到内存，不等待曝光或网络图像。
+
+## 2. P2为什么适合第一份可复算图像
+
+夹具位于`fixtures/contrast-target.pgm`，构建时复制到输出目录。P2是可直接读文本的灰度图形式，具有尺寸、最大值和逐像素数字；规范中还有二进制P5等形式。[Netpbm PGM规范](https://netpbm.sourceforge.net/doc/pgm.html)
+
+本阅读器刻意只支持：单张P2、maxval=255、精确像素数量、空白与行注释。不是完整PGM解码器，不支持P5、16位、PNG/JPEG/BMP或自动亮度缩放。
+
+```text
+P2
+# 本课原创合成图，不是标定照片
+8 6
+255
+... 后面是48个0到255之间的整数 ...
+```
+
+Parse检查尺寸、像素范围和数量，拒绝缺像素、额外像素及不支持的maxval。文本长度上限1,048,576字符、图像上限1,048,576像素是教学资源限制，不是工业相机能力。固定文件载入前还检查文件长度；CLI没有任意文件路径或硬件模式。
+
+PGM的像素值也不自动等于物理光强或线性辐射量，本项目不执行gamma或颜色管理；均值仅按数值样本计算。
+
+## 3. 打开、获取、复制、关闭的正常顺序
+
+```csharp
+Mono8Image fixture = PlainPgm.LoadFixture();
+using OfflineFrameSource source = new([fixture]);
+source.Open();
+
+OwnedFrame frame;
+using (FrameLease lease = source.Acquire())
+{
+    frame = lease.CopyToOwned();
+}
+
+source.Close();
+byte value = frame.Image.GetPixel(1, 1); // 220，已复制图不依赖源缓冲。
+```
+
+Open建立新的本地Session并重置帧计数，重复Open会拒绝；Acquire前必须打开，且上一租约已归还。每次获取会使用同一个内部缓冲，填入下一个夹具并给出新FrameStamp。
+
+FrameLease.Dispose归还一次租约，可以重复调用。Close使源关闭并撤销借用；Dispose还使源不能再打开。已经CopyToOwned的图像则仍可使用，因为它持有自己的托管byte数组。
+
+这里不是“Close一定让所有SDK结果失效”的通用结论。真实SDK的结果可能独立持有缓冲。本模型刻意采用更窄的关闭策略，帮助检查旧租约和新会话的隔离；不能拿它冒充厂商兼容性测试。
+
+## 4. 不复制就跨作用域会发生什么
+
+这个回放源不暴露原始指针或可逃逸的源byte数组，只允许有效租约调用CopyToOwned。租约Dispose、源Close或换会话后，再复制都会拒绝；这样测试能明确捕捉过期使用。
+
+真实SDK如果返回指针或数组引用，你的程序可能仍能访问那段地址，但数据已允许复用。错误未必立刻异常，也可能偶发地读到下一帧。不要把“程序没崩溃”当作所有权正确。
+
+若多线程消费者共享SDK结果，应查清引用计数、克隆、回调和Dispose责任；若复制，则计算额外带宽/分配成本。本项目选择深复制和单调用者，不实现SDK引用计数克隆、并发共享或零拷贝优化。
+
+OwnedFrame中的Mono8Image没有Dispose，因为只持有普通托管数组，没有原生资源。它不代表未来的Mat、HObject或SDK图像也可只等GC处理。
+
+## 5. CopyFromBuffer怎样处理stride
+
+```csharp
+byte[] raw = [1, 2, 3, 238, 238, 4, 5, 6];
+Mono8Image image = Mono8Image.CopyFromBuffer(
+    width: 3, height: 2, stride: 5, source: raw,
+    encoding: PixelEncoding.Mono8, complete: true);
+
+// image.CopyPixels() == [1,2,3,4,5,6]。
+```
+
+最低所需字节按`(height-1) × stride + width`检查，最后一行不要求额外padding存在。按行复制width个有效字节，得到紧凑图，输入中的padding或尾随区域不进入像素。
+
+尺寸和跨度验证使用宽整数算术，防止乘法/边界回绕。stride必须为正且不少于width；Unknown、Mono12Packed、BayerRG8及未定义格式全部拒绝，不把它们重贴Mono8标签。
+
+complete默认false，必须由外部明确声明图像完整。它不是由数组长度推断的质量，也没有验证相机传输、CRC或Chunk。本批既不解Packed，也不处理负pitch/上下翻转、多平面或压缩载荷。
+
+## 6. 像素与ROI的坐标约定
+
+图像使用`x=列、y=行`，左上为本项目(0,0)，x向右、y向下。合法范围为`0 ≤ x < Width`和`0 ≤ y < Height`。这与机器人/机械坐标不是同一套单位或轴方向。
+
+```csharp
+PixelRoi roi = new(X: 1, Y: 1, Width: 2, Height: 2);
+ImageCrop cropped = fixture.Crop(roi);
+PixelStatistics stats = fixture.Measure(roi, threshold: 200);
+// stats.Count=4，Mean=220，AtOrAboveThreshold=4。
+// cropped.Image.GetPixel(0,0)对应原图的(1,1)。
+```
+
+ROI必须非空且完全在图内；越界不会被静默裁掉。Crop是深复制，不是共享原图的视图，SourceRegion保留相对直接父图的位置。多次裁剪时，完整原图坐标偏移需调用者逐级组合，类不会自动追踪全部祖先。
+
+软件Crop与相机传感器ROI不同：本批先取得完整夹具再复制局部，不会减少真实曝光、传输带宽或读出时间。具体库中ROI/子矩阵也可能共享内存，不能用本类行为推断Mat或其他图像对象的所有权。
+
+## 7. Measure的统计能证明什么
+
+Measure返回区域、像素数、最小/最大、均值、`>=threshold`计数及恰为0/255的像素数。全图48个值之和2463，所以均值`2463/48 = 51.3125`；阈值200时有4个220与1个255，共5个像素。
+
+这些是可复算诊断，不是连通域、缺陷检测或质量判定。255可能是自然明亮区域，也可能涉及饱和；黑像素同理。某一ROI均值正常，也可能掩盖局部模糊、反光或缺陷，不能用统计替代真实样本验收。
+
+阈值是byte，含等号，0会统计全部样本。没有自动曝光、直方图均衡、颜色转换、形态学或测量标定，后续进入算法章节再单独建立任务。
+
+## 8. 为什么帧号要带Session
+
+本地FrameStamp含Session与Number。Open建立新Session，Number从1分配；重开后又出现1不是同一帧。旧租约归还时还核对自己的租约身份，不能误把新会话的缓冲归还。
+
+这些Guid/帧号只由离线源生成，不是相机序列号、设备BlockId、触发计数或工件身份。OwnedFrame也没有真实曝光时间/采集质量/配方，不能直接进入工件自动判定。
+
+后续通用采集会话会补充这些关联和时效边界；与[运动触发证据](/knowledge/industrial/host-computer/motion/csharp-trigger-and-frame-evidence/)及[机器人任务身份](/knowledge/industrial/host-computer/motion/csharp-robot-task-session-and-results/)衔接时，不按“到达顺序”猜配对。
+
+## 9. 异常、释放与能力边界
+
+处理异常仍需归还借用结果，因此示例用using而不是成功路径末尾才Dispose。不归还时，本源下一次Acquire会直接拒绝；真实SDK可能表现为池耗尽、超时或丢帧，不能要求都抛同一种异常。
+
+关闭、再打开或取消业务，都不自动产生新图像或补拍。此类无后台任务、异步IO、等待期限、硬件中断或退出线程；没有回调竞态、GC压力、长期运行、并发队列或端到端吞吐验收。
+
+Open/Acquire/Close/Dispose演示的是本地对象生命周期，不是相机已经连通。真实相机接入要先按实际SDK核对设备选择、参数读写、Start/Stop、收帧、转换与资源生命周期；用户未选品牌，本课程保持通用，不造“所有相机都适用”的API。
+
+## 10. 63项检查与后续
+
+检查覆盖固定图像读入和手算统计、ROI及坐标边界、数组隔离、stride/padding、截断与不支持格式、P2数量/范围、单借用约束、重复释放、处理异常释放、缓冲复用后旧图不变、Close失效、重开新会话及旧租约不影响新租约。
+
+本篇没有真实图像检测效果、光源/镜头选型、相机SDK、软/硬触发、设备时间戳、标定、WPF、HALCON/OpenCvSharp/YOLO依赖。接着读[通用采集会话与触发身份](/knowledge/industrial/host-computer/vision/acquisition-sessions-triggers-and-frame-identity/)及 [C#单拍关联](/knowledge/industrial/host-computer/vision/csharp-single-capture-session-and-frame-correlation/)，图像处理和显示按后续阶段逐步接入。

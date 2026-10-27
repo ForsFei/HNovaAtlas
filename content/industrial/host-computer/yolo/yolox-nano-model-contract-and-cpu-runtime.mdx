@@ -1,0 +1,121 @@
+---
+id: industrial-yolo-onnx-contract
+title: YOLOX-Nano部署基础：模型产物、输入契约与CPU推理
+description: 固定官方YOLOX-Nano ONNX文件和哈希，对照BGR数值范围、输入输出元数据及运行配置，区分真实原始推理、后处理和检测质量，并用Python参考验证数值链路。
+tags: [工业自动化, YOLOX, ONNX, ONNX Runtime, 模型契约]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 40
+prerequisite: [industrial-csharp-yolo-preprocessing]
+related: [industrial-csharp-yolo-onnx-session, industrial-yolo-foundations]
+---
+
+## 本批位置：第一次执行真实模型
+
+本批不再只做手写预测或像素算术：独立examples/industrial-yolo-onnx/实际加载官方YOLOX-Nano ONNX，使用ONNX Runtime1.27.0在Windows x64/CPU执行。新增31项托管契约检查与17项真实CPU检查；完整301,665个原始浮点值与Python参考对照，本机最大绝对误差0。
+
+但“图执行成功”还不是“检测功能完成”。本次输入是自有渐变像素，没有真实物体标注；没有解码、NMS、留图、WPF或现场质量评价。下一批才把该模型的原始输出转换为候选和检测框。
+
+## 1. 为什么选一个明确产物，而不是泛称YOLO
+
+YOLO系列不是只有一个厂商或一个输出格式。本轮选择官方已有ONNX发布、体积较小的YOLOX-Nano作为运行时教学产物，不追求“版本号最新”，也不替用户决定最终生产模型。后续接入Ultralytics或自训模型时，需要另行固定其输入、输出与适用许可，不能仅换文件名。
+
+官方[ONNX Runtime示例与发布入口](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/demo/ONNXRuntime/README.md)列出Nano的416×416配置。本轮使用其0.1.1rc0发布的yolox_nano.onnx，不在用户电脑安装训练框架、转换工具或CUDA。
+
+模型属于通用COCO目标检测路线，不是划痕/凹坑工业缺陷模型。第一批手写夹具的scratch/dent标签表不能拿来解释本模型类别，否则即使框和分数算对，显示名称仍然是错的。
+
+## 2. 本轮固定的产物与实测结构
+
+| 项目 | 固定值或实测值 |
+| --- | --- |
+| 文件来源 | Megvii-BaseDetection/YOLOX，release 0.1.1rc0 |
+| 文件 | yolox_nano.onnx，3,659,407字节 |
+| SHA256 | c789161ed43c8269fcd4e67c67eeeb4e80c622da2eb296a20bc6007bd18a0b7d |
+| 输入节点 | images，float32，[1,3,416,416] |
+| 输出节点 | output，float32，[1,3549,85] |
+| 运行时 | Microsoft.ML.OnnxRuntime/Managed 1.27.0，CPU |
+| 本次配置 | 单线程1/1、顺序执行、禁用图优化 |
+
+尺寸、类型和节点名由实际会话核对，不只来自文件名。输出实际长度是3549×85=301665，不能照搬上一批举例的1×84×8400。
+
+SHA256固定的是本轮读取的字节一致性，不是厂商数字签名，也不能证明模型没有偏差或一定符合商业场景。正式部署应共同保存来源、许可通知、文件哈希、标签顺序、预处理/后处理与运行环境版本。
+
+## 3. 下载与加载必须是两个动作
+
+本例只有显式--fetch-model命令访问网络，推理命令不隐式联网。模型和完整参考文件放在被Git忽略的.local目录，不提交权重到仓库。
+
+下载先限定大小并核对哈希，再写新临时文件、以不覆盖方式移动到目标；已有文件只检查，不悄悄覆盖或换模型。文件不匹配就失败，用户要重新确认来源，而不是临时关闭哈希检查。
+
+加载先从明确路径读出固定长度byte[]，核对这份数据，再把同一份byte[]传给InferenceSession。这样不出现“校验文件A后，文件内容被替换，会话又读取另一份数据”的时序漏洞。这里只加载固定的已核对产物，不提供任意ONNX浏览器；未知模型图也不应当成完全无风险的图片文件处理。
+
+上游项目提供[Apache-2.0许可文本](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/LICENSE)。仓库THIRD_PARTY.md记录来源与通知入口；具体代码、权重、数据和商业使用条件仍需在正式分发前核查，本教程不作法律或采购决定。
+
+## 4. 关键差别：这个模型不使用上一批默认输入
+
+| 约定 | 上一批教学PreparedInput | 本轮YOLOX-Nano适配 |
+| --- | --- | --- |
+| 通道 | RGB | BGR |
+| 数值 | byte/255f，0..1 | float表示原始byte，0..255 |
+| 布局 | NCHW | NCHW |
+| 填充 | 固定画布居中 | 内容放左上，空余在右/下 |
+| 缩放规则 | 自定ToEven/实际栅格比例 | 本批只选r=1，不执行缩放 |
+| 类型 | PreparedInput | 独立YoloXInput，不能直接互传 |
+
+这正是先读模型契约的意义：相同NCHW和float32，并不代表可以共用数组。上一批的代码保持不变，因为它明确是独立教学策略，不是这个权重的兼容层。
+
+官方[preproc实现](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/yolox/data/data_augment.py)在常规路径保留BGR、左上放图、填114并转CHW float32；legacy分支是另一种处理，不能混用。我们没有完整移植该函数，而是先选无需插值的受限输入，使运行时链路可以独立核对。
+
+## 5. 受限r=1输入解决什么，不解决什么
+
+YoloXInput.PrepareNoResize只接受宽416、高1..416的自有BGR24图。画布固定416×416，图从(0,0)放入，下面的行填114；r=1，不换序、不除255。
+
+本轮自有夹具宽416、高208，像素按如下规则生成：
+
+```text
+B = x % 256
+G = y % 256
+R = (x + 2*y) % 256
+```
+
+三个通道不同，便于发现误换序；底部208行填充，便于发现错误居中。对应输入的完整float32字节SHA256为5f598da750eae012350fc7b4b49b154c609104ee2b65a9aa3ac5d51c7c469863，C#与NumPy构建完全相同。
+
+如果传320×240，本例明确拒绝，不自动套上一批的resize。一般图像的缩放、取整、插值、比例与ROI坐标适配仍待后续实现及参考对照。本轮没有“所有图片都能检测”的入口。
+
+## 6. 会话是什么，为什么通常复用
+
+InferenceSession加载并准备执行图；创建会话可能包含解析、图处理、执行计划和内存准备，不应把每帧都新建会话当默认流水线结构。输入与输出OrtValue则通常属于一次Run的局部范围。
+
+本例一个YoloXNanoSession可顺序运行多次，持有实际InferenceSession，最终Dispose。只支持单调用者顺序使用，没有并发Run/Dispose、硬取消或队列；具体线程安全和应用调度要在后续集成中单独设计，不因为库能并行就任意在关闭时释放共享会话。
+
+CPU执行提供器在本项目显式添加，没有GPU路径。线程1/1、顺序与禁用优化是此次参考配置，不是“最快设置”；生产性能需要在固定模型、目标硬件和代表性输入下测量，再决定线程/优化和会话数量。[官方C#接口与生命周期说明](https://onnxruntime.ai/docs/tutorials/csharp/basic_csharp.html)
+
+## 7. 元数据能证明什么
+
+加载后验证只有一个输入images、一个输出output，均为float Tensor，形状分别为[1,3,416,416]和[1,3549,85]。本适配不接受动态维、多输入或其他输出结构，也不从负维/符号维猜实际尺寸。
+
+元数据告诉我们类型和结构，却不会自动解释通道、归一化、坐标和类别名称。该文件的自定义元数据实际为空，不能假设里面一定有names标签表。上述语义来自选定发布与参考代码，再由固定夹具核对。
+
+Run返回后还要检查实际输出类型/形状/元素数量与有限值。初始化时符合结构，不意味着后续所有调用都可以跳过边界检查。失败应保留诊断，而不是返回一个空框数组，让用户误以为“没有缺陷”。
+
+## 8. 原始输出不是最终框
+
+该产物输出每个候选85项，包含定位相关原始量、objectness与类别相关量。官方[ONNX推理入口](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/demo/ONNXRuntime/onnx_inference.py)在session.run之后仍调用demo_postprocess，再组合分数、转换框和执行NMS。
+
+所以output中的前四项不能直接当原图xyxy，也不能直接传给上一批Restore。本批只返回独立托管副本YoloXRawOutput，不生成Prediction，不使用scratch/dent类别，不输出物体数、OK/NG、Precision/Recall或mAP。
+
+下一批会针对这个产物讲解grid/stride与宽高解码、objectness×类别分数、阈值与NMS、网络到源图坐标；先固定一种模型，再讨论如何适配其他YOLO输出，避免写一个含糊的“通用解析器”。
+
+## 9. Python对照是接口验证，不是独立算法验证
+
+可选reference_yolox_nano.py只使用现有NumPy与Python ONNX Runtime，不安装包。它独立构建相同BGR输入，固定CPU、线程与图优化设置，运行同一模型，并写一个新建的无头小端float32原始参考文件。
+
+本机Python ORT1.27.0、NumPy2.5.0；C#与Python输入哈希一致。完整301665项逐项比较，允许absError≤1e-5+1e-4×abs(reference)，本机实际maxAbsError=0。另固定20个输出样点供不安装Python的读者运行native-test；20个样点不是完整输出对照，两个验证范围明确分开。
+
+两种语言调用的是同一个ORT引擎。这能发现输入构建、名称/维度、缓冲读取和API生命周期的问题，不是与PyTorch或另一个引擎独立对照，更不是检测准确率证明。不同硬件/实现路径可能产生小数值差别，不要求输出文件的SHA256处处一致。
+
+## 10. 本批验收与下一步
+
+已验证固定模型实际下载/哈希、锁模式还原/Release编译、31项托管检查、17项真实CPU检查、两个顺序Run、实际错误名称/形状/dtype拒绝，以及20样点和全量Python数值对照。原145项教学评价/预处理仍独立保留。
+
+本批未验收任意尺寸图像预处理、输出解码/NMS、真实照片/标注、工业缺陷质量、WPF/相机、GPU、长期内存或性能。继续阅读[C#会话、OrtValue、Run与释放](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)，第四批已补[网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)，一般图片和现场质量仍分别验收。

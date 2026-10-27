@@ -1,0 +1,243 @@
+---
+id: industrial-opcua-csharp-secure-read-write-subscribe
+title: C# OPC UA 实践：安全连接、读取写入、订阅与关闭
+description: 固定 OPC Foundation SDK 2.0.1，逐项说明 Host、ManagedSession、NodeId、DataValue、WriteValue 和订阅配置，通过本机加密服务验证双向证书信任、读写、通知与释放。
+tags: [工业自动化, OPC UA, C#, 通信, 证书]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 120
+prerequisite: [industrial-opcua-nodes-quality-security]
+related: [industrial-s7netplus-db-read-write, industrial-host-computer-chapter-map, wpf-ui-thread-and-async]
+---
+
+## 复现版本与示例边界
+
+本篇配套 `examples/industrial-opcua/`，运行目标 .NET 10，固定以下依赖，而不是随着教程执行时间自动换成最新版：
+
+```xml
+<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+<PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Client" Version="2.0.1" />
+<PackageReference Include="OPCFoundation.NetStandard.Opc.Ua.Server" Version="2.0.1" />
+```
+
+包元数据记录源码提交 `07e62f72500cc0923a2bab940653c8c1116fa286`。2.0 的宿主、订阅、集合和部分值类型 API 与许多 1.x 教程不同；本篇代码按还原包编译和运行，不混用旧示例。[固定源码](https://github.com/OPCFoundation/UA-.NETStandard/tree/07e62f72500cc0923a2bab940653c8c1116fa286)、[官方入门](https://github.com/OPCFoundation/UA-.NETStandard/blob/07e62f72500cc0923a2bab940653c8c1116fa286/docs/GettingStarted.md)
+
+项目同时启动自己的服务端和客户端，只监听并访问 `127.0.0.1` 临时端口。无需 PLC、UaExpert、Windows 服务或管理员证书导入。命令行不接受外部 Endpoint，避免把教学写入误发到设备。
+
+测试变量为 Temperature=23.5（Double 只读）、Ready=true（Boolean 只读）、Setpoint=25.0（Double，可写0～100）。单位仅是教学约定，本例没有完整工程单位属性、历史、报警、后端 PLC 或实际物理过程。
+
+## 先认识常用对象与所有权
+
+| 对象/类型 | 用途 | 主要成员 |
+| --- | --- | --- |
+| HostApplicationBuilder / IHost | 依赖注入、配置和服务生命周期 | Services、Build、StartAsync、StopAsync、Dispose |
+| OpcUaClientOptions | 客户端应用与安全配置 | ApplicationName、ApplicationUri、PkiRoot、AutoAcceptUntrustedCertificates、LoadConfigurationOnStart、Session |
+| ManagedSessionOptions | 会话和恢复配置 | SessionName、SessionTimeout、CheckDomain、ReconnectPolicy |
+| ManagedSession | 已连接的客户端会话 | Connected、ConfiguredEndpoint、NamespaceUris、ReadValueAsync、WriteAsync、DefaultStreaming、CloseAsync、DisposeAsync |
+| Browser | 浏览引用 | BrowseDirection、ReferenceTypeId、IncludeSubtypes、BrowseAsync |
+| NodeId | 变量或其他节点身份 | Identifier、NamespaceIndex；构造时匹配标识符类型 |
+| DataValue / Variant | 读值及质量/时间；有类型的值容器 | WrappedValue、StatusCode、SourceTimestamp、ServerTimestamp、TryGetValue |
+| WriteValue / WriteResponse | 指定一个属性写入；查看逐项结果 | NodeId、AttributeId、Value；Results |
+| MonitoredItemOptions（V2） | 一项监控的申请参数 | SamplingInterval、QueueSize、DiscardOldest、TimestampsToReturn |
+
+Host 管配置与服务，会话由调用方 `await using`；流枚举器也单独 `await using`。不要等 GC 关闭通道，不要对每个点重新创建一份证书配置。
+
+## 配置应用、发现端点与开启连接
+
+客户端创建位于 `DemoHosts.Client`。下面为同一配置的关键部分；`endpoint` 和 `pki` 由本机示例提供：
+
+```csharp
+builder.Services.AddOpcUa().AddClient(options =>
+{
+    options.ApplicationName = "HNovaOpcUaClient";
+    options.ApplicationUri = "urn:localhost:HNovaOpcUaClient";
+    options.ProductUri = "urn:hnova:opcua:demo";
+    options.PkiRoot = pki;
+    options.AutoAcceptUntrustedCertificates = false;
+    options.LoadConfigurationOnStart = true;
+    options.Session = new ManagedSessionOptions
+    {
+        SessionName = "HNova loopback checks",
+        SessionTimeout = TimeSpan.FromSeconds(30),
+        CheckDomain = true,
+        ReconnectPolicy = new ReconnectPolicyOptions
+        {
+            MaxRetries = 1,
+            MaxTotalReconnectTime = TimeSpan.FromSeconds(5)
+        }
+    };
+}).AddDiscoveryAndConnect(options =>
+{
+    options.DiscoveryUrl = endpoint;
+    options.SecurityMode = MessageSecurityMode.SignAndEncrypt;
+    options.SecurityPolicyUri = SecurityPolicies.Basic256Sha256;
+});
+```
+
+ApplicationUri 是应用身份的一部分，不是 Endpoint URL；PkiRoot 是该应用的专用证书目录。SessionTimeout 是请求的会话超时，不是某次 Read 的总耗时期限，服务端还可能修订它。
+
+特别注意该版本 `MaxRetries=0` 表示无限重试，**不是禁止重试**。本例设1次和5秒恢复预算；对整个测试另设三分钟协作取消令牌。ManagedSession 管连接恢复，不等于它会安全地重放业务写入。本例每次写只调用一次，不增加应用层重发。
+
+已构建并启动的客户端 Host 获取连接委托：
+
+```csharp
+var connect = host.Services
+    .GetRequiredService<Func<CancellationToken, Task<ManagedSession>>>();
+await using ManagedSession session = await connect(ct);
+```
+
+`AddDiscoveryAndConnect` 查找匹配安全要求的端点，`connect` 返回连接的会话；不是先创建一个空对象再假定其 Connected。连接后还核对 ConfiguredEndpoint 的模式和策略。Connected 只描述当前状态，不能替代下一次操作的异常处理。
+
+本机服务端通过 SDK BackgroundService 启动，`host.StartAsync()` 返回不等于 UA 地址空间已经可访问。示例使用服务端 `AddStartupTask` 发出就绪信号，`StartServerAsync` 等待该信号或后台任务失败，再开始连接；不用固定 Sleep 猜启动完成。
+
+## 双向证书信任：先失败，再批准，再成功
+
+本例每次运行生成独立 `.local/<运行编号>/server` 与 `client`，执行三阶段验证：
+
+1. 双方信任库为空，连接必须因安全/证书错误失败。此时首先由服务端拒绝客户端。
+2. 只把本次客户端自己生成的公开证书批准给服务端，再启动新 Host；客户端仍拒绝未受信任的服务端。
+3. 再批准本次服务端自己的公开证书给客户端，重新启动后连接成功。
+
+批准函数只从本次运行中已知对端的 `certs` 目录取 `.der`，核对预期应用名称，打印 SHA256，再复制到己方 `trusted/certs`；不复制 `private`，不批量信任 `rejected`。SDK 可能为不同算法生成多份应用证书，本例批准这批明确由自己创建的证书。
+
+这里的安全前提是“两端均由本程序在隔离目录中创建”，不是凭名称识别现场陌生证书。真正部署需要通过管理员批准和独立渠道核对证书身份/指纹，并管理私钥访问、有效期、更新、链与吊销策略。保持标准验证开启，不用无条件接受回调。
+
+前两个阶段打印 `BadSecurityChecksFailed` / `BadCertificateUntrusted` 的 SDK error 日志是预期负例；只有匹配预期错误才计为通过，网络拒绝、节点不存在或任意异常不能冒充证书测试成功。
+
+## 解析 NodeId 与浏览
+
+不要直接写 `new NodeId("Demo.Temperature", 2)`。本例封装：
+
+```csharp
+int index = session.NamespaceUris.GetIndex(DemoModel.NamespaceUri);
+if (index < 0)
+    throw new InvalidOperationException("Server does not expose the contracted namespace URI.");
+NodeId temperature = new("Demo.Temperature", checked((ushort)index));
+```
+
+示例的 `UaOperations.Resolve(session, "Temperature")` 等价于上面逻辑；不是 SDK 自带的方法。服务端不包含约定 URI 就中止，不退回 ns=2 猜测。
+
+Browser 用向前的层次引用浏览 Demo 文件夹，得到三个变量。生产工具从 Objects 开始逐步探索地址空间时应限制展开规模，不要在 UI 线程无界遍历。底层 Browse/分页和具体节点模型要按接口与服务器限制处理。
+
+## 读取：ReadValueAsync 返回什么、什么时候抛错
+
+```csharp
+DataValue value = await session.ReadValueAsync(temperature, ct);
+double reading = UaOperations.RequireGoodDouble(value);
+Console.WriteLine($"{reading}, {value.StatusCode}");
+Console.WriteLine($"Source={value.SourceTimestamp}; Server={value.ServerTimestamp}");
+```
+
+`RequireGoodDouble` 是配套代码自己的业务检查：
+
+```csharp
+if (!StatusCode.IsGood(value.StatusCode))
+    throw new InvalidDataException($"Unusable quality: {value.StatusCode}");
+if (!value.WrappedValue.TryGetValue(out double number) || !double.IsFinite(number))
+    throw new InvalidDataException("Expected a finite UA Double.");
+```
+
+该 SDK 的便捷 `ReadValueAsync` 遇到 Bad 结果会抛 `ServiceResultException`，Uncertain 仍可能返回，因此既要捕获调用异常，也要检查返回质量。例子读不存在的节点验证 BadNodeIdUnknown，并单独构造 Uncertain 值检查业务层拒绝。
+
+Ready 用 `TryGetValue(out bool ...)` 读取，不通过 `Convert.ToBoolean` 把任意数字转换成状态。这个最小示例仅展示质量、类型和时间戳；尚未实现现场采集心跳、值龄策略或 WPF 画面，不能声称已经保证端到端实时有效性。
+
+2.0 的 DataValue 为不可变值，构造测试数据可用 `new DataValue(new Variant(30.0), StatusCodes.Uncertain)`，不要套用旧教程的 StatusCode 属性赋值写法。
+
+## 写入：正确类型、逐项结果和读回
+
+完整项目中的一次写入：
+
+```csharp
+WriteResponse response = await session.WriteAsync(null, [new WriteValue
+{
+    NodeId = setpoint,
+    AttributeId = Attributes.Value,
+    Value = new DataValue(new Variant(30.0))
+}], ct);
+
+if (response.Results.Count != 1)
+    throw new InvalidDataException("Unexpected write result count.");
+StatusCode result = response.Results[0];
+```
+
+`new Variant(30.0)` 是 Double；`new Variant(30)` 是 Int32，`new Variant("30")` 是 String。不要依赖未知服务端替你转换。示例 `UaOperations.WriteAsync` 只是封装以上单次写入并返回状态，不是另一套 SDK 写接口。
+
+Setpoint 的服务端回调检查有限 Double 和0～100。客户端实际检查：写30返回 Good、订阅收到30、读回30；写只读 Temperature 返回 BadNotWritable，写字符串返回 BadTypeMismatch，写101或NaN返回 BadOutOfRange，拒绝后值仍为30。
+
+Good 和读回一致仍然不表示加热完成。超时/断线时如果无法确定服务端是否已处理，应记录“结果未知”，不能把本地 CancellationToken 当设备回滚，也不能在重连后直接补发动作。
+
+## 订阅：先拿初始值，再验证变化
+
+为避免经典和 V2 同名类型混用，文件显式声明别名：
+
+```csharp
+using MonitoredItemOptions =
+    Opc.Ua.Client.Subscriptions.MonitoredItems.MonitoredItemOptions;
+```
+
+本篇采用短时观察的 Streaming API，不在这一步引入复杂长期监控框架：
+
+```csharp
+using var budget = CancellationTokenSource.CreateLinkedTokenSource(ct);
+budget.CancelAfter(TimeSpan.FromSeconds(10));
+await using var updates = session.DefaultStreaming.SubscribeDataChangesAsync(
+    setpoint,
+    new MonitoredItemOptions
+    {
+        SamplingInterval = TimeSpan.FromMilliseconds(100),
+        QueueSize = 4,
+        DiscardOldest = true,
+        TimestampsToReturn = TimestampsToReturn.Both
+    }, budget.Token).GetAsyncEnumerator(budget.Token);
+
+if (!await updates.MoveNextAsync())
+    throw new InvalidDataException("No initial notification.");
+double initial = UaOperations.RequireGoodDouble(updates.Current.Value);
+```
+
+读取初始25之后才写30；随后循环 MoveNextAsync，只有收到 Good / Double / 30 才通过。十秒预算只是测试等待上限，不是服务端采样性能保证。完整代码在 Program.cs，不能删掉等待初始值的步骤后仍声称测试等价。
+
+QueueSize=4、DiscardOldest=true 适合本次最新值观察，不是事件无损保证。该版本 Streaming 自带有界本地缓冲，慢消费也会丢弃；长期监控可按官方建议使用 V2 回调式订阅管理，单独设计背压和质量快照。[订阅 API 与生命周期](https://github.com/OPCFoundation/UA-.NETStandard/blob/07e62f72500cc0923a2bab940653c8c1116fa286/docs/Subscriptions.md)
+
+## 取消、退订和关闭顺序
+
+先结束并释放枚举器，再关闭会话，然后停止并释放客户端/服务端 Host。额外测试创建第二条流、接收初始值、取消令牌并 await 下一次 MoveNextAsync 的取消结果，避免只调用 Cancel 就丢下后台工作。
+
+```csharp
+await session.CloseAsync(ct);
+// await using 作用域退出时 DisposeAsync 会话
+// finally 中，即使主流程失败也执行：
+await clientHost.StopAsync(CancellationToken.None);
+await serverHost.StopAsync(CancellationToken.None);
+```
+
+主流程有协作预算；清理不复用已取消的工作令牌。SDK 自身远端清理有失败可能，释放本地资源不等于已经确认远端删除成功。测试正常关闭后检查监听端口消失；没有模拟断电、网络分区或远端订阅泄漏。
+
+`await foreach` 正常结束或 `await using` 枚举器退出会移除该监控项；共享 Streaming 订阅可继续服务其他流，最终随会话异步释放。不要把“一个流退出”说成“所有订阅立刻删除”。
+
+WPF 中后续会将通信与界面分开，通知更新后台快照，再由 Dispatcher 交接。不要直接在通知路径阻塞等待 UI、创建无限历史列表，或在关窗时只 Dispose 而不等待任务退出。
+
+## 运行、排错与验收边界
+
+在仓库根目录运行：
+
+```powershell
+dotnet run --project examples/industrial-opcua/IndustrialOpcUa.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-opcua/IndustrialOpcUa.csproj -c Release -- --demo
+```
+
+两种入口运行同一完整本机流程，`--demo` 不是长期监听的独立服务。每次生成新测试证书；`.local` 包含私钥，已加入 Git 忽略，不应截图私钥、上传目录或导入系统根信任库。可在程序完全退出后按明确路径手工清理自己的运行目录。
+
+| 现象 | 先看什么 | 不要做什么 |
+| --- | --- | --- |
+| BadCertificateUntrusted | 是客户端还是服务端拒绝；核对身份/指纹 | 接受所有陌生证书 |
+| 主机名/有效期错误 | URL、证书SAN、Application URI、系统时间 | 关闭域名和时间校验 |
+| BadNodeIdUnknown | URI、索引映射、标识符和服务端模型 | 改成ns=2不断试写 |
+| BadTypeMismatch / BadNotWritable | 实际数据类型、用户与节点访问权限 | 字符串万能转换、改PLC保护 |
+| 没收到通知 | 初始订阅是否建立、质量、数据是否变化、预算 | 当作每100ms必定推送一条 |
+| 服务未就绪/端口占用 | 等待启动信号、启动异常、端口交接 | 固定Sleep、停止别人的服务 |
+
+已通过29项本机检查，涵盖实际回环监听、双向证书拒绝/批准、加密策略、浏览、URI解析、类型/质量/时间戳、写入与订阅、非法写入、未知节点、取消和关闭。临时端口先占用后交给 SDK，存在交接竞态，冲突时直接报错而不占用已有服务。
+
+当前未验收真实PLC/网关、账号权限与凭据轮换、CA/吊销、证书更新、断线后的重订阅、历史/事件或长期WPF运行。继续第5步的 [MC/SLMP设备地址与报文](/knowledge/industrial/host-computer/communication/mc-slmp-frames-and-device-addresses/)和 [C# McpX读写](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)，再进入设备动作握手；不能把本机订阅成功当成所有PLC通信完成。

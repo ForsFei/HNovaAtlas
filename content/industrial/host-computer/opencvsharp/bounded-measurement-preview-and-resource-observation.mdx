@@ -1,0 +1,144 @@
+---
+id: industrial-opencvsharp-bounded-pipeline
+title: 有界处理：测量终态、最新预览与资源观察
+description: 将OpenCvSharp测量放入单消费者有界流水线，区分队列容量与未确认终态、检测任务与可丢预览，解释背压、结果确认、关闭排空和内存采样的边界。
+tags: [工业自动化, OpenCvSharp, Channel, 背压, 资源管理]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 140
+prerequisite: [industrial-opencvsharp-wpf-display, industrial-opencvsharp-stripe-measurement]
+related: [industrial-csharp-opencvsharp-bounded-pipeline, industrial-csharp-inspection-pipeline, industrial-csharp-opencvsharp-wpf-viewer]
+---
+
+## 从单次查看器，走到有接收责任的流水线
+
+上一批WPF查看器允许换图或清空后丢弃旧显示结果，适合离线试验。但如果处理的是已经接收的工位检测任务，界面换图不能成为丢掉检测终态的理由。
+
+这一批保留原有三个按钮，不把查看器直接改造成连续采集程序；新增独立命令示例，在既有WPF项目里复用真实OpenCvSharp测量、冻结位图和输出复核。它使用有界任务账本与Channel，另设最新预览槽，明确“可以替换显示”和“必须交代终态”的区别。
+
+第8步已有通用Mono8统计流水线；本批在同类接收责任模型上接真实OpenCV/位图后端，而不是声称原来的统计检查已经验证了新算法。仍没有相机、PLC、结果数据库或产品判定。
+
+## 1. 两条路径，允许不同的丢弃策略
+
+```text
+自有不可变图像与本地请求
+  ├─ 预览：一个最新槽 → UI按需取走 → 可替换未消费旧预览
+  └─ 测量：明确接收 → 排队 → 单消费者处理 → 保留终态 → 处理/确认后释放容量
+```
+
+预览用于看当前画面，允许覆盖尚未消费的旧预览。测量一旦Accepted，就必须给出Completed或Failed，不因预览刷新而删除。满载返回Full表示没有接收这个任务，不是“已经接收后再悄悄丢掉”。
+
+同一幅图可以被显示，却因检测容量不足而未被接收测量；这两件事必须分别记录。预览出现新图，也不能说明其检测已经完成。
+
+## 2. 有界Channel不等于整条系统有界
+
+队列长度只能约束还在排队的输入。若算法处理很快、结果消费很慢，把每个结果保存在列表里，队列可以一直很短，而终态和位图持续增长。
+
+本例容量C限制的是账本中所有条目：
+
+```text
+Retained = Queued + Running + Unacknowledged
+Retained <= Capacity
+```
+
+单消费者使Running最多1；Completed和Failed在未确认时都属于Unacknowledged。容量教学范围1..8、默认2，不是任何相机或工位的推荐缓冲数。
+
+例如容量2，两项已经处理完但尚未确认：Queued=0、Running=0、Unacknowledged=2。此时队列虽然空，第三项仍返回Full。必须先处理某个具体终态，确认释放一个槽位，才可能接收新任务。
+
+这里限制的是流水线内部持有数量，不是进程内存硬上限。生产者仍可能无限创建被拒收的图；调用者也可能无限保存Task、终态、位图或Dispatcher操作。容量设计要跨越这些边界，不能只数Channel。
+
+## 3. Channel选项与非阻塞提交
+
+本例采用BoundedChannelFullMode.Wait，写入却使用TryWrite而不是WriteAsync。Wait配置不意味着TryWrite会阻塞等待；无法立即写入就返回false。前置账本检查满载时也立即拒收。[微软Channels说明](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)
+
+SingleReader=true描述一个逻辑消费者，SingleWriter=false允许提交方法并发使用；AllowSynchronousContinuations=false减少在提交线程内联执行消费者的风险。Task.Run只启动一个工作循环，不是每收到一帧就创建一个新任务。
+
+不能简单改成DropOldest/DropWrite：这些模式适合某些可丢数据，但可能使写入方误以为已接收，而某个检测任务实际被覆盖。本例预览和测量分开，预览才采用替换旧项的策略。
+
+## 4. 接收状态必须可解释
+
+| Admission | 本例含义 | 有Completion吗 |
+| --- | --- | --- |
+| Invalid | 身份、尺寸、配方等输入不符合契约 | 无 |
+| Accepted | 已进入有界账本，负责形成终态 | 有 |
+| AlreadyTracked | 同一个请求对象已经在账本中 | 返回同一个Task |
+| Conflict | 同编号但不是同一个请求对象 | 无 |
+| Stale | 编号不大于已经接收的高水位且不在账本中 | 无 |
+| Full | 当前容量不足，本次没有接收 | 无 |
+| Closed | 已结束接收，不再加入新任务 | 无 |
+
+Full不推进高水位，不生成后台工作。离线demo会在处理并确认旧结果后，明确再次提交之前未接收的C图；这是调用方的新决策，不是流水线自动重试、相机补拍或命令重放。
+
+实机环境若准备再次提交，还要重新确认图像时效、工件身份和工艺上下文；本例没有实现这些资格检查。即便是离线编号，如果更大的编号已经先被接受，旧编号也会被Stale规则拒绝。
+
+## 5. 本地身份，不冒充物理帧证明
+
+MeasurementJob包含Producer、Number、FrameId和不可变FrameSelection，后者绑定图像与配方。Pipeline.Session区分运行实例，固定Recipe/RecipeVersion绑定算法配置；不允许同一实例静默换ROI或极性。
+
+这些都是本地提供的标记，不证明真实触发、曝光或工件身份。同编号新建一个字段相同的record，仍按Conflict处理；本例使用进程内引用身份去重，不是网络幂等协议或内容哈希去重。
+
+编号按成功接收顺序严格递增。SingleWriter=false不意味着乱序编号都能接受；多个生产者需要协调编号和提交顺序。本批的32次并发测试针对同一对象去重，不是多生产者公平性或吞吐验收。
+
+## 6. 计算完成不等于产品合格
+
+终态分两层：
+
+| 流水线终态 | 测量报告 | 责任 |
+| --- | --- | --- |
+| Completed | WidthMeasured | 算法得到唯一像素宽度，仍非产品OK |
+| Completed | NoEdges/NoPair/Ambiguous/BoundaryResponse | 算法正常结束，但不能发布唯一宽度 |
+| Failed | Output=null，保留有界错误类型名 | 后端或输出契约失败，不能伪装为未找到 |
+
+真实OpenCV后端仍按局部using创建和释放Mat，返回冻结位图与托管报告。工作循环复用上批输出复核逻辑，检查像素、配方、轮廓和尺寸内部一致性；报告不自洽时产生Failed，不填0、不切换托管算法回退。
+
+普通后端异常被隔离为对应任务的失败终态，消费者可以处理后续明确提交的任务。但本例不承诺从进程崩溃、内存耗尽或所有原生损坏中恢复。
+
+## 7. 确认终态，才释放该条目的责任
+
+Acknowledge要求当前Session以及原始终态对象引用匹配。复制一个字段一样的record、伪造Session、重复确认，都不能释放条目；确认后原编号不会被重新当作新任务执行。
+
+本例确认意味着“调用方已处理这个进程内结果”。demo只是打印后确认，不是数据库落盘、PLC回执或工件分拣成功。真实系统要在其规定的处理/持久化边界之后确认，不能在UI没显示时直接略过失败任务。
+
+账本条目在确认前还持有源图和终态，方便解释和关联；确认移除内部引用，却不能清除调用方已经保存的Task/终态对象，也不意味着GC或WPF缓存立刻归零。结果持久化、崩溃恢复与跨进程幂等本批未实现。
+
+## 8. 最新预览槽有自己的账
+
+LatestMeasurementPreview只有一个待消费MeasurementJob。Publish可替换旧项，Take取走并清空，Close撤下剩余项并禁收。它按发布进入锁的顺序选择“最新”，不是按曝光时间或编号大小排序。
+
+计数满足：Published=Replaced+Taken+ClearedOnClose+当前是否Pending。重复Close不重复增加清理数；无效或关闭后的发布不计入已发布数。
+
+取走预览不会确认检测结果，关闭预览也不会取消测量队列。GUI以后按需取最新图即可，不要为每次预览发布都无限追加Dispatcher调用，否则只是把无界队列搬到了UI线程。
+
+显示关联用终态Session和请求对象核对。A结果不能叠到C预览上；C是NoEdges时可以关联显示该状态，但仍不画宽度线。MatchesDisplay只是关联辅助，不验证终态真伪，也不把Failed或匹配状态当作测量成功。
+
+## 9. 关闭接收、处理排空、结果交接是三件事
+
+Complete只禁收并结束Channel写端。消费者继续处理已接受的排队任务；await Completion表示工作循环已经退出，不表示所有终态已经被消费或确认。
+
+排空后账本可能仍有多条结果，Read和Acknowledge仍可使用。关闭预览或清空旧界面，不会自动确认这些结果。新实例需要新Session，不能把旧收据混进来。
+
+本例没有强制取消原生调用、关闭硬期限或持久化恢复。真实门闩测试在Mat使用中结束接收并关闭预览，Mat没有提前Dispose；放行后两项已接收任务都完成并保留终态，等待明确确认。
+
+## 10. 资源观察：看数量，也看不同内存口径
+
+ProcessResourceSample依次读取账本快照、GC.GetTotalMemory(false)、当前进程PrivateMemorySize64和WorkingSet64，不强制GC，不设置RSS“必须不变”的断言。
+
+| 指标 | 本例观察用途 | 不能据此得出什么 |
+| --- | --- | --- |
+| Retained/Queued/Running/Unacknowledged | 任务与结果是否遵守容量 | 整个进程所有引用都已受控 |
+| ManagedBytes | 托管堆分配量的估计，不包含所有原生内存 | 等于实际存活对象或整个进程内存 |
+| PrivateBytes | 进程私有分配的字节数 | 等于Mat像素内存 |
+| WorkingSetBytes | 当前驻留物理内存口径 | 等于所有已分配内存或长期峰值 |
+
+托管统计参考[GC.GetTotalMemory](https://learn.microsoft.com/en-us/dotnet/api/system.gc.gettotalmemory?view=net-10.0)，进程口径见[PrivateMemorySize64](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64?view=net-10.0)与[WorkingSet64](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.workingset64?view=net-10.0)。这些读数并非跨API原子快照，不能简单相减就得到精确“原生泄漏字节数”。
+
+本次32轮原生短回放，每轮输入Mat都实际Dispose、账本始终不超过1、32个终态都确认，结束时Retained=0。但内存采样仍上涨：这可以来自未收集对象、WPF/原生缓存和分配策略等，单次数据既不能证明泄漏，也不能证明无泄漏。
+
+真正的长期验收还需要预热后的多时点曲线、较长连续运行、失败/满载/关闭样本、对象或原生资源分析，并结合实际吞吐和延迟目标。不能靠循环32次、强制GC后“看着下降”就宣布完成。
+
+## 11. 本轮交付与阶段位置
+
+新增51项通道/WPF/会话检查使用明确托管后端测试替身，不执行OpenCV；16项真实原生路径检查含32轮短回放，验证实际测量、失败范围释放、终态背压和排空。既有WPF查看器保持不变，新命令尚未接成连续采集UI。
+
+这批完成OpenCvSharp基础教学主线，不代表现场精度/质量、人工UI/多DPI、连续相机、持久化/PLC交接或长期资源验收完成。接着读 [C#有界账本、结果收据与预览槽](/knowledge/industrial/host-computer/opencvsharp/csharp-channel-ledger-receipts-and-preview-slot/)，下一阶段进入[YOLO任务、数据与部署契约](/knowledge/industrial/host-computer/yolo/tasks-datasets-metrics-and-deployment-contracts/)。

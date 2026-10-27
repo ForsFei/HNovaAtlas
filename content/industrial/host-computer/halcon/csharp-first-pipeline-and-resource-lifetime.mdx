@@ -1,0 +1,199 @@
+---
+id: industrial-csharp-halcon-first-pipeline
+title: C#接入HALCON 24.11：真实算子、HTuple与资源释放
+description: 固定官方.NET接口包，编译读图/阈值/连通域/筛选/面积中心链，区分托管构建与原生执行，验证34项输出契约而不伪造HALCON运行结果。
+tags: [工业自动化, C#, HALCON, 资源管理, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 10
+prerequisite: [industrial-halcon-objects-foundations]
+related: [industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer, industrial-csharp-planar-calibration]
+---
+
+## 先看本轮真正验证到哪一层
+
+新增独立`examples/industrial-halcon/`，.NET 10/x64，固定官方[MVTec.HalconDotNet 24113.0.0](https://www.nuget.org/packages/MVTec.HalconDotNet/24113.0.0)，即HALCON 24.11.3接口，并生成packages.lock.json。用户已明确先按24.11路线，不据此把本机空的20.11目录当成可用环境。
+
+| 验证项 | 本轮状态 |
+| --- | --- |
+| 官方托管接口还原与真实API编译 | 已通过，Release零警告零错误 |
+| 34项纯C#输出契约检查 | 已通过，不调用HALCON算子 |
+| 原生调用尝试 | 未通过：DllNotFoundException，进程返回3 |
+| HDevelop脚本、原生分割/数值结果 | 尚未执行验证 |
+| 相机、UI集成、质量/性能与部署验收 | 未进行 |
+
+官方包目标为.NET Standard 2.0；本项目在.NET 10编译成功，不等于厂商对全部运行环境的认证。还原此项目依赖不等于安装HALCON运行库，没有修改系统PATH、注册表或许可，也没有把厂商二进制提交到仓库。
+
+## 1. 项目内容与命令
+
+| 文件 | 责任 |
+| --- | --- |
+| IndustrialHalcon.csproj / packages.lock.json | 固定官方包与x64目标 |
+| HalconApiDemo.cs | 真正的HOperatorSet调用，运行须匹配原生库/许可 |
+| BlobReadback.cs | 原生数值边界到只读托管DTO的校验，不实现视觉算子 |
+| ContractChecks.cs | 34项合成数组检查，不代替原生测试 |
+| Program.cs | 明确选择托管检查或原生执行，无自动回退 |
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release -- --contract-test
+```
+
+确认匹配HALCON原生库、x64和有效许可后，在厂商配置正确的运行环境执行：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release -- --native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release -- --native-test
+```
+
+没有原生库时不要反复改代码把异常吞掉。CLI返回：0表示所选路径完成，1为托管检查失败，2为参数错误，3为原生路径未通过。native-test包含两组夹具预期检查，本轮尚未通过，不能把命令列在这里就当它已运行成功。
+
+## 2. 常用对象、属性和方法
+
+| 类型/成员 | 用途与边界 |
+| --- | --- |
+| HObject | 图像/区域/XLD等图标对象的基础包装，可包含多个对象 |
+| HObject.CountObj() | 图标对象数，不是像素数或必然的连通块数 |
+| HImage / GetImageSize | 面向对象图像类型与尺寸查询，不应凭空假设Width属性 |
+| HImage.Threshold | 从图像得到区域，返回新对象 |
+| HRegion.Connection / SelectShape | 连通区域分开与按特征选择 |
+| HXLDCont | 轮廓对象，与区域/图像不同，后续轮廓专题使用 |
+| HTuple.Length / Type | 有效元素数与类型，不是图标对象数 |
+| HTuple.I / D / S | 相应标量访问，读取前先验证长度和类型含义 |
+| HTuple.TupleReal / DArr | 转为实数元组，再访问内部double数组表示 |
+| HOperatorSet | 静态算子风格，输出经out返回 |
+| Dispose | 结束本调用拥有的包装器/资源引用，不能清别人仍在用的对象 |
+
+主程序统一使用HOperatorSet，避免同一入门链中混用多种风格。面向对象方法可查[HImage](https://www.mvtec.com/doc/halcon/2411/en/HImage.html)与[区域阈值接口](https://www.mvtec.com/doc/halcon/2411/en/threshold.html)；表格是查用地图，不表示本轮把所有方法都跑过。
+
+## 3. 从输入契约开始，而不是直接Threshold
+
+本例复用前面原创P2夹具，固定一张8×6单通道byte图。不把文件后缀当类型证明：
+
+```csharp
+HOperatorSet.ReadImage(out image, path);
+if (image.CountObj() != 1)
+    throw new InvalidOperationException("只接受一张图");
+HOperatorSet.GetImageSize(image, out width, out height);
+HOperatorSet.CountChannels(image, out channels);
+HOperatorSet.GetImageType(image, out type);
+```
+
+这些是完整函数中的片段，image等变量在函数前声明并在finally释放。width/height/channels必须是单元素元组；本例再检查8、6、1及type.S为byte。不会悄悄把RGB转灰度、把uint2缩到8位或改变输入尺寸。
+
+ReadImage官方支持包含pgm的多种格式，但本轮没有原生库实际验证该P2文件读取，仍需native-test确认，不把此前自写P2解析器通过当成HALCON读图通过。
+
+程序还读取neighborhood与max_connection，要求8和0，只读不改。它是隔离教学进程的前提检查，不是阻止其他线程并发改全局设置的锁；正式多算法进程需要集中管理此类配置。
+
+## 4. 实际的算子链与参数
+
+```csharp
+low = new HTuple(200);
+high = new HTuple(255);
+HOperatorSet.Threshold(image, out region, low, high);
+HOperatorSet.Connection(region, out components);
+
+feature = new HTuple("area");
+operation = new HTuple("and");
+minArea = new HTuple(2);
+maxArea = new HTuple(10);
+HOperatorSet.SelectShape(components, out selected,
+    feature, operation, minArea, maxArea);
+```
+
+以上真实API已针对官方24113.0.0接口编译。数值阈值来自8位夹具，不是所有工件的最佳参数；[SelectShape官方说明](https://www.mvtec.com/doc/halcon/2411/en/select_shape.html)描述按特征与区间筛选，本例只用area。
+
+为什么先Connection再SelectShape？如果对包含多个分离部分的一个阈值区域直接按总面积筛选，就不等于逐个连通块筛选。具体该按整体还是按单块，要由任务定义，不是固定顺序能包治百病。
+
+## 5. 没有对象与异常要走不同分支
+
+```csharp
+int count = selected.CountObj();
+if (count == 0)
+    return BlobReadback.FromArrays(w, h, 0, 2, 10, [], [], []);
+if (count > 64)
+    throw new InvalidOperationException("超出教学对象上限");
+
+HOperatorSet.AreaCenter(selected, out areas, out rows, out columns);
+```
+
+成功处理后没有选中区域，才返回NoCandidates；不能用catch所有异常再返回NoCandidates。读图失败、库加载失败、许可失败、维度错误或元组不一致都不是“算法已执行但没找到”。
+
+本例count=0时不调用AreaCenter，避免依赖空输入相关系统设置的行为。正面积候选要求面积至少2，不把一个空区域的(0,0,0)输出误当有效原点目标。
+
+## 6. HTuple有效长度与内部数组容量
+
+本轮同时核对了固定包自带XML说明：DArr暴露内部double数组，数组长度可能大于HTuple.Length，而且要求对应类型。直接把整段DArr当有效输出会带出多余容量。
+
+实际代码先转实数，再只复制有效前缀：
+
+```csharp
+private static double[] Numbers(HTuple tuple)
+{
+    using HTuple real = tuple.TupleReal();
+    return BlobReadback.CopyUsedValues(real.DArr, real.Length);
+}
+```
+
+CopyUsedValues校验0..64与底层容量，再用AsSpan(0, usedLength).ToArray生成独立托管副本。复制后的数组不共享HTuple内部存储，不会把临时元组或原生包装器传入后续UI。
+
+再要求areas/rows/columns长度都等于选中图标对象数量。不能只检查三个数值数组彼此一样长，却忘记与CountObj比较。面积要求有限、为整数像素数且落在筛选区间；Row/Column有限且在原图中心域。
+
+本例所有夹具都是全图像素坐标，因此允许检查0..Height-1和0..Width-1。裁剪/重采样/其他坐标域需要另建输入契约，不能只放宽范围绕过错误。
+
+## 7. 资源释放：不覆盖丢失旧所有者
+
+完整函数对HObject和HTuple输出预先置null，并在finally释放已有值：
+
+```csharp
+HObject? image = null;
+HObject? region = null;
+try
+{
+    HOperatorSet.ReadImage(out image, path);
+    HOperatorSet.Threshold(image, out region, 200, 255);
+    // 后续使用；不要让这些原生对象逃出所有权范围。
+}
+finally
+{
+    region?.Dispose();
+    image?.Dispose();
+}
+```
+
+该片段仅展示图标对象顺序，完整函数还显式保存/释放参数元组、输出元组等。不要连续out到同一变量并丢掉仍需释放的旧对象；也不要返回一个已经在using/finally里Dispose的HObject。
+
+HDevelop自动管理局部变量的体验不能直接等同于C#作用域自动确定释放。GC最终化不是高频处理的精确释放时机；同时也不应每帧GC.Collect去掩盖所有权问题。
+
+对于本次固定接口，HTuple.Dispose的XML说明特别区分含句柄与纯数值元组：纯数值元组调用没有清句柄效果，含句柄则涉及其引用。不要笼统声称“Dispose一个数值元组就关闭采集器”或“所有HTuple都绝不影响句柄”。[ClearHandle官方说明](https://www.mvtec.com/doc/halcon/2411/en/clear_handle.html)还指出显式清除会影响仍持有引用的使用者，模型/采集器需按具体对象管理。
+
+## 8. 托管返回值不携带原生资源
+
+BlobReport包含源宽高、Outcome和只读BlobFeature集合，每项有AreaPixels、RowPixels、ColumnPixels。FromArrays做防御复制，调用者改输入数组不会改已发布结果。
+
+Candidates表示存在符合本批筛选条件的候选，不是产品OK；NoCandidates也不自动等于产品NG。没有工件/帧/配方身份字段的这份小例子，不应该直接替换前面流水线中的完整结果信封。
+
+后续连接[同帧显示](/knowledge/industrial/host-computer/vision/csharp-wpf-offline-viewer-and-overlay/)或[处理流水线](/knowledge/industrial/host-computer/vision/csharp-bounded-inspection-and-latest-preview/)时，要由外层保留原CaptureKey、FrameStamp、采集与算法版本。坐标仍为像素，实际毫米换算另查[平面标定基础](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)，不直接派发机械动作。
+
+## 9. 两组原生夹具的预期是什么
+
+| 处理条件 | 手算预期 |
+| --- | --- |
+| 阈值200..255，再按面积2..10筛选 | 阈值对象1、连通对象2、选中1；面积4，Row=1.5、Column=1.5 |
+| 阈值254..255，再按面积2..10筛选 | 仅白点面积1，筛选后无候选 |
+
+native-test在真实运行库中执行以上两组，再比较预期。当前因为第一步原生库加载失败，整个测试链未通过；没有报告“HALCON分割测试通过”，也没有用自写C#连通域冒充HALCON回退。
+
+--contract-test只测试数值前缀、长度/计数、只读复制、面积/坐标/有限性、空输出与资源上限等34项，不调用HALCON算子、不消耗其运行许可，不验证阈值/连通域本身。
+
+## 10. 环境故障怎么定位
+
+1. 先检查托管包版本与实际运行库版本是否匹配，别把旧20.11原生DLL与24.11接口混用。
+2. 检查进程架构与原生库架构；本例固定x64，AnyCPU不等于自动适配全部厂商文件。
+3. 检查原生库搜索路径及其依赖，使用厂商提供的正确运行环境；不要把随机DLL复制进System32。
+4. 原生库成功加载后，再区分许可、格式、算子参数和输出语义错误；当前DllNotFoundException不能证明许可有问题。
+5. 不安装破解/替代许可，不把环境故障改写成正常空结果；部署文件和授权按合法配套环境核对。
+
+接着学习[阈值与ROI、形态学、连通域和筛选](/knowledge/industrial/host-computer/halcon/threshold-roi-morphology-and-region-selection/)，再运行[C# ROI分割与分步读回](/knowledge/industrial/host-computer/halcon/csharp-roi-segmentation-and-stage-readback/)。新增的原生入口与参数检查见该篇，本篇两组小夹具和34项输出检查仍独立保留。原生库未就绪时仍可整理算子/编译接口与检查托管边界，但真实HALCON结果、HDevelop对照和长期内存必须明确保留待验证。

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="S7netplus" Version="0.20.0" />
+    <None Include=".local/snap7.dll" Link="snap7.dll" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.local/snap7.dll')" />
+    <None Include=".local/lgpl-3.0.txt" Link="lgpl-3.0.txt" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.local/lgpl-3.0.txt')" />
+    <None Include=".local/gpl-3.0.txt" Link="gpl-3.0.txt" CopyToOutputDirectory="PreserveNewest" Condition="Exists('.local/gpl-3.0.txt')" />
+    <None Update="THIRD-PARTY-NOTICES.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

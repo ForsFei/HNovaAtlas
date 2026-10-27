@@ -1,0 +1,188 @@
+---
+id: industrial-csharp-opencvsharp-bounded-pipeline
+title: C#实践：Channel账本、结果收据与最新预览槽
+description: 在既有OpenCvSharp/WPF项目中新增有界测量命令，结合真实算法解释TrySubmit、Completion、Acknowledge、预览替换与进程资源采样，验证背压及32轮短回放。
+tags: [工业自动化, C#, OpenCvSharp, Channel, 结果交接]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 150
+prerequisite: [industrial-opencvsharp-bounded-pipeline, industrial-csharp-opencvsharp-wpf-viewer]
+related: [industrial-csharp-inspection-pipeline, industrial-csharp-opencvsharp-stripe-measurement]
+---
+
+## 运行与文件
+
+沿用examples/industrial-opencvsharp-wpf/，固定包及锁文件不变，无新第三方依赖。System.Threading.Channels来自当前.NET共享框架；不修改原来的三个按钮，也不新建连续采集界面。[Channels官方说明](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)
+
+```powershell
+dotnet restore examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build -- --pipeline-test
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build -- --pipeline-native-test
+dotnet run --project examples/industrial-opencvsharp-wpf/IndustrialOpenCvSharp.Wpf.csproj -c Release --no-build -- --pipeline-demo
+```
+
+Release零警告零错误，锁模式还原通过。pipeline-test新增51项检查，不执行OpenCV，使用真实Channel/BitmapSource及明确托管测试替身；pipeline-native-test新增16项真实原生路径检查，含32轮短回放。demo使用真实OpenCV。成功0，测试替身路径失败1，用法2，原生测试/demo失败3，不Show可见窗口。
+
+新增MeasurementPipeline.cs、LatestMeasurementPreview.cs、PipelineDemo.cs、PipelineChecks.cs和PipelineNativeChecks.cs。既有FrameSession.Detach及SessionChecks.Fake仅调整为程序集内部可见以复用验证/测试，不把Fake接到真实demo或界面。
+
+## 1. 常用对象、属性和方法
+
+| 对象 | 主要成员 | 用途 |
+| --- | --- | --- |
+| MeasurementJob | Producer、Number、FrameId、Selection | 本地请求身份与自有像素/配方 |
+| MeasurementPipeline | Session、RecipeVersion、Recipe、Capacity | 一个实例固定配置 |
+| MeasurementPipeline | TrySubmit(job)、Read(number)、Snapshot | 非阻塞接收、阶段查询、数量观察 |
+| PipelineSubmission | Admission、Completion | 区分未接收和已有任务 |
+| MeasurementTerminal | Stage、Output、Error、Job、MatchesDisplay | 保留终态及显示关联 |
+| MeasurementPipeline | Acknowledge(terminal)、Complete()、Completion | 确认释放、禁收、等待工作循环结束 |
+| LatestMeasurementPreview | Publish、Take、Close、Snapshot | 最新待消费预览槽，独立于检测确认 |
+| ProcessResourceSample | Read(pipeline) | 账本及当前进程内存点采样 |
+
+注意有两个Completion：submission.Completion属于单个任务；pipeline.Completion属于整个消费者循环。单个任务完成不释放账本，整个循环退出也不会自动确认结果。
+
+## 2. 创建固定配方实例
+
+```csharp
+Guid producer = Guid.NewGuid();
+FrameSelection bright = FrameFactory.Create(0);
+MeasurementPipeline pipeline = new(producer, 128, 96,
+    bright.Recipe, "stripe-v1", capacity: 2);
+MeasurementJob job = new(producer, 1, Guid.NewGuid(), bright);
+```
+
+构造函数检查Producer非空、版本非空且≤64字符、容量1..8，并验证固定图像尺寸及ROI。默认backend为NativeFrameRunner.Analyze；注入delegate仅用于可控测试或明确适配，不是原生失败后自动替换。
+
+提交再检查Number>0、FrameId非空、Selection/图像/配方完整、名称有界、Producer/尺寸/Recipe等于本实例约定。暗槽配方与亮条不同，不能在同一stripe-v1实例下偷偷切换；可以排空后建立显式新配置实例。
+
+本地标记不验证真实相机/工件/新鲜度。ValidJob的结构检查不能取代采集资格；相同字段新建请求也不是本例的“同一次对象”。
+
+## 3. Channel与账本共同限定容量
+
+核心Channel创建方式：
+
+```csharp
+input = Channel.CreateBounded<Entry>(new BoundedChannelOptions(capacity)
+{
+    SingleReader = true,
+    SingleWriter = false,
+    AllowSynchronousContinuations = false,
+    FullMode = BoundedChannelFullMode.Wait
+});
+Completion = Task.Run(WorkAsync);
+```
+
+账本Dictionary最多Capacity个Entry。TrySubmit在同一个锁中检查关闭、重复/冲突、高水位和Retained，然后先加账本、TryWrite入队；失败则撤销条目且不推进编号。TryWrite不等待容量，不把Drop模式当成检测接收语义。
+
+Snapshot在锁内给出Queued/Running/Unacknowledged及Accepted/Completed/Failed/Acknowledged。常规运行下Retained=Queued+Running+Unacknowledged，Accepted−Acknowledged=Retained；并不说明任务之外的所有引用都已释放。
+
+## 4. 接收时检查Admission，不能盲目await
+
+```csharp
+PipelineSubmission submission = pipeline.TrySubmit(job);
+if (submission.Admission is not
+    (PipelineAdmission.Accepted or PipelineAdmission.AlreadyTracked))
+{
+    // Full/Closed/Invalid/Conflict/Stale：本次没有新增处理责任。
+    return;
+}
+MeasurementTerminal terminal = await submission.Completion!;
+```
+
+Accepted与AlreadyTracked都带Task，但后者是同一个进程内请求对象原有的Task，不会再次执行后端。Full不创建任务。已确认的老编号再次提交为Stale；相同编号但不同对象在仍被跟踪时为Conflict。
+
+高水位随成功接收增加，不要求编号连续，但不允许倒序接收。多生产者必须自己安排提交顺序；不能根据SingleWriter=false推导任意乱序都能排进来。
+
+## 5. 单消费者与终态发布
+
+WorkAsync用ReadAllAsync消费Channel，取到条目后标Running，再在锁外执行真实后端及FrameSession.Detach。后者复制/核对冻结位图和报告，包括反向轮廓恢复后复算配对，不重复实现另一套验证规则。
+
+后端正常结束时Terminal.Stage=Completed，Output里保留真实报告；即使Outcome是Ambiguous或NoEdges也属于计算完成。后端/报告复核异常则Failed、Output=null，错误只保留长度有界的类型名，不保留无界日志或返回伪造宽度。
+
+Entry的TaskCompletionSource使用RunContinuationsAsynchronously；设置终态时仍在账本锁内，但调用方延续不应在此内联执行耗时逻辑。普通失败不会终止消费者，也不会自动重试这个任务。灾难性进程故障不在本例恢复保证中。
+
+## 6. 结果处理与Acknowledge
+
+```csharp
+if (terminal.Stage == PipelineStage.Failed)
+    Console.WriteLine($"处理失败：{terminal.Error}");
+else
+    Console.WriteLine($"{terminal.Output!.Report.Outcome}");
+
+// demo只演示本地处理后确认；实际应放到项目规定的持久化/交接边界之后。
+bool released = pipeline.Acknowledge(terminal);
+```
+
+方法要求相同Session及账本中原始Terminal对象引用；复制record、空Job、异Session或重复确认都返回false。移除条目后只释放流水线内部容量，调用方仍保存的Task/终态/位图引用不会被这个方法抹掉。
+
+失败终态也占容量，不能把错误结果丢掉来绕过背压。Complete之后仍能Read和Acknowledge，直到调用方明确完成处理。这里没有磁盘持久化、PLC Ack、网络重传或崩溃恢复。
+
+## 7. 最新预览槽与显示关联
+
+```csharp
+LatestMeasurementPreview preview = new();
+PreviewAdmission state = preview.Publish(job);
+MeasurementJob? shown = preview.Take();
+bool same = shown is not null && terminal.MatchesDisplay(shown, pipeline.Session);
+```
+
+Published表示占据空槽，Replaced表示覆盖未取走旧项。槽中只有自有不可变图像所属Job，没有Mat租约；Take只取走预览，不确认测量。它按发布顺序更新，不比较编号或曝光时间。
+
+MatchesDisplay只检查预期Session与同一个请求对象，之后仍要区分Failed、NoEdges、Ambiguous或WidthMeasured。匹配不等于可以画宽度线；实际叠加仍应遵守前篇Viewer只在WidthMeasured时画橙线的规则。该辅助方法也不认证外部构造的终态。
+
+本批在CLI里演示此逻辑，没有把新槽/账本接到原三按钮GUI，也没有实现连续采集UI定时刷新。下一阶段集成时，不要为每帧无限投递Dispatcher操作。
+
+## 8. 实际demo的三项任务
+
+同一亮条配方下依次提交亮条A、双条带B、空白C，容量2：
+
+```text
+Admission: A=Accepted, B=Accepted, C=Full
+preview: Published=3, Replaced=2，当前为C
+#1: Completed/WidthMeasured; matches current preview=False
+#2: Completed/Ambiguous; matches current preview=False
+显式处理并确认A、B，再由调用方再次提交未接收的离线C
+#3: Completed/NoEdges; matches preview=True; width=absent
+最终 Accepted=3, Completed=3, Failed=0, Acknowledged=3, Retained=0
+```
+
+A、B没有因为当前预览为C就被丢掉；C此前可预览，但尚未被测量接收。明确再次提交只适用于这里可重复的离线输入，不构成真实帧仍新鲜、工件未变化或允许补拍的证据。
+
+## 9. Complete、排空和结果保留
+
+```csharp
+pipeline.Complete(); // 禁止新接收，完成Channel写端
+preview.Close();     // 撤下预览；不确认、不取消检测任务
+await pipeline.Completion; // 等待已接收队列全部处理到终态
+// 此时继续处理/确认账本中未确认的结果。
+```
+
+消费者可以切换线程池线程，但只有一个逻辑执行器；真实Mat在同步回调范围内创建/使用/释放，不依赖一个固定OS线程。排空不抢先Dispose在途Mat，不删除已排队工作，也不自动Acknowledge。
+
+原生函数若不返回，本例继续等待；没有硬关闭期限、强制取消或工作进程隔离。新版流水线与上批单次查看器的“旧显示结果丢弃”策略不同，不能拿旧CloseAsync替代生产任务的终态交接。
+
+## 10. 资源采样与32轮短回放
+
+ProcessResourceSample.Read依次采样pipeline.Snapshot、GC.GetTotalMemory(false)、Process.GetCurrentProcess().Refresh后的PrivateMemorySize64/WorkingSet64。只读取当前进程，using释放Process包装，不强制GC、不启动外部监控进程，也不计算不可靠的“Private−Managed=全部原生内存”。
+
+一次已执行过前置原生案例后的32轮记录，单位字节：
+
+| 指标 | before32 | after32 |
+| --- | --- | --- |
+| ManagedBytes | 1005280 | 3743536 |
+| PrivateBytes | 93835264 | 97214464 |
+| WorkingSetBytes | 65925120 | 69361664 |
+| Retained | 0 | 0 |
+
+这组数值不是运行门槛，每次可能变化。32轮包含亮条、双条、空白：实际输入Mat逐次Dispose，单个后端范围同时最多1，32个终态逐次确认。表中内存上涨如实保留，不声称这意味着泄漏，也不声称Mat.IsDisposed证明所有缓存和外部引用都已消失。
+
+指标口径见[GC.GetTotalMemory](https://learn.microsoft.com/en-us/dotnet/api/system.gc.gettotalmemory?view=net-10.0)、[进程私有内存](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.privatememorysize64?view=net-10.0)、[WorkingSet](https://learn.microsoft.com/en-us/dotnet/api/system.diagnostics.process.workingset64?view=net-10.0)。这些是多次读取的点值，不是长期曲线或全部分配的峰值。
+
+## 11. 验证范围及后续
+
+51项pipeline-test验证真实Channel/冻结位图及明确托管后端替身：输入、满载、运行/排队/未确认计数、同对象32次并发去重、冲突/高水位、精确确认、失败隔离、预览替换/关闭和关联。此入口不执行OpenCV，不是51项原生图像检查。
+
+16项pipeline-native-test执行真实Mat/Reduce/Gaussian/位图：32px亮条、歧义/空图终态、背压、真实Mat范围内合成异常后的释放、后续明确任务恢复、关闭时继续处理队列，以及32轮短回放/资源点采样。合成异常不冒充现场故障；短回放不冒充长期性能验收。
+
+OpenCvSharp基础教学主线到此完成。实际采集资格、UI队列连接、人工多DPI、持久化/PLC回执、毫米精度/产品质量和长期内存/吞吐继续单列待验收；下一阶段进入[YOLO任务、数据与C#部署基础](/knowledge/industrial/host-computer/yolo/tasks-datasets-metrics-and-deployment-contracts/)及 [C#手写数据评价](/knowledge/industrial/host-computer/yolo/csharp-dataset-audit-box-iou-and-evaluation/)，不提前安装训练环境或下载模型权重。

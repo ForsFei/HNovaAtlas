@@ -1,0 +1,340 @@
+---
+id: industrial-serial-framing-and-wpf
+title: C# 串口接收：缓冲组帧、响应超时与 WPF 线程交接
+description: 从分段到达和连续多帧解释串口字节流，编写有界 CRLF 解析器，结合 SerialPort 后台单消费者、有限读取超时和 WPF 异步关闭完成可运行示例。
+tags: [工业自动化, C#, 串口, SerialPort, WPF, 通信协议]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 20
+prerequisite: [industrial-serialport-basics]
+related: [industrial-tcp-client-listener-stream, industrial-communication-data-contracts, industrial-host-computer-chapter-map, wpf-ui-thread-and-async, csharp-io-streams-ownership]
+---
+
+## 本节解决什么问题
+
+上一节的 [SerialPort 常用属性与方法](/knowledge/industrial/host-computer/communication/serialport-basics/)适合先认识对象。实际接到 WPF 后，还要解决三个问题：**本次读取是不是完整消息、谁负责端口生命周期、怎样安全地把结果交给界面**。
+
+本节沿用 ASCII 教学协议，不对未知设备发送指令：
+
+```text
+上位机请求：READ TEMP\r\n
+设备响应：  TEMP=253\r\n
+含义：      253 × 0.1 °C = 25.3 °C
+```
+
+其中 `\r\n` 表示实际的两个字节 `0D 0A`，不是四个可见字符。载荷只允许可打印 ASCII，最多 64 字节；温度原始值范围仍为 -400～1250。设备只在收到查询时回复一帧，不主动上报。
+
+配套目录为 `examples/industrial-serial-framing/`：包含独立解析器、后台会话、离线断言与一个 WPF 窗口。默认使用内存设备，只有明确勾选 COM 模式才会打开填写的端口。固定复现基线为 .NET 10、System.IO.Ports 10.0.0，不表示它是最新包版本。
+
+## 一次 Read 为什么不是一帧
+
+发送端写了一次 `TEMP=253\r\n`，接收端不一定一次读完。驱动缓冲、调度和本次读取容量都会影响返回的字节块。
+
+| Read 次序 | 本次拿到的字节 | 解析后的动作 |
+| --- | --- | --- |
+| 1 | `TE` | 保存，尚无完整帧 |
+| 2 | `MP=253\r` | 保存，CR 后仍缺 LF |
+| 3 | `\nTEMP=-15\r\nTE` | 输出 `TEMP=253`、`TEMP=-15`，保留最后的 `TE` |
+| 4 | `MP=260\r\n` | 输出 `TEMP=260` |
+
+这就是常说的“半包/粘包”问题；更准确地说，是应用必须从连续字节中识别自己的消息边界。**串口没有替你的自定义协议保存一次 Write 对应一次 Read 的边界**。
+
+```csharp
+byte[] buffer = new byte[256];
+int count = port.Read(buffer, 0, buffer.Length);
+// count 是实际数量，只处理 [0, count)。后面的数组空间可能是旧数据。
+IReadOnlyList<string> frames = decoder.Feed(buffer.AsSpan(0, count));
+```
+
+`Read` 的数量参数给出最多读取多少字节，不是要求协议恰好返回这么长。[Microsoft：SerialPort.Read](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.read)
+
+这里有三个不同层次的“缓冲”：驱动/SerialPort 的接收缓冲、本次读取用的 `byte[]`、解析器保留的未完成帧。把 `ReadBufferSize` 调大不能替代组帧；`BytesToRead` 也不是完整帧数。
+
+## 先按设备协议选择分帧规则
+
+| 规则 | 怎样识别边界 | 必须明确的限制 |
+| --- | --- | --- |
+| 固定长度 | 累计到约定字节数 | 初始对齐、丢字节后怎样重新同步 |
+| 结束符 | 找到 CRLF 等分隔符 | 载荷能否包含分隔符，是否需要转义 |
+| 帧头＋长度＋载荷＋校验 | 找帧头，读长度，等完整报文 | 长度字段字节序、计数范围、最大长度及校验覆盖范围 |
+| 协议规定的时间边界 | 按该协议的间隔要求识别 | 普通 UI 定时器或任意延时不能冒充协议时序 |
+
+例如二进制载荷能包含任意字节，就不能随意用 `0A` 分隔；长度字段必须先检查上限再申请空间，不能直接相信设备传来的数值。带校验的报文应先验证边界、长度和校验，再转换业务数据。校验和/CRC 是差错检测，不是身份认证。
+
+Modbus RTU 也不能直接套用本节 CRLF 解析器，它有自己的报文与时序规则，留到 Modbus 章节按规范实现或选择库。
+
+### 为什么不靠 Thread.Sleep 等“收完”
+
+等待 50 ms 后读取，可能刚好碰上半帧；等待 500 ms，又可能把几条完整消息一起读到。延时只能改变读取时刻，不能创造消息边界。正确边界来自协议。
+
+设备完全不再发送结束符时，即使缓冲有上限，短半帧也可能一直保留。因此还需要请求响应期限，或由协议定义的组帧期限。本节采用前者：一个请求最多等 2 秒，没有完整有效响应就结束会话。
+
+## 编写有界 CRLF 解析器
+
+先把解析器写成纯 C#，不引用 WPF，也不依赖某个串口。这样可以直接喂入不同切分的字节，检查协议逻辑，而不必每次连接硬件。
+
+接口很小：
+
+| 成员 | 用途 |
+| --- | --- |
+| `new CrlfFrameDecoder(64)` | 配置最大载荷字节数，不包含 CRLF |
+| `Feed(ReadOnlySpan<byte>)` | 输入一块字节，返回零帧、一帧或多帧，内部保留半帧 |
+| `BufferedBytes` | 查看当前未完成帧占用，包含已收到但尚未匹配的 CR |
+| `Reset()` | 清除未完成状态；新会话不能继承旧会话的半帧 |
+
+核心实现与配套项目一致：
+
+```csharp
+using System.Text;
+
+public sealed class CrlfFrameDecoder
+{
+    private readonly byte[] _payload;
+    private int _count;
+    private bool _afterCr;
+
+    public CrlfFrameDecoder(int maxPayloadBytes = 64)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(maxPayloadBytes);
+        _payload = new byte[maxPayloadBytes];
+    }
+
+    public int BufferedBytes => _count + (_afterCr ? 1 : 0);
+
+    public IReadOnlyList<string> Feed(ReadOnlySpan<byte> bytes)
+    {
+        var frames = new List<string>();
+        try
+        {
+            foreach (byte value in bytes)
+            {
+                if (_afterCr)
+                {
+                    if (value != 0x0A || _count == 0)
+                        throw new FormatException("期待非空 ASCII 帧与 CRLF 结束符。");
+                    frames.Add(Encoding.ASCII.GetString(_payload, 0, _count));
+                    Reset();
+                }
+                else if (value == 0x0D)
+                {
+                    _afterCr = true;
+                }
+                else
+                {
+                    if (value is < 0x20 or > 0x7E)
+                        throw new FormatException("载荷只允许可打印 ASCII；不接受单独 LF。");
+                    if (_count == _payload.Length)
+                        throw new FormatException("帧载荷超过上限，终止本次会话。");
+                    _payload[_count++] = value;
+                }
+            }
+            return frames;
+        }
+        catch (FormatException)
+        {
+            Reset();
+            throw;
+        }
+    }
+
+    public void Reset()
+    {
+        _count = 0;
+        _afterCr = false;
+    }
+}
+```
+
+这里需要理解四个选择：
+
+1. CR 和 LF 可以落在两次 Feed 中，所以单独保存 `_afterCr`，不能每次读取后清空。
+2. 载荷恰好达到 64 字节后，仍允许接收 CRLF；第 65 个载荷字节才超限。
+3. 找到完整帧后才转成字符串，输出对象不依赖下一次重用的接收数组。
+4. 出现非 ASCII、裸 LF、CR 后不是 LF、空帧或超长载荷时，明确抛异常并终止会话，而不是静默丢弃后继续执行命令。
+
+一次 Feed 内若前面有正常帧、后面又出现异常，整个调用抛异常，不返回该批前面的帧。这是本教学实现的保守策略，不是所有协议必须如此。生产协议如要“丢弃坏帧后继续”，必须有可靠的重新同步规则，并记录丢弃原因，不能仅把异常吃掉。
+
+**Feed 与 Reset 不是线程安全操作。** 本节只让一个后台消费者调用它们，不用多个接收线程争抢同一个解析器。
+
+## 分帧成功不等于业务数据有效
+
+`TEMP=abc\r\n` 有合法边界，但不是合法温度。需要先组帧，再用上一节的 `TemperatureProtocol.ParseResponse(frame)` 验证字段、整数格式与量程，最后得到 `decimal` 温度。
+
+```csharp
+foreach (string frame in decoder.Feed(buffer.AsSpan(0, count)))
+{
+    decimal temperature = TemperatureProtocol.ParseResponse(frame);
+    // 现在才产生经过验证的业务结果，交给界面显示。
+}
+```
+
+`ERR=UNKNOWN` 也不能解析成温度。完整协议可以给成功响应和错误响应定义不同结果类型；本节把它作为协议失败结束会话并记录原因，绝不显示成 0 °C。
+
+解析器支持多帧输入，不代表这个具体业务允许设备随意回复多帧。本节每次查询只允许一条响应，多余响应或未请求字节会导致会话结束。这与支持主动上报的监控协议是两种不同契约。
+
+## 谁来打开、读取、写入和关闭
+
+本节选择**一个后台逻辑所有者**处理端口，不订阅 `DataReceived`，也不同时使用 `ReadLine`、`ReadExisting` 或 `BaseStream` 接收。
+
+```text
+UI：连接 → 后台 Open → 点击读取 → 后台 WriteLine
+                              ↓
+                    后台 Read → Feed → 业务验证
+                                        ↓
+                              await Dispatcher 更新 UI
+
+UI：断开/关窗 → Cancel → 等后台退出 → 后台 Dispose → 完成关闭
+```
+
+“逻辑所有者”指同一条不并发的执行流程；异步等待恢复后不要求是同一个托管线程。端口对象只在该流程中创建和访问，不作为公共字段暴露给按钮。
+
+### 本例用到的对象、属性与方法
+
+| 对象/成员 | 本例用法 | 边界 |
+| --- | --- | --- |
+| `SerialPort.Open()` | 在后台打开端口 | 失败可能是占用、权限、参数或驱动问题 |
+| `ReadTimeout = 100` | 给同步读取设置有限等待 | 不是完整响应的 2 秒期限，也不是令牌取消 |
+| `WriteTimeout = 500` | 限制同步写入等待 | 写入失败后不能当作未执行而盲目重发 |
+| `Read(byte[], 0, length)` | 读取字节块，交给解析器 | 返回多少处理多少，超时不清空半帧 |
+| `WriteLine("READ TEMP")` | 沿用配置的 CRLF 追加结束符 | 参数本身不再附加一次 CRLF |
+| `Dispose()` | 后台退出作用域时关闭并释放 | UI 不另行并发调用 Close |
+| `Interlocked.CompareExchange` | 只允许一个排队/在途请求 | 不是无界命令队列 |
+| `Stopwatch.GetElapsedTime` | 计算单次请求的响应期限 | 使用单调计时，不依赖墙钟调整 |
+| `CancellationTokenSource.Cancel()` | 请求后台尽快退出 | 不会直接打断同步 Read |
+| `Dispatcher.InvokeAsync(...).Task` | 在 UI 线程应用已验证结果并等待 | 不同步阻塞 UI，不无限投递更新 |
+
+串口的其余参数仍采用上一节的 9600、8N1、无握手、ASCII、CRLF；实际设备必须以手册为准。`SerialBytePort` 是对 SerialPort 的薄封装，不是额外的工业通信库。
+
+### 后台读取循环的关键部分
+
+完整代码在 `Core/SerialSession.cs`。下面摘出读接收部分，位于同一个后台流程中：
+
+```csharp
+CheckDeadline();
+int count;
+try { count = port.Read(buffer); }
+catch (TimeoutException) { continue; } // 本次读取没等到字节，继续检查停止与期限。
+
+stop.ThrowIfCancellationRequested();
+CheckDeadline();
+if (count > 0 && !awaitingReply)
+    throw new FormatException("未请求时收到字节，无法可靠匹配，终止会话。");
+
+foreach (string frame in decoder.Feed(buffer.AsSpan(0, count)))
+{
+    if (!awaitingReply)
+        throw new FormatException("收到未请求或多余响应，终止会话。");
+    decimal value = TemperatureProtocol.ParseResponse(frame);
+    awaitingReply = false;
+    Interlocked.Exchange(ref _request, 0);
+    await report(new(UpdateKind.Reading, $"RX: {frame}", value));
+}
+if (!awaitingReply && decoder.BufferedBytes != 0)
+    throw new FormatException("响应之后还有多余半帧，终止会话。");
+```
+
+这里的 `port.Read(buffer)` 是项目中 `IBytePort` 的简化接口；真实适配器内部调用 `SerialPort.Read(buffer, 0, buffer.Length)`。接口只为了让同一个会话算法可以接真实串口和离线测试替身，没有引入驱动框架。
+
+`TimeoutException` 只在具体 Read 调用附近作为“读取窗口暂时无数据”处理。不能把整个循环套在同一个吞超时的 catch 中，否则 WriteTimeout、应用响应超时也可能被误吞。
+
+### 为什么还有 2 秒响应期限
+
+100 ms 是单次同步读取等待，2 秒是从发送开始计算的应用响应期限。收到部分数据不重置该期限；否则设备每隔一会儿发一个字节，就能无限延长等待。
+
+没有请求编号的教学协议无法可靠区分新旧响应。本例超时后结束会话，不立刻发送下一条查询，也不自动重发。**重新打开端口也不证明设备端不再发送旧响应**；真实接入需要协议规定的会话同步、请求编号或明确的设备恢复流程，`DiscardInBuffer()` 不是通用补救。
+
+## WPF 怎样交接结果
+
+WPF 项目故意只做一个窗口，没有增加导航框架和复杂命令层：连接、读取一次、断开、状态、温度和最多 100 条记录。通信逻辑放在可测试 Core 中；界面处理程序负责捕获异常、显示结果和管理生命周期。
+
+创建后台会话前，先在 UI 线程取出端口名、波特率等值。后台不再访问 TextBox：
+
+```csharp
+bool useReal = RealPort.IsChecked == true;
+string name = PortName.Text.Trim();
+_stop = new CancellationTokenSource();
+_session = new SerialSession();
+_run = _session.RunAsync(
+    () => useReal ? new SerialBytePort(name, baud) : new DemoBytePort(),
+    update => Dispatcher.InvokeAsync(() => Apply(update)).Task,
+    _stop.Token);
+```
+
+`Apply` 在 UI 线程执行，更新控件和 `ObservableCollection`。后台等待该次 Dispatcher 操作完成，不每收到一个字节就排一个 UI 任务。断开后把温度标为无效，避免旧读数继续看起来像实时数据。
+
+对高频采集，等待每次 UI 更新可能反过来拖慢接收，应改成有界队列、批量处理和适当刷新频率；本例是低频单次查询，不提前引入这些层次。[Microsoft：WPF 线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)
+
+### 停止和关闭不能用 Wait 阻塞
+
+UI 点击断开时，先禁用新的读取和连接，再取消并异步等待后台任务。后台退出 `using` 作用域后释放端口。
+
+```csharp
+Task? running = _run;
+_stop?.Cancel();
+if (running is not null)
+    await running; // 完整示例还会捕获并记录失败、恢复按钮状态。
+```
+
+不能改成 `running.Wait()` 或 `.Result`：后台可能正在等待 `Dispatcher.InvokeAsync`，UI 却被同步等待阻塞，双方就可能互相等待。
+
+关窗处理先设置 `e.Cancel = true` 暂缓关闭，防止 Dispatcher 过早结束；等待后台完成，再设置允许关闭标记并调用 `Close()`。窗口连续收到关闭操作也只执行一次停止流程。对应代码在 `Wpf/MainWindow.xaml.cs` 的 `StopAsync` 和 `OnClosing`。
+
+令牌只表达停止请求。当前同步 Read 需在返回或超时后，后台才有机会观察它；本例不声称 100 ms 内一定关闭。Open、Write、Dispose 及驱动行为也可能影响退出耗时。若现场驱动持续卡住，应记录阶段并处理驱动/设备故障，不能伪装成“已经释放”。[Microsoft：ReadTimeout](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.readtimeout)
+
+## DataReceived 方案能不能用
+
+可以，但仍需要相同的协议组帧和生命周期管理。`ReceivedBytesThreshold` 只是事件通知阈值，不是“帧长度设置”；回调在辅助线程执行，也不保证每收到一个字节触发一次。[Microsoft：DataReceived](https://learn.microsoft.com/en-us/dotnet/api/system.io.ports.serialport.datareceived)
+
+如果选择事件方案，就应当只有它负责接收读取，串行地把字节交给解析器；异常要有明确出口，停止时要协调正在运行的回调并解除事件订阅。本节选择后台循环，是为了让打开、读取、发送和释放有一条容易追踪的主线，不意味着事件方式错误。
+
+不要一边保留 `DataReceived` 中的 `ReadExisting()`，一边复制本例的 Read 循环：两个消费者会争抢相同的接收字节。
+
+## 运行与分层验收
+
+从仓库根目录运行离线检查：
+
+```powershell
+dotnet run --project examples/industrial-serial-framing/Checks/SerialFraming.Checks.csproj
+```
+
+检查包括：所有两段切分位置、逐字节输入、连续多帧、CR/LF 分离、空输入、长度边界、异常字符、清除旧半帧、拒绝重叠请求、响应超时，以及打开/读取/写入失败后释放。使用测试替身，**不打开任何 COM 端口**。
+
+Windows 上启动 WPF：
+
+```powershell
+dotnet run --project examples/industrial-serial-framing/Wpf/SerialFraming.Wpf.csproj
+```
+
+保持 COM 复选框未选中，点击“连接 → 读取一次温度”，内存设备会依次返回 `TE`、`MP=2`、`53\r`、`\n`，最终显示 25.3 °C。点击断开或关闭窗口，后台结束，读数失效。
+
+| 验收层 | 能证明什么 | 不能证明什么 |
+| --- | --- | --- |
+| 离线解析与会话断言 | 字节切分、边界检查、协议失败和释放逻辑 | OS 串口驱动与实际电气连接 |
+| WPF 编译 | XAML/C# 引用与类型检查通过 | 用户实际点击、界面表现与设备行为 |
+| WPF 内存设备手动测试 | 界面交接、按钮与退出流程 | COM 端口打开和真实收发 |
+| 已连通端口对/实机 | 对应环境下的驱动、串口收发与设备行为 | 换设备、换接线或换 SDK 后仍然正确 |
+
+若自己已经准备好 COM3 ↔ COM4 这样的**连通端口对**，可先用上一节的 `--device COM4 9600` 启动设备端，再在 WPF 勾选 COM、填写 COM3 与 9600。实际端口名必须按环境核对；不要把两个独立 COM 端口当作已连通，也不要拿未知设备试教学命令。
+
+## 故障排查与面试追问
+
+| 现象 | 先检查 |
+| --- | --- |
+| 字节日志有内容但始终没有温度 | CRLF 是否完整、协议是否真的是 ASCII、业务字段是否有效 |
+| 几秒后超时但半帧一直到达 | 是否错误地用“收到任意字节”重置响应期限 |
+| 偶尔少字或读到另一半 | 是否存在两个接收消费者，是否忽略实际 Read 数量 |
+| UI 卡住或关窗死锁 | 是否在 UI 同步读串口，是否 Wait 一个等待 Dispatcher 的任务 |
+| 断开后仍显示旧温度 | 是否把会话结束与数据失效关联，是否接受旧会话回调 |
+| 超时后的下一次查询值不对 | 没有请求标识时是否误配迟到响应，是否盲目重发 |
+
+复习时试着回答：
+
+1. 调大接收缓冲与完成应用层组帧为什么不是同一件事？
+2. 载荷已达最大长度但下一个字节是 CR，此时应不应该报超长？
+3. 为什么解析器支持多帧，但这个请求响应会话拒绝额外响应？
+4. 读取等待超时、组帧超时、请求响应超时和写入超时分别是什么意思？
+5. 为什么取消令牌不能直接取消这里的同步 Read？为什么关闭操作仍要 await？
+6. 若协议改成主动上报，你会怎样调整请求匹配、数据有效性和 UI 刷新，而不是只删掉一个异常？
+
+至此，串口基础形成“对象用法 → 字节组帧 → 后台所有权 → WPF 交接”的可运行链路。下一步进入 [TCP](/knowledge/industrial/host-computer/communication/tcp-client-listener-and-stream/)与 [UDP](/knowledge/industrial/host-computer/communication/udp-client-and-datagrams/)，保留这些协议边界意识，再学习网络连接、流与数据报的不同生命周期。

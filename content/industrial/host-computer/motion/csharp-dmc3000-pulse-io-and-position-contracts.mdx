@@ -1,0 +1,184 @@
+---
+id: industrial-csharp-dmc3000-pulse-contracts
+title: C# 脉冲卡接口：位置、IO位域、回零配置与反馈契约
+description: 对照DMC3000常用SDK函数，讲解初始化关闭、参数读写、脉冲定位、状态位与编码器读取；提供53项纯数值离线检查。
+tags: [工业自动化, 雷赛, C#, 脉冲卡, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-20"
+order: 100
+prerequisite: [industrial-dmc3000-pulse-homing-feedback]
+related: [industrial-leadshine-e3032-sdk-basics, industrial-csharp-e3032-motion-observation, industrial-wpf-manual-axis-panel]
+---
+
+## 两类代码的验证边界
+
+本篇分为两部分：常用DMC3000 SDK接口导读，以及 `examples/industrial-motion/PulseContracts.cs` 的可运行纯数值逻辑。前者按[官方指定手册](https://www.leisai.com/upload/file/2025/07/31/DMC3000%E7%B3%BB%E5%88%97%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250710.pdf)核对，但**没有针对用户配套LTDMC.cs编译或执行**；后者通过53项离线检查，没有原生DLL、驱动、网络或脉冲输出。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --pulse-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --pulse-demo
+```
+
+没有新增脉冲卡固件模拟器，也没有将既有WPF内存面板接到脉冲硬件。E3032实际SDK接入依然是独立待验收项。
+
+## 1. 初始化与关闭没有变成TCP连接
+
+`LTDMC`是对原生库的包装，不是 `new TcpClient(ip)`。资源生命周期仍要有唯一所有者：
+
+| 函数 | 目的 | 返回契约 |
+| --- | --- | --- |
+| `dmc_board_init` | 初始化板卡资源 | 正数为卡数；0表示未找到或异常，负数另有定义 |
+| `dmc_get_CardInfList` | 读取卡类型/ID列表 | 返回码和输出数组/数量分别检查 |
+| `dmc_get_total_axes` | 查询当前卡轴数 | 不是每个功能都有同样多通道 |
+| `dmc_board_close` | 释放板卡资源 | 不等于停止，更不是单轴关闭 |
+
+卡数量不等于卡ID，位置读数不等于错误码。SDK本地位数、声明、数组容量、调用约定和依赖仍按同包头文件核对，不从其他系列复制一份同名DLL凑合加载。
+
+退出前需要禁止新命令、按设备规程停止并确认状态、处理机械相关使能/制动条件，最后释放资源。失联时不能从close返回成功推断机械已停止。
+
+## 2. 设置与读回脉冲模式
+
+下方的 `approved` 均代表已审核参数，不是示例中可直接运行的配置类型。所有SDK片段都只是调用形态。
+
+```csharp
+short rc = LTDMC.dmc_set_pulse_outmode(card, axis, approved.OutputMode);
+if (rc != 0)
+    throw new InvalidOperationException($"Set pulse output mode: {rc}");
+
+ushort actualMode = 0;
+rc = LTDMC.dmc_get_pulse_outmode(card, axis, ref actualMode);
+if (rc != 0)
+    throw new InvalidOperationException($"Read pulse output mode: {rc}");
+// 与审核配置对照；不在读回之后自动输出脉冲。
+```
+
+输出方式与波形含义见[脉冲卡理论对照](/knowledge/industrial/host-computer/motion/dmc3000-pulse-direction-homing-and-feedback/)。改模式、方向或单位是受控配置，不放在正在运行的UI刷新循环中。
+
+## 3. 曲线、定位、停止怎样调用
+
+```csharp
+// dmc_set_profile：速度pulse/s；Tacc/Tdec为秒。
+short rc = LTDMC.dmc_set_profile(card, axis,
+    approved.StartPulseRate, approved.MaxPulseRate,
+    approved.AccelerationSeconds, approved.DecelerationSeconds,
+    approved.StopPulseRate);
+if (rc != 0)
+    throw new InvalidOperationException($"Set profile: {rc}");
+
+// 在另一受控动作步骤中，核对条件后只提交一次。
+int displacementPulse = approved.RelativeDisplacementPulse;
+rc = LTDMC.dmc_pmove(card, axis, displacementPulse, 0); // 0相对、1绝对。
+// 这里只记录调用结果，不宣布定位完成。
+```
+
+上方假设配套包装层正确使用Windows C的32位long参数。C# long为64位，不能仅凭C头文件中的long就自己声明为C# long；优先使用官方配套声明。
+
+连续运动可查 `dmc_vmove`；普通单轴/PVT停止查 `dmc_stop(card, axis, 0)`，插补另查坐标系接口。`dmc_check_done`直接返回0运行、1停止，不能通过通用“0成功”检查器解释。
+
+超时/取消后的动作结果也可能未知。尤其相对运动不能因为没收到确认就重发，否则可能额外走一段。沿用[动作观察](/knowledge/industrial/host-computer/motion/csharp-e3032-motion-observation/)的证据思想，但真实脉冲卡状态归一化必须单独核对。
+
+## 4. 原点与卡侧回零参数
+
+先核对输入映射/极性、板卡轴资源和方法支持，再配置、读回并按流程启动：
+
+```csharp
+// 受控参数步骤，非本项目已执行的调用。
+short rc = LTDMC.dmc_set_home_pin_logic(card, axis, approved.OriginLogic, 0);
+if (rc != 0)
+    throw new InvalidOperationException($"Set ORG logic: {rc}");
+
+// vel_mode在该API中是double类型的0/1选择器，不是实际速度。
+rc = LTDMC.dmc_set_homemode(card, axis, approved.HomeDirection,
+    approved.LowOrHighSelector, approved.CardHomeMode, 0);
+if (rc != 0)
+    throw new InvalidOperationException($"Set home mode: {rc}");
+// 使用dmc_get_homemode等配套读取接口核对；不自动进入回零。
+```
+
+原点filter与EZ_count在所查版本中是保留值0。方式4固定低速、方法和轴/固件支持等限制不能忽略。之后的动作入口为 `dmc_home_move`；结果读 `dmc_get_home_result`，分别检查返回码和输出0/1，并防止旧完成位被误认成本次成功。
+
+偏移与清零、限位遇到后的行为须按该型号说明另行配置；不套用E3032的 `nmc_set_home_profile`。本篇的离线配置检查不生成真实回零轨迹，也不发出运动许可。
+
+## 5. 读取指令位置、编码器与状态位
+
+```csharp
+// 以下返回值本身就是数据，不是错误码。
+int commandCount = LTDMC.dmc_get_position(card, axis);
+uint rawStatus = LTDMC.dmc_axis_io_status(card, axis);
+
+// 只有已确认该参数对应目标反馈通道时才调用。
+int encoderCount = LTDMC.dmc_get_encoder(card, confirmedEncoderChannel);
+```
+
+负计数可以是合法位置，不能把所有负数当成SDK错误。`uint`位域也不能截断为short，或把高位置1当成负错误码。接口缺少独立质量返回时，应用仍要结合资源/连接诊断、新鲜度和厂商错误语义，不把“拿到一个数”当作有效采样证明。
+
+同一axis参数跨函数未必是同一资源：编码器API的8在部分型号表示手轮，脉冲轴8则可能是另一条运动轴。启用螺距补偿时，常用指令与反馈读取接口还可能处于不同补偿阶段；本例不为未知通道或补偿关系自动生成缩放。
+
+## 6. PulseIoStatus：未知不是false
+
+所查手册表8.2对应的位：
+
+| 位 | 名称 | 位 | 名称 |
+| --- | --- | --- | --- |
+| 0 | ALM | 6 | SL+ |
+| 1 | EL+ | 7 | SL- |
+| 2 | EL- | 8 | INP |
+| 3 | EMG | 9 | EZ |
+| 4 | ORG | 10 | RDY |
+| 5 | 保留 | 11 | DSTP |
+
+本示例的 `KnownMask=0xFDF`只解释上述已定义位，保留其他原始位。调用者另外提供 `ConfirmedMask`，声明哪些状态的来源、映射与含义已经确认；未确认时 `Read` 返回null，不是false。
+
+```csharp
+uint raw = (uint)(PulseSignal.Ready | PulseSignal.InPosition) | 0x80000000u;
+var io = new PulseIoStatus(raw, (uint)PulseSignal.Ready);
+Console.WriteLine(io.Read(PulseSignal.Ready));       // True
+Console.WriteLine(io.Read(PulseSignal.InPosition));  // null：不能因为bit8是1就自动信任。
+Console.WriteLine($"{io.ReservedBits:X8}");           // 80000000，保留诊断。
+```
+
+`ConfirmedMask`是教学应用契约，不是厂商硬件寄存器，也不全等于接线清单：软件限位等位有自己的来源。它不提供安全许可，调用者把未确认信号误标为确认时，纯解码器无法替其验证接线。
+
+`RawLevelIsActive`仅演示独立原始电平如何按配置解释，不会自动应用到上述SDK状态位，避免二次反转。`BothHardLimitsActive`在任一限位未知时也是null。
+
+## 7. 两个计数通道分别换算
+
+`PulseCountChannel`声明counts/mm、方向符号和参考计数。编码时先对位移计数量化，再加参考，最终以checked转为Int32；解码先在decimal域做差，避免两个Int32极值相减时溢出。
+
+```csharp
+var command = new PulseCountChannel(4000);
+var feedback = new PulseCountChannel(10000, sign: -1, originCount: 100);
+var contract = new PulsePositionContract(command, feedback);
+var reading = contract.Read(50000, -124900,
+    dataValid: true, comparisonContractConfirmed: true);
+// 指令12.5mm，反馈12.5mm，差值0mm。所有数字均为虚构夹具。
+```
+
+`comparisonContractConfirmed`必须代表调用方已核对单位、方向、共同参考、补偿阶段和采样关联等条件；函数本身不会证明这些外部事实。未确认时仍可显示各自的换算值，但差值为null。不能为了让差值变成0就自动改变方向、缩放或清计数器。
+
+没有编码器配置或缺少反馈样本时，反馈与差值都保持null；整批数据无效时不发布换算值。这个对象不对计数器回绕自动展开，不处理硬件滤波、螺距补偿、伺服动态、跨采样一致性或机械间隙。
+
+## 8. 部分回零配置检查
+
+`PulseHomePlan.ValidateConfiguration`接收明确提供的轴数/方法支持集合、信号确认状态和索引路径确认。测试中的4轴和方法集合都是虚构能力夹具，不是SDK发现结果，也不是对所有DMC3000卡型的支持声明。
+
+检查器限定1～12轴的教学范围，不概括整个产品线。覆盖的教学方法为0～5和10～12：核对轴范围、0/1方向、低/高速选择器、保留EZ_count、方式4低速，以及对应ORG/EZ/限位状态来源是否已确认。6～9锁存方式故意不支持，因为还需要单独验证的锁存资源和映射。
+
+检查的是“有无该信号的已确认来源”，不是“此时开关必须为ON”。例如方式2的ORG当前为OFF，也可以通过配置检查；方式4的EZ瞬时为OFF，不代表没有可用索引路径。反过来，一个瞬时高电平也不能证明编码器索引能力已经验证。
+
+```csharp
+var io = new PulseIoStatus(0, (uint)PulseSignal.Origin);
+var plan = new PulseHomePlan(Direction: 0, SpeedMode: PulseHomeSpeed.Low, Mode: 2);
+plan.ValidateConfiguration(axis: 0, axisCount: 4,
+    confirmedModes: new HashSet<ushort> { 2 }, io: io, indexPathConfirmed: false);
+// 只完成教学配置检查；没有检查全部机械互锁，更没有执行回零。
+```
+
+## 9. 53项检查覆盖与缺口
+
+检查覆盖11个位的独立解析、保留位、未知信号、限位矛盾可观察性、原始极性、运行/回零返回契约、独立缩放/方向/参考、半值量化、偏置与Int32边界、无反馈/不可比较数据，以及部分回零配置和能力限制。
+
+没有验证脉冲卡SDK ABI、IO电气、实际输出波形、编码器输入、回零轨迹、现场停止、补偿一致性、锁存方式或安全系统。本轮也没有改变WPF面板，它继续只操作原有内存轴。
+
+脉冲分支的基础对照至此补齐，实际接线与卡型验证仍单独保留。接下来回到E3032主线，进入多轴任务与IO联动，不将这些纯值测试当成硬件验收。

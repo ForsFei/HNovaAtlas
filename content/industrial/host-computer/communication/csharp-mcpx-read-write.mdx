@@ -1,0 +1,199 @@
+---
+id: industrial-csharp-mcpx-read-write
+title: C# 三菱通信：McpX 属性、连接关闭、D/M 读写与超时
+description: 固定 McpX 0.13.0，说明构造连接和 Dispose、地址进制、泛型读写宽度、字与位批量操作、非0结束码、请求期限及无取消令牌时的停止边界，附真实回环测试。
+tags: [工业自动化, 三菱, MC协议, SLMP, McpX, C#]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 140
+prerequisite: [industrial-mc-slmp-frames-device-addresses]
+related: [industrial-host-computer-chapter-map, industrial-s7netplus-db-read-write, industrial-opcua-csharp-secure-read-write-subscribe]
+---
+
+## 包版本、源码与复现范围
+
+配套项目 `examples/industrial-mc/`，目标 .NET 10，固定 NuGet McpX 0.13.0；该包不额外依赖 MX Component、GX Works 或原生控制器DLL。本机 .NET 10 选择包中的 net9.0 资产。
+
+```xml
+<PackageReference Include="McpX" Version="0.13.0" />
+```
+
+NuGet元数据记录源码提交 `3e883803ec2e6434fd66fafdad2cf938da16ad89`，许可为MIT。它是第三方开源协议库，不是三菱官方SDK，也不把安装量或主页兼容声明当作实机验收。[固定包](https://www.nuget.org/packages/McpX/0.13.0)、[对应源码](https://github.com/YudaiKitamura/McpX/tree/3e883803ec2e6434fd66fafdad2cf938da16ad89)
+
+**不要混用主分支1.x的代码。** 本版本使用 `new McpX(...)` 构造并连接、`Dispose()`关闭；没有本教程可用的 `McpXOptions` / 静态 `ConnectAsync` 这套新版用法，也没有读写方法的调用方 CancellationToken 参数。本例按还原包实际编译，未给不存在的方法补“想当然”的签名。
+
+使用范围为 TCP / Binary / 3E / Q-L设备指定格式；未测试4E、ASCII、UDP、iQ-R扩展、跨站路由、远程CPU操作、字符串或大块自动拆包。
+
+## 先看点位表
+
+所有地址只属于本程序启动的回环模拟设备：
+
+| 设备地址 | C#解释 | 初值与职责 | 访问边界 |
+| --- | --- | --- | --- |
+| D100 | short / 0.1℃ | -123，即-12.3℃ | 只读教学温度 |
+| D101～D102 | uint，低字在前 | 0x12345678 | 只读计数样例 |
+| D103～D104 | float | 23.5 | 只读浮点样例 |
+| D105 | ushort | 65535 | 只读无符号样例 |
+| D110 | short / 0.1℃ | 250，即25.0℃ | 可写0～1000原始值 |
+| D120～D127 | 演示暂存字 | 0 | 本机类型/批量写入练习 |
+| M100～M104 | bool | true,false,true,false,true | 可读写的内部模拟位 |
+| X10 | bool | true | 只读，不模拟现场输入电路 |
+| W10 / W16 | ushort | 1111 / 2222 | 十六进制编号，仅供读取 |
+
+模拟器没有提供Y输出、密码解锁或CPU状态变更。CLI不接受外部IP，不能把本例的写入直接指向现场设备。
+
+## 对象、属性和常用方法速查
+
+命名空间为 `McpXLib`、`McpXLib.Enums`，异常位于 `McpXLib.Exceptions`。
+
+| 成员 | 0.13.0中的作用 | 本例选择 |
+| --- | --- | --- |
+| McpX构造参数 ip / port | TCP连接目标；构造中建立连接 | 已启动的回环服务端及系统分配端口 |
+| password | 非null会涉及远程解锁/释放时加锁 | null，不执行解锁/锁定命令 |
+| isAscii / IsAscii | 报文编码选择 | false |
+| isUdp | 传输选择，构造参数 | false，即TCP |
+| requestFrame / RequestFrame | 帧选择 | RequestFrame.E3 |
+| processorSeries / ProcessorSeries | 设备指定格式选择 | ProcessorSeries.Q，不是声明接入了某款实机 |
+| timeoutMilliseconds | ushort类型，连接/单次请求超时配置 | 800 ms；不使用0无限等待 |
+| Route | 访问路径的报文构造器 | 使用默认直达本站，不运行时改写 |
+| UseMultiBlockAccess | 组合访问是否采用多块命令 | false，本轮不用 |
+| Read/ReadAsync&lt;T&gt; | 一个T类型元素 | 返回T；int/float可占两个字 |
+| BatchRead/BatchReadAsync&lt;T&gt; | 连续读取多个T元素 | 本版元素数量参数为ushort |
+| Write/WriteAsync&lt;T&gt; | 写入一个T元素 | Task完成或抛错，不返回操作完成状态枚举 |
+| BatchWrite/BatchWriteAsync&lt;T&gt; | 连续写入数组 | 返回值不能替代独立读回 |
+| Dispose | 释放实例持有的连接 | using作用域退出，不能依赖GC |
+
+属性虽然部分可写，也不代表可以在另一个任务通信时随意切换帧、编码与系列。本例初始化后保持不变，一个所有者顺序调用。也没有杜撰 `IsConnected` 属性来给界面显示永远可靠的在线状态。
+
+## 开启连接：这里的new真的会做网络工作
+
+项目的 `McExamples.Connect` 包装以下实际构造：
+
+```csharp
+using McpX plc = new(
+    device.Endpoint.Address.ToString(), device.Endpoint.Port,
+    password: null,
+    isAscii: false,
+    isUdp: false,
+    requestFrame: RequestFrame.E3,
+    timeoutMilliseconds: 800,
+    processorSeries: ProcessorSeries.Q,
+    useMultiBlockAccess: false);
+```
+
+`device` 是本机 `LoopbackMcDevice`，不是SDK里的设备发现对象。构造失败要记录连接异常，不再调用一个不存在的 `OpenAsync`；构造成功只说明socket已建立，首次MC读取仍可能因协议、地址或设备状态失败。
+
+因为构造是同步阻塞入口，WPF不能只把后面的Read改成await，就认为界面不会阻塞。示例用 `RunAsync` 把构造、调用和Dispose的所有权放在同一个后台任务里，并等待该任务结束；不是仅把一个读取任务丢到后台就不再管理。
+
+## 读取一个值和一批连续值
+
+```csharp
+short rawTemperature = await plc.ReadAsync<short>(Prefix.D, "100");
+decimal temperature = rawTemperature / 10m;
+uint counter = await plc.ReadAsync<uint>(Prefix.D, "101");
+float measurement = await plc.ReadAsync<float>(Prefix.D, "103");
+bool ready = await plc.ReadAsync<bool>(Prefix.X, "10");
+
+short[] pair = await plc.BatchReadAsync<short>(Prefix.D, "100", 2);
+bool[] states = await plc.BatchReadAsync<bool>(Prefix.M, "100", 5);
+```
+
+Prefix与编号分开传；D编号写`"100"`而不是`"D100"`。W/X/Y等编号按该版本库的十六进制规则解析，不加`0x`前缀。真实型号的工程地址应先转换核对，不能凭字符串外观默认一致。
+
+本机检查确认 W的`"10"`取0x10处的1111，而`"16"`取0x16处的2222。D的`"1A"`会在发包前因地址格式无效而报错，不能用读取0来掩盖。
+
+BatchRead的数量是T元素数。两个int从D120开始占四个字；本机检查实际发包中的设备点数为4。M的五个位会在协议数据中包含最后的填充半字节，但该版本命令层会去掉填充，返回恰好五个bool；不要额外删掉一个合法值。
+
+本例附带 `ReadExactAsync` 再核对返回数组长度，限制单次教学读取1～32个元素；它是自己的业务封装，不是SDK原生方法。一个格式完整但少一个值的成功响应，也不应被当作完整采样。
+
+这个长度检查不是完整协议验证器，不能证明库会校验所有路由、非法位编码或恶意载荷。现场还要核对所用包的解析与资源限制，并用对应对端验收；当前测试只覆盖列明的错误场景。
+
+## 写入：泛型宽度不是装饰
+
+单值写入：
+
+```csharp
+await plc.WriteAsync<short>(Prefix.D, "110", 300); // 一个字，30.0℃
+await plc.WriteAsync<bool>(Prefix.M, "100", true); // 一个模拟内部位
+```
+
+`WriteAsync<int>(Prefix.D,"110",300)`会占用D110和D111，不能因为数值300放得下short就假定只写一个字。业务代码应明确类型，而不是依赖默认int字面量推断。
+
+批量写入与读回：
+
+```csharp
+await plc.BatchWriteAsync<int>(Prefix.D, "120", [123456, -789]);
+int[] readBack = await McExamples.ReadExactAsync<int>(plc, Prefix.D, "120", 2);
+
+await plc.BatchWriteAsync<bool>(Prefix.M, "100", [false, true, false, true, false]);
+bool[] bitReadBack = await McExamples.ReadExactAsync<bool>(plc, Prefix.M, "100", 5);
+```
+
+参数写入封装 `WriteTargetAsync` 限制D110的原始值0～1000，检查停止令牌后只发送一次；模拟端同样检查范围。客户端拦截非法值用于及时反馈，服务端拒绝用于保护数据契约，两者不是互相替代。
+
+本例模拟端对不支持/不允许请求统一返回教学拒绝码C059，并测试异常的 ErrorCode。**这不是对所有真实设备错误原因的映射**；现场应保留十六进制结束码并对照型号手册，不要看到该码就一律显示“温度越界”。
+
+## 超时、停止和关闭：不要给旧API虚构取消能力
+
+0.13.0的 `ReadAsync` / `WriteAsync` 不接收调用方 CancellationToken。项目采用以下边界：
+
+- 在构造前、构造后和下一条业务请求前检查停止。
+- 请求正在等待时，不返回一个假装已经结束的Task；等待库完成或到达配置期限。
+- 调用方观察停止后不再发送下一条，最后由单一所有者Dispose。
+- 不让UI线程同时Dispose正在读写的对象，也不用WaitAsync取消外层等待后丢下原任务。
+
+该版本TCP传输源码按单个请求从发送到完整响应计算剩余时间，超时会关闭旧连接；并非每收到一个字节就重新获得800ms。连接阶段、排队、一次批量方法自动拆出的多条请求，也不能统统算成同一个800ms全流程期限。[固定TCP实现](https://github.com/YudaiKitamura/McpX/blob/3e883803ec2e6434fd66fafdad2cf938da16ad89/McpXLib/Transports/TcpPlcTransport.cs)
+
+本例800ms设置生成500ms设备监视定时器，二者不同；系统调度和清理也意味着不应许诺精确的实时退出时间。若后续需要立即协作取消，应选择并验证真正支持该能力的API版本或独占传输设计，而不是在教程代码中给本版本补一个token参数。
+
+TCP超时或EOF之后，本例释放整个实例，不在旧连接继续读，也不自动重建后重发写入。本轮只测试错误退出，不宣称已经实现长期恢复监控。
+
+## 完整所有权示例
+
+项目中的基本组合方式如下，`RunAsync`负责后台构造和using释放：
+
+```csharp
+await using var device = new LoopbackMcDevice();
+await McExamples.RunAsync(device, async (plc, stop) =>
+{
+    short before = await plc.ReadAsync<short>(Prefix.D, "110");
+    stop.ThrowIfCancellationRequested();
+    await McExamples.WriteTargetAsync(plc, 300, stop);
+    stop.ThrowIfCancellationRequested();
+    short after = await plc.ReadAsync<short>(Prefix.D, "110");
+    return after;
+});
+```
+
+这是同一项目内部组合片段；命令行入口执行的是完整检查流程。停止若发生在写入收到成功回执之后，不应把已知成功的写入改写为“未发送”；停止只是后续流程退出的原因。写入过程中断线则属于结果可能未知，两种情况要区分记录。
+
+退出时先等客户端工作任务/using结束，再取消并await模拟器服务。不要只调用Cancel而不观察任务结果，也不要在WPF关窗时用同步Wait堵住Dispatcher。
+
+## 异常按阶段记录，不用catch后返回默认值
+
+| 异常 | 本课含义 | 处理 |
+| --- | --- | --- |
+| DeviceAddressException | 库检测到编号格式无效 | 修改配置，未发送不算设备拒绝 |
+| McProtocolException | 非0结束码 | 保存ErrorCode、阶段和点位，不能当正常数值 |
+| RecivePacketException | 本版名称就是这个拼写；响应格式不符 | 中止会话，不猜测剩余数据 |
+| TimeoutException | 建立连接或单请求期限到达 | 失效旧采样，写入可能未知 |
+| IOException / SocketException | EOF、连接故障、旧实例不可用等 | 结束当前对象，单独决定恢复 |
+| InvalidDataException | 示例封装发现数量与契约不符 | 不提交不完整快照 |
+
+不要只看英文Message自动判定设备故障类型，也不要照抄新版 `ReceivePacketException` 拼写却声称能在这个包编译。
+
+## 运行与已完成验证
+
+```powershell
+dotnet run --project examples/industrial-mc/IndustrialMc.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-mc/IndustrialMc.csproj -c Release -- --demo
+```
+
+两个入口执行同一有限本机流程。46项检查包括独立报文向量、真实库发包核对、地址进制、整数/浮点、字与位读写、泛型点数、非法目标与地址、分段响应、结束码、异常帧头、短数据、静默超时、EOF、停止和端口释放。
+
+额外故障演示先让模拟端修改D110，再丢失回执并关闭；检查客户端看到失败、对端确实只写入一次且没有自动重放。知道模拟器内部值的测试代码不能据此宣称现场客户端已经知道写入结果。
+
+服务端只提供有界小数据区与0401/1401子集，不模拟PLC扫描、跨请求原子快照、CPU权限或物理互锁。已通过本机编译和回环，不等于已完成真实三菱PLC或长期WPF界面验收。
+
+继续阅读[设备动作握手：请求号、状态与结果保留](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)及 [C#命令邮箱、MC读写与恢复查询](/knowledge/industrial/host-computer/communication/csharp-command-mailbox-and-recovery/)，把“数据能写进去”组织成可追踪的模拟设备任务；真实设备仍须单独验收。

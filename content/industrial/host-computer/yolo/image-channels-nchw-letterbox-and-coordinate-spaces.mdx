@@ -1,0 +1,149 @@
+---
+id: industrial-yolo-preprocessing
+title: YOLO输入基础：颜色通道、NCHW、Letterbox与坐标还原
+description: 用小图解释BGR与RGB、HWC到NCHW、浮点归一化、缩放填充与插值，区分采样中心和框面积边界，并说明ROI原点、取整比例和padding候选的处理。
+tags: [工业自动化, YOLO, 图像预处理, 张量, 坐标变换]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 20
+prerequisite: [industrial-csharp-yolo-evaluation]
+related: [industrial-csharp-yolo-preprocessing, industrial-opencvsharp-wpf-display]
+---
+
+## 本批做什么：先验证输入，而不是先猜输出
+
+上一批建立了[数据与评价口径](/knowledge/industrial/host-computer/yolo/tasks-datasets-metrics-and-deployment-contracts/)。本批用自有小图字节实际执行C#预处理，生成RGB float32 NCHW数组，并验证框的正反变换。新增76项检查，其中一项包含36组坐标往返。
+
+没有读取JPEG/PNG、调用相机或ONNX Runtime，没有下载权重。本批实现一个明确的教学策略，不宣称与某个YOLO导出模型、Ultralytics或OpenCV逐字节一致。后续固定模型后，需要把实际预处理与参考输入逐项对照。
+
+## 1. 一张图有三层不同的信息
+
+第一层是采集/解码后的像素：宽高、颜色格式、每行stride、是否上下翻转。第二层是模型数值输入：尺寸、类型、维度、通道与数值范围。第三层是几何关系：用了哪块ROI，怎样缩放/填充，检测框要还原到哪里。
+
+这三层不能靠一个Width属性表达。显示正常的图也可能以错误的通道进入网络；形状正确的float数组也可能把像素压到错误范围；检测到了正确目标，框仍可能因漏减padding而整体偏移。
+
+| 阶段 | 本批的数据约定 | 需要保留的关系 |
+| --- | --- | --- |
+| 原图 | 自有、从上到下的BGR24，允许正stride行填充 | 原图尺寸与ROI原点 |
+| 取ROI/缩放 | 固定画布居中填充，记录实际缩放宽高 | ScaleX/ScaleY和四边padding |
+| 张量 | RGB float32，单张[1,3,H,W]，除255 | 当前变换和张量一起返回 |
+| 框还原 | 已解码的输入画布xyxy面积边界 | 去padding、除比例、加ROI原点 |
+
+变换对象只说明这组尺寸与公式，不证明真实帧或工件身份。未来异步推理还要像[WPF同帧显示](/knowledge/industrial/host-computer/opencvsharp/wpf-mat-bitmap-frame-consistency-and-lifetime/)那样保留请求/帧关联，不能把上次640×640变换用于下一张同尺寸却不同ROI的图。
+
+## 2. BGR、RGB、灰度与Bayer不是一回事
+
+RGB的红像素为(255,0,0)，相同像素在BGR内存顺序中为(0,0,255)。两者像素数和总字节数相同，传错通道未必抛异常，却会改变颜色特征。
+
+本例输入BGR24，读取通道索引0/1/2代表B/G/R；输出RGB平面索引0/1/2代表R/G/B，所以输出通道c读取输入2−c。当前Ultralytics预测器的常规三通道数组路径也有颜色重排与数值变换，但不能据此推断所有模型都需要同样处理。[官方预测器源码](https://github.com/ultralytics/ultralytics/blob/main/ultralytics/engine/predictor.py)
+
+相机Mono8不自动变成BGR24，Bayer也不等于三通道彩色，BGRA还多一个Alpha通道。需要在采集/解码边界先明确转换；本例不猜格式、不读取EXIF方向、不直接使用SDK临时缓冲。负stride/倒置图也不支持，必须显式转换成约定的从上到下布局。
+
+## 3. stride不是模型张量的宽
+
+宽2的BGR24有效一行是6字节，但stride可以为8，多出的2字节只是行填充。原图某通道的字节索引为：
+
+```text
+byteIndex = y * stride + x * 3 + bgrChannel
+```
+
+行尾填充不能作为下一行像素，更不能被归一化后填入张量。本批Bgr24Image.Create要求缓冲长度正好为stride×height并复制所有字节；处理时只读有效像素。用不同填充哨兵值的2×2小图验证跳行，能发现把stride误写成width×3的错误。
+
+## 4. HWC到NCHW：不仅是换Shape
+
+HWC按位置连续存每像素的通道；NCHW按批、通道、行、列组织。单张图的N=1，C=3。模型如果要求NHWC或其他排列，不能只照抄本例。
+
+以原图四个像素为例，按行分别为“红、绿 / 蓝、白”。完成RGB与归一化后：
+
+| 平面 | 第一行 | 第二行 | 连续数组片段 |
+| --- | --- | --- | --- |
+| R | 1, 0 | 0, 1 | 1,0,0,1 |
+| G | 0, 1 | 0, 1 | 0,1,0,1 |
+| B | 0, 0 | 1, 1 | 0,0,1,1 |
+
+因此float数组依次为R整平面、G整平面、B整平面，不是每个像素的RGB交错。单批NCHW索引公式：
+
+```text
+index = (channel * H + y) * W + x
+```
+
+给交错数组贴上[1,3,H,W]标签不会重排内容。数组长度对了、Run能执行，也不证明通道布局正确；先用这类可手算彩色小图核对，定位错误比看自然图片直观。
+
+## 5. 归一化和数据类型必须与模型一致
+
+本例把byte像素用resized/255f转为float32，0映射0，255映射1。要有浮点操作数，不能先用整数除法把绝大多数像素变成0。padding=114也需变成114/255≈0.4471，而不是填0、填114.0或在归一化后再除一次。
+
+“归一化”不是永远除255。有的输入需要不同均值/标准差、不同范围或整数类型；有的图包含预处理节点，外面再做一次会重复。float16、float32和量化int8/uint8也不能凭数组外观互换。本批只实现一套显式RGB float32除255约定，不提供自动猜测。
+
+## 6. 直接拉伸、裁剪和Letterbox的区别
+
+直接把640×480拉伸到640×640，会改变纵横比例；裁剪可以保留局部比例，但可能丢目标。Letterbox先按受限比例缩放，再把剩余画布填充，通常较好保留整体内容，但小目标仍可能随缩小失去细节。
+
+下面是本例的固定画布策略，ROI尺寸为Wr×Hr，网络画布为Wn×Hn：
+
+```text
+r = min(Wn / Wr, Hn / Hr)
+如果禁止放大：r = min(r, 1)
+resizedW = max(1, roundToEven(Wr * r))
+resizedH = max(1, roundToEven(Hr * r))
+left = (Wn - resizedW) / 2        // 非负整数除法
+top  = (Hn - resizedH) / 2
+right  = Wn - resizedW - left
+bottom = Hn - resizedH - top
+```
+
+余量为奇数时，右边或下边多1。例如2×1放入5×5，理想高度2.5，显式ToEven取2，top=1、bottom=2。禁止放大则保留2×1，left=1/right=2、top=2/bottom=2。最薄边保留至少1，不生成零高图；这不表示极端长宽比仍有足够检测质量。
+
+真实库可能提供auto/stride对齐、scale_fill、center与scaleup等选项，不能都简写成“等比缩放”。Ultralytics的LetterBox确实公开这些配置。[官方LetterBox参数](https://docs.ultralytics.com/reference/data/augment/#ultralytics.data.augment.LetterBox) 本例只实现固定画布/居中/可选禁止放大，不启用最小stride矩形或拉伸填满。
+
+## 7. 理想比例与实际栅格比例要分开记录
+
+本批框坐标采用“取整后栅格面积边界”的策略：ScaleX=resizedW/Wr，ScaleY=resizedH/Hr。3×2放入5×5时，r=5/3，实际缩放5×3，ScaleX=5/3、ScaleY=3/2，top=1。
+
+整个原图框(0,0,3,2)映射到(0,1,5,4)，再用实际比例还原得到(0,0,3,2)。若在本策略里误用理想r还原Y2，则(4−1)/(5/3)=1.8而不是2。
+
+但这不等于“所有YOLO的标签与后处理都应该改为ScaleX/ScaleY”。参考实现可能以理想统一比例变换标签、保存ratio/pad或采用其特定scale_boxes口径。模型学习到的坐标语义要随训练/导出/推理路线核对；不能把本例栅格策略未经对照直接套到模型上。后续真实模型会明确选择并验证适配策略，不把往返测试当参考兼容证明。
+
+## 8. 像素采样中心与框面积边界别混用
+
+框坐标是面积边界，前面使用x×ScaleX+left。图像插值要问“目标像素中心对应源图哪里”，本例采用half-pixel中心映射：
+
+```text
+sourceX = (targetX + 0.5) / ScaleX - 0.5
+sourceY = (targetY + 0.5) / ScaleY - 0.5
+```
+
+映射结果先限制在当前ROI的有效像素中心，再对邻近四点双线性插值；边缘复制，不到ROI外借像素。插值后按ToEven取整到byte，再除255f。二值掩膜/类别图不宜盲用此彩色图插值流程，否则会制造不存在的类别值。
+
+ONNX Resize规范也区分half_pixel、align_corners等坐标模式，说明“都是resize”不代表数值一致；本例没有执行ONNX Resize节点。[ONNX Resize坐标定义](https://onnx.ai/onnx/operators/onnx__Resize.html) 同样，本例double计算及byte取整不承诺与OpenCV内部整数优化逐字节相同，真实部署要对比参考张量及误差容忍。
+
+## 9. 从输入画布还原到原图
+
+设ROI左上为(X0,Y0)，本例已解码的输入框是连续xyxy，则：
+
+```text
+originalX = (inputX - left) / ScaleX + X0
+originalY = (inputY - top)  / ScaleY + Y0
+```
+
+这里的输入框必须已经明确是画布像素边界，不是归一化坐标、cxcywh或原始模型输出行。输出解码属于后续模型专题，本批Restore不负责猜测或转换。
+
+原图640×480，ROI=(100,50,320,200)，画布640×640：内容640×400、top=120、ScaleX=ScaleY=2。原图框(120,70,220,120)映射为(40,160,240,260)，还原时先减120、除2，再加ROI原点，而不是直接把网络框画到原图。
+
+本例先将输入框与画布中的实际内容区域求交，再还原。完全位于padding或仅接触内容边界时，没有原图面积，返回空框；部分重叠则记录WasClipped。裁剪只是几何处理，不能把“只剩一个小片段”自动认可为有效目标，业务/评价可能还要限制可见比例或拒绝边缘目标。
+
+还原到原图后，再做WPF视口缩放、标定或工件坐标变换。这是不同层次，不要直接把网络坐标当毫米、机器人坐标或屏幕DIP。
+
+## 10. 验证顺序与常见追问
+
+先查输入像素布局与颜色，再查纯色/渐变小图的张量，再用独立手算几何检查padding和ROI。正反往返只是补充：两边共享同一个错误公式也可能来回相等，所以本批同时保留独立黄金坐标和张量值。
+
+面试/排障中可以这样回答：
+
+- 框整体上下偏：先查top padding、ROI原点、是否重复还原以及当前帧变换，不先归因于模型差。
+- 形状正确但置信度异常：检查BGR/RGB、NCHW/NHWC、范围/dtype与是否重复归一化。
+- 框越界：先确认输出坐标契约，再执行明确的裁剪/拒绝策略；不可用交换端点或补零掩盖解码错误。
+- CPU和GPU结果略有不同：要固定预处理与输出解析、记录数值容忍，再分析算子/精度/执行环境；本批未做任何GPU对照。
+
+继续阅读[C#图像缓冲、输入数组与坐标变换实践](/knowledge/industrial/host-computer/yolo/csharp-bgr-nchw-letterbox-and-box-restoration/)。

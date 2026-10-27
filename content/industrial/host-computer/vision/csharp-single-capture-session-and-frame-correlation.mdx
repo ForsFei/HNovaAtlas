@@ -1,0 +1,180 @@
+---
+id: industrial-csharp-single-capture-session
+title: C# 单次采集会话：一次触发意图、帧关联与超时不补拍
+description: 在Mono8离线源上检查工件请求、外部触发关联和自有图像身份，拒绝旧帧串单、重复与冲突，晚到只记元数据而不自动处理。
+tags: [工业自动化, C#, 机器视觉, 图像采集, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 30
+prerequisite: [industrial-vision-acquisition-identity]
+related: [industrial-csharp-mono8-buffer-lifetime, industrial-csharp-trigger-frame-evidence, industrial-csharp-robot-task-session]
+---
+
+## 本轮只实现哪一层
+
+沿用`examples/industrial-vision/`新增`SingleCaptureSession.cs`与`CaptureChecks.cs`，无新包、线程、UI或硬件。既有OfflineFrameSource提供固定P2图像和真实托管深复制；新会话只负责应用请求、外部关联与处理交接。
+
+先读[采集会话与触发身份](/knowledge/industrial/host-computer/vision/acquisition-sessions-triggers-and-frame-identity/)。核心限制是：**外层必须先证明关联，模型只做核对**。测试人工填写TriggerSequence和Qualified，不代表相机真的支持回传PC请求号或软件触发计数。
+
+## 1. 运行方式
+
+```powershell
+dotnet build examples/industrial-vision/IndustrialVision.csproj -c Release
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --capture-test
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --capture-demo
+```
+
+本轮73项采集会话检查，上一批`--self-test`仍是63项图像/缓冲检查。demo故意在期限后投递匹配帧，输出LateEvidenceOnly、Unknown、Processing offered=False；没有真实SDK触发或延迟测量。
+
+## 2. 对象和常用方法
+
+| 对象/方法 | 内容或用途 |
+| --- | --- |
+| CaptureContext / Update | 设备代、主机会话、配置、模式、采集/许可/就绪及摘要时间 |
+| CaptureKey / CaptureRequest | 本地所有者＋序号、工件和配置版本 |
+| Prepare | 冻结一份尚未尝试的请求 |
+| TakeTrigger | 再查就绪与时效，只取一次本地触发意图 |
+| RecordDispatch | 记录未尝试、调用确认或结果未知 |
+| TriggerAssociation / Associate | 外部核对的本请求与原触发关系 |
+| CaptureFrame / ObserveFrame | 自有图像、原触发、质量、配置和主机接收时间 |
+| TakeForProcessing / ReleaseCapture | 一次图像交接与采集槽释放 |
+| Read / Invalidate | 读当前/最后历史，或声明失效；不做IO |
+
+这些是本项目类型，不是厂商API。实际连接与缓冲生命周期仍读[上一批示例](/knowledge/industrial/host-computer/vision/csharp-mono8-replay-and-buffer-lifetime/)，其中Open/Acquire/Close也只是离线源行为。没有相机SDK、软件触发发送器、Start/Stop/Abort或硬触发实现。
+
+## 3. 固定会话与配置
+
+```csharp
+using OfflineFrameSource source = new([PlainPgm.LoadFixture()]);
+source.Open();
+Guid cameraEpoch = Guid.NewGuid(); // 仅夹具，不是设备身份/重启证据。
+
+SingleCaptureSession capture = new(
+    cameraEpoch, source.Session, profileRevision: 1,
+    width: source.Width, height: source.Height,
+    startupReviewed: true);
+```
+
+构造固定相机执行代、主机图像会话、配置版本及期望尺寸。尺寸仍受Mono8教学上限约束；配置版本由外层管理，代码没有读回曝光/ROI/像素格式或审核设备身份。
+
+startupReviewed默认false，默认锁定。夹具声明true不证明旧触发、旧缓存、工件和采集配置已核对。真实启动必须外部建立可靠依据，不能把这段new放进自动重连分支就说恢复完成。
+
+OwnerSession为每个对象新生成的本地Guid，业务序号不回绕；但没有持久化或跨进程仲裁。全部方法要求单所有者串行调用，没有锁、多线程回调调度或后台看门狗。
+
+## 4. 输入CaptureContext
+
+```csharp
+CaptureContext context = new(
+    SampledAt: 0, CameraEpoch: cameraEpoch,
+    SourceSession: source.Session, ProfileRevision: 1,
+    Mode: AcquisitionMode.SoftwareSingle,
+    Valid: true, Grabbing: true, TriggerReady: true, ProcessPermit: true);
+capture.Update(context, now: 0);
+```
+
+所有正向布尔默认false，Mode默认Unknown。本模型只支持应用SoftwareSingle；HardwareSingle/Continuous是用来明确拒绝误用的类别，不是已经实现的采集器，也不直接映射相机AcquisitionMode枚举。
+
+Update检查质量、设备/主机代、配置、模式、Grabbing和普通工艺许可，并检查时间。TriggerReady只在Prepare/TakeTrigger时要求true；等待本帧时可以false，避免把正常忙碌当故障。
+
+SampledAt与now必须是同一单调时钟域。默认maxAge=0.25秒是教学策略；会检查上一摘要是否已经过期，不能让新数据遮住中间缺口。无效、未来、重复或错代摘要会锁定，新鲜数据不会自动解锁。
+
+## 5. 一次请求和一次触发意图
+
+```csharp
+CaptureRequest? request = capture.Prepare("part-A", now: .01);
+CaptureRequest? intent = capture.TakeTrigger(now: .02);
+if (intent is not null)
+{
+    capture.RecordDispatch(intent.Key,
+        TriggerDispatchEvidence.Acknowledged, now: .03);
+}
+```
+
+Prepare记录工件和ProfileRevision，状态Prepared。TakeTrigger再次复核就绪/时效，状态TriggerTaken；反复调用不会得到第二份意图。上面Acknowledged也只是脚本输入，没有发出SDK调用。
+
+NotAttempted表示本实例发布者明确未尝试，保留NotSubmitted并锁定复核；Unknown表示可能触发，保留Unknown且不自动补拍；Acknowledged仅进入AwaitingFrame，不能凭它构造帧身份。
+
+如果独立合格关联与完整帧比回执先到，可先得到FrameMatched；晚回执不得把帧证据覆盖回AwaitingFrame。单靠“本地取了一次”不证明物理曝光exactly-once。
+
+## 6. Associate最容易被误用在哪里
+
+```csharp
+if (request is not null)
+{
+    capture.Associate(new TriggerAssociation(
+        request.Key, cameraEpoch, TriggerSequence: 7, Qualified: true), now: .035);
+}
+```
+
+7只是夹具数字，不是从当前工件号、回调次数或帧号自动计算的设备触发身份。Qualified默认false，外层需要独立核对真正关联；同一请求关联一旦确定，不能换成另一触发。
+
+TriggerSequence在同一设备代内要求严格递增且不复用，允许跳号，0可有效，缺失用nullable表示。它是适配后的契约，不表示原生计数永不回绕，也不验证期间没有丢触发。真实计数复位/回绕、切换模式或缺关联能力，都需单独处理。
+
+只有本所有者当前请求、已经取出触发意图且未明确NotAttempted，才可安装关联。调用确认不能绕过Qualified。模型不读取Chunk、时钟或外部触发IO，不实现关联证明本身。
+
+## 7. 把已复制的图像作为证据输入
+
+```csharp
+OwnedFrame owned;
+using (FrameLease lease = source.Acquire()) owned = lease.CopyToOwned();
+
+CaptureFrame packet = new(
+    owned, cameraEpoch, ProfileRevision: 1,
+    TriggerSequence: 7, ReceivedAt: .04,
+    Complete: true, IdentityQualified: true);
+
+CaptureFrameDecision decision = capture.ObserveFrame(packet, now: .04);
+```
+
+这段读取真实P2夹具像素，但相机代、触发序号、完整性与身份资格都由测试声明，不是硬件报告。主机FrameStamp与TriggerSequence分属两域，不能用owned.Stamp.Number直接填入7来冒充证明。
+
+帧需匹配当前设备代、主机图像会话、配置与原触发关联，还要完整、身份资格有效、尺寸符合固定配置、FrameStamp非零且未在该源会话中重复用于新请求。ReceivedAt需新鲜、不在未来且不早于取触发意图；它仍只是主机时间，不证明真实曝光发生在某机械位置。
+
+只有得到Matched，才存在可供后续取走的CaptureResult。没有关联或没有触发身份返回Uncorrelated；模型不会保留这份未关联像素、自动排FIFO或在关联稍后到达时偷偷配上。外层若确有可靠关联且仍持有新鲜自有包，可显式再次提交；本轮没有这类缓冲队列。
+
+## 8. 重复、冲突和旧回调
+
+完全相同帧身份、尺寸、元数据和像素再次出现，返回Duplicate。测试还验证重新深复制的相同像素仍可识别重复；本实现比较时复制两份像素数组，属于受教学尺寸限制的线性离线检查，不作高帧率性能承诺。
+
+同触发出现另一FrameStamp，或同Stamp内容/元数据改变，返回Conflict并锁定，保留第一次匹配记录。它不适用于一触发多曝光或burst任务；不能把额外帧自动当下一工件。
+
+旧设备代、旧主机SourceSession、错配置或另一触发序号返回Unrelated，不刷新上下文或期限。不同工件不得靠“当前请求只有一个”而接纳下一张到达的图。
+
+## 9. 期限后为什么只有LateEvidenceOnly
+
+默认frameBudget=1秒，从TakeTrigger时开始，且由后续方法调用检查。上下文持续新鲜也不能让收帧无限等待；如果应用线程不调用方法，没有独立定时器执行期限，更不能保证设备停止。
+
+超预算、失联、配置/代变化、无效摘要或派发Unknown后会粘性锁定。在已知原关联且晚到帧仍是新鲜、合格、匹配的情况下，只记LateFrame这个FrameStamp，返回LateEvidenceOnly；不保存额外晚到像素，不把Unknown改成FrameMatched。
+
+TakeForProcessing和新触发都被阻止。旧帧时间本身过期或匹配证据无效则拒绝；“晚到但刚收到”与“很早收到、现在才处理”是不同情况。demo使用0.1秒预算在0.2秒投递，展示这一区别，不是相机时序测量。
+
+## 10. TakeForProcessing与ReleaseCapture
+
+```csharp
+CaptureResult? work = capture.TakeForProcessing(now: .05);
+if (work is not null)
+{
+    // 此时应用取得的是带请求/工件/配置的自有图像。
+    // 实际有界队列和算法尚未在本批实现。
+    capture.ReleaseCapture(work.Request.Key, now: .06);
+}
+```
+
+TakeForProcessing只取一次，还会检查当前上下文和图像ReceivedAt年龄。即便相机摘要一直更新，太旧的已匹配图也不能获得新的处理意图；历史记录仍保留。
+
+ReleaseCapture只释放本地采集槽，要求匹配Key且此前已取处理所有权。它不代表算法已运行、产品合格、已入库或留图成功。下一请求仍需显式Prepare、就绪和一次TakeTrigger。
+
+LastReleased仅保存最后一条内存匹配记录，可能持有一张自有图，不是完整追溯日志。业务结果的Key关联、队列与存储下一批单独实现。
+
+## 11. 关闭与重连边界
+
+Invalidate不发Stop/Abort/Flush，也不归还SDK结果；资源依旧按上一批的using管理。Prepared被失效时记NotSubmitted，已经取触发但尚未匹配则Unknown，已有匹配记录保留历史但不再给处理许可。
+
+新会话需要重新核对设备、图像源和配置以及旧工件/触发/缓存。OwnerSession新Guid和源Session更新只是隔离手段，不证明现场已对账；没有自动重连、重试、补拍或恢复接口。
+
+## 12. 73项检查与未完成项
+
+覆盖默认阻止、就绪两次复核、一次触发、回执与帧先后、关联缺失/变更、原请求与主机会话、重复/冲突/旧图串单、尺寸与完整性、未知/超时晚到只记元数据、摘要覆盖缺口、图像处理前时效和一次交接。
+
+全部关联与状态是脚本夹具，只验证应用契约。没有真实SDK、Chunk/硬件触发、设备时间同步、关联证明算法、并发回调/队列、检测准确率或现场停止验收。相机继续通用路线，下一批有界处理、算法结果交接与预览/检测分流，后续再补标定和具体视觉库。

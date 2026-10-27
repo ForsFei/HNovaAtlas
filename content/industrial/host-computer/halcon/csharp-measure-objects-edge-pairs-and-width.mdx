@@ -1,0 +1,176 @@
+---
+id: industrial-csharp-halcon-one-dimensional-measurement
+title: C#实践：测量对象、边缘配对、宽度读回与释放
+description: 固定HALCON 24.11.3真实接口编译GenMeasureRectangle2/MeasurePos/MeasurePairs，用56项托管检查验证窗口、方向和不同长度元组，七组原生测量预期保留待验证。
+tags: [工业自动化, C#, HALCON, 边缘测量, 尺寸测量]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 90
+prerequisite: [industrial-halcon-one-dimensional-measurement, industrial-csharp-halcon-shape-following]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline]
+---
+
+## 本轮交付边界
+
+沿用`examples/industrial-halcon/`，官方MVTec.HalconDotNet仍固定24113.0.0、锁文件与.NET10/x64。新增真实一维测量调用，托管侧只验证窗口与数值输出，不实现高斯滤波、边缘搜索或HALCON回退。
+
+| 验证项 | 状态 |
+| --- | --- |
+| 锁模式还原、真实接口Release编译 | 通过，零警告零错误 |
+| 新增窗口/夹具/输出检查 | 56项纯托管检查通过 |
+| 既有四批托管检查 | 34＋27＋35＋53项回归通过 |
+| 原生measure-test | DllNotFoundException，退出3，未通过 |
+| 七组测量数值、释放/性能/精度 | 待原生与真实数据验收 |
+
+没有安装原生运行库、修改PATH/注册表/许可、写模型文件或调用设备。最终结果仅为像素宽度，不返回毫米、产品OK/NG或机械动作。
+
+## 1. 文件与命令
+
+| 文件 | 内容 |
+| --- | --- |
+| MeasureFixture.cs | 128×96原创亮条、暗槽、双条、背景、单阶跃与横条像素 |
+| MeasureContracts.cs | MeasureWindow、边缘/配对快照、对应关系与结果状态 |
+| MeasureDemo.cs | 真实测量对象、两种边缘API与局部释放 |
+| MeasureChecks.cs | 56项不调用HALCON的检查 |
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --measure-contract-test
+```
+
+在匹配24.11.3原生运行库、x64与合法许可的厂商环境中，再运行：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --measure-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --measure-native-test
+```
+
+demo只处理默认亮条，test才检查七组场景。退出码仍为0所选路径完成、1托管失败、2CLI用法错误、3原生路径失败；不能用contract-test通过替代native-test。
+
+## 2. 测量对象不是区域、模型或相机连接
+
+| 类型/方法 | 用途与区别 |
+| --- | --- |
+| HMeasure | 专用测量对象风格，包含相应测量方法 |
+| HTuple handle | 本例静态风格返回的测量句柄，不是HRegion |
+| GenMeasureRectangle2 | 根据窗口和图像尺寸建立采样数据结构 |
+| MeasureProjection | 取得一维灰度剖面；本轮只作接口导读 |
+| MeasurePos | 返回独立边缘、幅值与相邻距离 |
+| MeasurePairs | 返回配对端点、对内距离与对间距 |
+| CloseMeasure | 显式删除测量对象，不是关闭相机 |
+| Dispose | 归还自己拥有的包装器/句柄引用 |
+
+本例统一HOperatorSet静态调用，HTuple输出按有效Length复制后转只读托管对象；不把原生测量句柄传给UI。HMeasure不是有一个自动随相机更新的Width属性的传感器对象。[创建对象](https://www.mvtec.com/doc/halcon/2411/en/gen_measure_rectangle2.html)、[剖面接口](https://www.mvtec.com/doc/halcon/2411/en/measure_projection.html)
+
+## 3. 示例配方属性与验证
+
+```csharp
+MeasureWindow window = new();
+window.Validate();
+MeasureWindow vertical = window with { Phi = Math.PI / 2 };
+```
+
+| 属性 | 默认值 | 责任 |
+| --- | --- | --- |
+| Row / Column | 48 / 64 | 整数窗口中心 |
+| Phi | 0 | 弧度，扫描主轴方向 |
+| HalfLength1 / HalfLength2 | 40 / 8 | 两个半长度，不是完整宽高 |
+| Sigma | 1 | 一维边缘提取平滑尺度 |
+| Threshold | 20 | 幅值门槛，不是分割灰度 |
+
+这些是示例record的属性，不是HMeasure上可随意设置、自动重建采样表的属性。固定图像128×96、单通道byte，插值为bilinear；中心限定整数以避开内部取整含义。
+
+Validate检查有限数、教学长度上限、Sigma≥0.4且不大于min(10,HalfLength1/4)、Threshold在1..255，并按旋转后的完整矩形范围加1像素余量检查边界。Sigma/长度比和其他上限是本例策略，不是HALCON全部合法范围。无静默裁剪或自动扩大窗口。[官方采样与边界说明](https://www.mvtec.com/doc/halcon/2411/en/gen_measure_rectangle2.html)
+
+## 4. 创建真实测量对象
+
+以下是MeasureDemo.Analyze中的片段，完整函数声明输出并在finally释放：
+
+```csharp
+HOperatorSet.GenMeasureRectangle2(
+    window.Row, window.Column, window.Phi,
+    window.HalfLength1, window.HalfLength2,
+    128, 96, "bilinear", out handle);
+```
+
+图像由GenImageConst/SetGrayval建立，先完成新独占图像的像素写入，再执行测量；不是相机缓冲接入或高吞吐搬运示范。像素数组有12288项，属于已知有界夹具。
+
+同一次Analyze中MeasurePos和MeasurePairs复用这个handle、同一张图与同样Sigma/Threshold。不同Analyze会新建并释放句柄，本批没有实现跨帧缓存、并发复用或窗口动态更新。
+
+## 5. 独立边缘：Distance不是等长输出
+
+```csharp
+HOperatorSet.MeasurePos(image, handle,
+    window.Sigma, window.Threshold, "all", "all",
+    out rows, out columns, out amplitudes, out distances);
+```
+
+两次all分别表示两种极性都提取、所有边缘都返回。ReadEdges要求行/列/幅值各N项、Distance为max(0,N-1)项；上限16条是教学资源策略。[MeasurePos输出](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)
+
+每条边先验证有限性、原图范围、幅值绝对值不低于门槛，再核对它位于窗口主轴及主轴范围。相邻距离要为正并与扫描坐标之差一致，而不是把Row或Column统一升序排序。
+
+Project在本例使用Along=-sin(Phi)×ΔRow+cos(Phi)×ΔColumn。Phi=π/2时Row从63.5到31.5，对应Along增加32；“行号递减”不是负宽度。
+
+## 6. 配对：七组等长数组加一组短数组
+
+```csharp
+HOperatorSet.MeasurePairs(image, handle,
+    window.Sigma, window.Threshold, transition, "all",
+    out r1, out c1, out a1, out r2, out c2, out a2,
+    out intra, out inter);
+```
+
+ReadPairs要求两组端点的行/列/幅值和Intra各M项，Inter为max(0,M-1)项。本例只接收positive或negative作为首边缘极性，HALCON支持的all/strongest等模式没有开放给该适配器；不能把教学限制误写成API不支持。[MeasurePairs规则](https://www.mvtec.com/doc/halcon/2411/en/measure_pairs.html)
+
+配对先后顺序、幅值符号、Intra与端点的距离、Inter与前一对末端到后一对起点的距离都要一致。最多8对，不把少一个Inter元素补成0，也不将一对情况下的空Inter当异常。
+
+这里对矩形主轴输出作校验，不能直接复用到环弧测量；沿弧距离、窗口参数和坐标关系应另设契约。
+
+## 7. 合并证据：什么时候才发布宽度
+
+两次原生调用使用同样的图像与提取参数，因此Combine要求每个配对端点都能与全边缘列表对应；若位置或幅值不一致就独立报错，不把不同调用的历史输出拼成一组测量。
+
+数值相符本身不能证明同帧；本例依靠一次同步Analyze中不更换图像的调用范围。正式接入仍需明确帧/配方身份，不能用端点相等代替关联证据。
+
+| Outcome | 条件 | WidthPixels |
+| --- | --- | --- |
+| NoEdges | 没有边缘，且无配对 | null |
+| NoPair | 有边缘，但当前规则没有完整配对 | null |
+| Ambiguous | 多组配对，或一组配对外还有额外边缘 | null |
+| WidthMeasured | 恰好两条边，恰好一个对应配对 | 该对Intra |
+
+WidthMeasured只表示这个有界示例的像素宽度证据成立，不是产品合格。单边缘、错误首极性或双目标，都不生成默认0宽度，也不自动挑第一组。
+
+EdgeProfile和PairProfile保留全部端点与距离，结果列表与距离数组只读且独立复制。源码复用前篇的ImagePixel坐标类型，完整项目可直接编译；只复制一个文件不是独立程序。
+
+## 8. domain、定位与测量句柄的关系
+
+MeasurePos及剖面测量忽略图像domain，测量范围由测量对象本身决定。将上一批的HRegion拿来ReduceDomain后，继续复用旧测量handle，不能保证测量位置已经跟随目标。[domain说明](https://www.mvtec.com/doc/halcon/2411/en/measure_pos.html)
+
+正式接入形状定位时，需以同一帧与配方的变换更新中心、主轴方向、长度/图像尺寸等配置，再建立或正确更新测量对象。不能把六元素矩阵直接当作GenMeasureRectangle2的全部参数。
+
+本批只提供独立固定窗口案例，没有把ShapeDemo与MeasureDemo串成流水线，也不携带相机帧、工件或模型身份。不要根据两个单独示例都能编译，就报告定位测量闭环完成。
+
+## 9. 句柄与输出的释放
+
+Analyze创建图像与测量句柄，在finally释放所有数字输出元组、handle和image。固定24113.0.0包的HTuple.Dispose会归还其中存储的句柄引用；本例不再额外强制CloseMeasure，也没有借用句柄、别名、线程或缓存。
+
+CloseMeasure是显式删除测量对象的接口；若由别处统一持有，就不能在一次测量结束时擅自关闭。采用专用HMeasure包装或静态HTuple风格，都应明确一个所有者与一条清理策略。[CloseMeasure参考](https://www.mvtec.com/doc/halcon/2411/en/close_measure.html)
+
+本轮原生库第一步加载就失败，因此没有实际验证句柄释放、复用后的内存、异常中途清理或长期吞吐。不要把finally已经写好当作这些验收已通过。
+
+## 10. 测试覆盖与原生预期
+
+56项纯托管检查覆盖窗口角度/长度/采样余量、Sigma与幅值策略、轴向投影、边缘N-1与配对M-1长度、符号/顺序/距离、端点对应、空/单边/多候选状态、只读快照和夹具布局。不执行边缘检测、高斯滤波或插值。
+
+原生test计划检查亮条32px、暗槽32px、朝上扫描横条32px、纯背景、单阶跃、错误首极性与双条带。双条应保留宽16/16与间隙24；前三组边界和距离允许0.75像素教学误差，幅值只校验方向/门槛，不猜精确幅值。
+
+当前原生test实际尝试为DllNotFoundException/退出3，七组预期未通过。应在合法环境中先对照相同夹具，再加入噪声、倾斜、模糊、毛刺、倒角、弱边缘、采样边界与不完整工件，不能只看一张理想图。
+
+## 11. 下一步：物理尺寸与二维几何
+
+本批没有毫米换算代码或工艺公差。标定后应在适用平面/范围内转换边缘点并计算真实距离，还需独立精度与重复性证据；不是把WidthPixels乘一个凭空写的比例。
+
+继续学习[直线/圆的多处边缘与Metrology模型](/knowledge/industrial/host-computer/halcon/lines-circles-and-metrology-models/)，结合 [C#模型创建、参数设置与几何读回](/knowledge/industrial/host-computer/halcon/csharp-metrology-model-lines-circles-and-results/)。后续再接HDevelop导出/HDevEngine及WPF。先把“找对哪两条边、测的是什么距离、结果属于哪个坐标系”建立清楚，再扩大系统规模。

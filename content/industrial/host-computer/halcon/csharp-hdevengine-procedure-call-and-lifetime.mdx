@@ -1,0 +1,132 @@
+---
+id: industrial-csharp-halcon-engine
+title: C#实践：HDevEngine过程加载、参数传递与释放
+description: 使用固定24.11.3接口编译HDevEngine、HDevProcedure和HDevProcedureCall，传图像/控制参数、执行并读取区域和数值，记录20项托管检查与原生加载边界。
+tags: [工业自动化, C#, HALCON, HDevEngine, 资源管理]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 130
+prerequisite: [industrial-halcon-procedure-integration, industrial-csharp-halcon-first-pipeline]
+related: [industrial-csharp-halcon-metrology, industrial-csharp-wpf-vision-viewer]
+---
+
+## 本轮范围
+
+沿用examples/industrial-halcon/及MVTec.HalconDotNet 24113.0.0/.NET10/x64。新增EngineDemo.cs、EngineContracts.cs和procedures/atlas_blob_v1.hdvp。没有新NuGet包，没有修改系统运行环境或许可。
+
+真实引擎接口Release编译通过，新增20项纯托管契约检查通过。原生入口实际尝试仍为DllNotFoundException/退出3，因此过程文件的HALCON加载、执行、数值、异常中途释放和长期内存均未验证。手写.hdvp不是实际HDevelop导出产物，不报告IDE操作已完成。
+
+## 1. 命令与依赖
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --engine-contract-test
+```
+
+以下仅在匹配的24.11.3/x64原生环境与合法许可配置后运行，当前未通过：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --engine-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --engine-native-test
+```
+
+固定包XML明确HDevEngine依赖hdevenginecpp.dll。只还原.NET接口包不能提供完整引擎部署；还需厂商对应运行组件及其依赖。不要从不明网站单独下载DLL或把旧版本文件复制进系统目录。[官方引擎说明](https://www.mvtec.com/products/halcon/features-tools/development-tools-programming/hdevengine)
+
+## 2. 三个核心类
+
+| 对象 | 责任 | 本例常用成员 |
+| --- | --- | --- |
+| HDevEngine | 引擎环境与过程搜索配置 | SetProcedurePath、Dispose |
+| HDevProcedure | 已加载过程的描述 | 构造函数、GetInput/Output参数元数据方法、Dispose |
+| HDevProcedureCall | 一次执行的输入输出状态 | SetInput…、Execute、GetOutput…、Dispose |
+
+固定包还提供HDevProgram/HDevProgramCall，用于程序级调用，本批只作导读，不执行整段main。读取参数元数据可以在启动时核对接口，但本例没有做完整反射式参数绑定器。
+
+这些类不是通过Connect/Open连接网络设备的对象。也不存在一个通用Read方法把所有过程结果自动变成业务DTO；图标输出和控制输出要分别读取。
+
+## 3. 加载过程
+
+```csharp
+using HDevEngine engine = new();
+engine.SetProcedurePath(Path.Combine(AppContext.BaseDirectory, "procedures"));
+using HDevProcedure procedure = new("atlas_blob_v1");
+```
+
+csproj将外部过程复制到输出目录procedures。构造函数参数是已知过程名，搜索路径决定从哪里加载；不把web输入、任意盘符或网络目录作为过程来源。
+
+SetProcedurePath等配置不能当成每个工件请求自己的局部变量。示例是独立CLI、同步单调用者，每次Analyze创建自己的包装对象，不展示多个独立引擎环境隔离，不提供多线程路径修改、缓存或自动卸载/热更新。
+
+生产中通常应在启动/配方切换阶段处理加载，避免每帧重复解析；这需要补充所有权和在途调用排空，本批未实现，也没有吞掉加载错误后继续使用旧过程。
+
+## 4. 输入验证后传参
+
+Analyze首先拒绝NaN/无穷或范围外Low。固定夹具从输出目录读取后，检查单图、8×6、byte和单通道；不是任意相机图像接入。只读检查neighborhood=8、max_connection=0，不修改全局系统设置。
+
+```csharp
+call = new HDevProcedureCall(procedure);
+call.SetInputIconicParamObject("Image", image);
+call.SetInputCtrlParamTuple("Low", threshold);
+call.Execute();
+```
+
+image是保持存活的HObject，threshold是HTuple(low)。不能把Image传给SetInputCtrlParamTuple，也不能把文件路径当作图标对象。
+
+使用名称重载使映射更容易阅读；如果用索引重载，固定包说明参数索引从1开始，且各组参数独立，不是把四组参数合成一个从0开始的数组。本例不靠“第几个参数大概没变”维持接口。
+
+Execute是同步调用，不返回Task，也没有在本例中接受CancellationToken。把它包装进Task.Run并对等待超时，不代表原生算法已经停止；在途调用未完成前不能释放它使用的图像和调用对象。
+
+## 5. 读取图标输出和控制输出
+
+```csharp
+selected = call.GetOutputIconicParamObject("Selected");
+version = call.GetOutputCtrlParamTuple("ContractVersion");
+areas = call.GetOutputCtrlParamTuple("Areas");
+rows = call.GetOutputCtrlParamTuple("Rows");
+columns = call.GetOutputCtrlParamTuple("Columns");
+```
+
+GetOutputIconicParamObject返回区域对象包装，不是面积列表。GetOutputCtrlParamTuple返回数值元组，不是可直接绑定的单个double。专用Image/Region/Xld读取方法也存在，本例统一HObject读取，减少类型转换分支。
+
+读取必须发生在Execute成功之后。异常后不要继续取历史输出并发布；复用调用对象时尤其需要防止上一轮值冒充本轮值。本例每次新建call，没有实现跨帧复用。
+
+## 6. 版本和输出契约
+
+EngineContracts.Read要求ContractVersion恰好一项且等于1，然后复用第一批BlobReadback校验：对象数0..64、面积2..10、三元组长度一致、有限整数面积、行列在8×6范围内。数值通过TupleReal转实数后，仅复制DArr的有效Length前缀。
+
+有0个区域且三个元组都空，得到NoCandidates；有对象则得到Candidates及只读BlobFeature列表。Candidates不是产品OK。版本不支持或长度冲突时抛错，不静默截断、补0或发布部分结果。
+
+接口版本是必要检查之一，不证明过程文件内容正确，也不绑定工件/帧/配方身份。正式接入还需[同帧结果与上位机显示边界](/knowledge/industrial/host-computer/vision/wpf-image-display-coordinates-and-frame-consistency/)，不能凭区域中心相同就认为它们属于同一次拍照。
+
+## 7. 释放顺序和输入借用
+
+外层using持有engine、procedure和threshold；try/finally持有image、call及返回的区域/数字包装。先复制结果为独立托管快照，再释放输出包装，之后释放call和image，最后由using清理其余对象。
+
+image在Execute以及读回期间一直存活，直到call释放后才归还。输入不是借来就转交所有权给UI；输出图标对象也不直接从Analyze返回。当前没有CopyImage深复制、相机缓冲借用或跨线程图形共享。
+
+过程内部的Region/Components为局部变量，不用clear_all等交互命令清空整个运行环境。未来引入模型句柄时，应单独明确创建/借用/清除责任，不能照抄这个无模型分割过程就假定所有资源都自动安全。
+
+本轮原生库加载失败，以上是实现的所有权设计，不是实测内存稳定性证明。仍需实际异常注入、重复调用及长时间内存观察。
+
+## 8. 异常、路径与诊断
+
+缺少过程、错误参数名和算子失败应作为不同诊断线索；HDevEngineException的Category、HalconError、ProcedureName、LineNumber等可用于定位，但不应把完整源码/路径无筛选地写到面向所有用户的页面。
+
+现有CLI原生分支统一退出3并打印异常类型；并不把每类错误都解释成DLL缺失或许可错误。建议排查时从实际异常类型开始，核对位数、匹配组件、过程是否部署及接口名字，不要先修改系统PATH碰碰运气。
+
+本例没有启动调试服务、允许忽略无效代码、捕获后重试、加载任意第三方脚本或访问设备。不同错误的完整诊断UI和恢复流程仍未实现。
+
+## 9. 怎样验证这个示例
+
+20项托管检查覆盖Low的边界/有限性、标量版本、错误版本、区域数/数值长度一致、固定坐标/面积与独立复制。不创建HDevEngine，不解析过程，不调用HALCON，不验证许可。
+
+native-demo仅调用Low=200。native-test计划调用200/254，并与第一批直接HOperatorSet链比较：前者一块面积4、中心(1.5,1.5)，后者NoCandidates。只有真实调用与断言完成后才打印原生通过。
+
+当前真实尝试为DllNotFoundException/退出3，过程加载/语法及两组对照都未通过。通用XML检查只说明文件结构可读取，不证明HDVP格式或算子被HALCON接受。下一次有合法环境时，先在HDevelop核对接口、保存和执行，再运行引擎对照，必要时修复文件格式后重验，不把待验证源文件当作已验收产物。
+
+## 10. 下一步：接WPF而不阻塞UI
+
+本批只交付无窗口同步CLI。后续WPF集成应明确后台调用者、提交容量、图像/结果身份、Dispatcher交接、关闭时等待在途调用以及谁负责Dispose；不因用户关窗口就立刻释放仍在原生执行中的资源。
+
+不需要为了一个算法入口先建立复杂插件平台。先完成离线图像→后台一次算法→只读结果→同帧显示，再扩展相机和工位流程。继续读[C# WPF单次会话与像素桥接](/knowledge/industrial/host-computer/halcon/csharp-wpf-halcon-frame-session-and-viewer/)。HDevEngine原生环境与数值验收仍单列，不因WPF能编译而自动算通过。

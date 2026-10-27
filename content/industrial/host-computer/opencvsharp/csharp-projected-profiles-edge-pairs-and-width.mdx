@@ -1,0 +1,171 @@
+---
+id: industrial-csharp-opencvsharp-stripe-measurement
+title: C#实践：Reduce、灰度轮廓、边缘配对与宽度
+description: 使用OpenCvSharp真实投影和平滑接口，自己实现差分分组、极性配对及唯一测量状态，读回亮条暗槽宽度并验证边界、反向和多候选。
+tags: [工业自动化, C#, OpenCvSharp, 灰度轮廓, 像素测量]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 110
+prerequisite: [industrial-opencvsharp-stripe-measurement, industrial-csharp-opencvsharp-edge-fitting]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 交付与运行
+
+沿用examples/industrial-opencvsharp/，包及锁文件不变，固定OpenCvSharp4与Windows原生包4.13.0.20260627，运行库OpenCV4.13.0。新增StripeRecipe.cs、StripeDemo.cs、StripeContracts.cs、StripeChecks.cs，没有新界面、相机或文件保存操作。
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --stripe-contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --stripe-native-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --stripe-demo
+```
+
+Release编译零警告零错误，新增34项纯托管配方/合成轮廓检查与28项真实原生路径检查通过。后者实际调用Reduce/GaussianBlur，再执行本例C#分析，不应描述成“28项原生卡尺算子检查”。成功退出0、托管失败1、错误用法2、原生路径失败3，无运行库失败后的托管替代图像流程。
+
+## 1. 先区分库接口和自定义接口
+
+| 对象/方法 | 常用成员 | 本例用途 |
+| --- | --- | --- |
+| Mat | Empty()、Dims、Type()、Rows、Cols、Total() | 验证二维Mono8并缓存尺寸 |
+| Mat ROI构造/Clone() | new Mat(gray,Rect)、Clone() | 借用视图与独占副本 |
+| Cv2.Reduce | dim、rtype、dtype | ROI平均为单行/单列 |
+| Cv2.GaussianBlur | ksize、sigmaX/Y、borderType | 沿扫描轴平滑 |
+| Mat.At&lt;double&gt; | row、column | 读CV_64FC1，行列不可交换 |
+| StripeRecipe | Window、Axis、Reverse、Polarity、DifferenceThreshold、Sigma | 本例自定义参数，不是厂商对象 |
+| StripeDemo.Measure | gray、recipe → StripeReport | 原生投影/平滑加C#配对 |
+| StripeAnalysis.Analyze | mean、smooth、recipe → StripeReport | 纯托管分析，输入不是图像 |
+
+OpenCV接口对照[Reduce](https://docs.opencv.org/4.13.0/d2/de8/group__core__array.html)和[GaussianBlur](https://docs.opencv.org/4.13.0/d4/d86/group__imgproc__filter.html)。本例没有Cv2.MeasurePairs/Cv2.CreateCaliper等调用，也没有用上一批Hough圆候选假装完成宽度测量。
+
+## 2. 配方对象及边界
+
+默认配方：
+
+```csharp
+StripeRecipe recipe = new(new ScanWindow(16, 16, 96, 32),
+    Axis: ScanAxis.X,
+    Reverse: false,
+    Polarity: StripePolarity.Bright,
+    DifferenceThreshold: 20,
+    Sigma: 1);
+```
+
+ScanWindow是本例纯值结构。Validate限制枚举合法、原点非负且不超过1048576、扫描长度16..4096、平均方向宽度1..256、差分门槛大于0且不超过255、sigma0.25..2，全部需有限。Guard固定3、不作为随意调大的自由参数。以上为教学资源与配方范围，不是OpenCV支持范围的完整说明。
+
+ValidateImage还检查输入正尺寸、最多1048576像素，以及ROI完全包含。坐标加法使用long，避免越界加法溢出后被误判；不裁剪ROI或默默切换方向。ToImage另拒绝非有限或不在0..Length−1内的扫描坐标。
+
+## 3. 原生对象的创建、借用和关闭
+
+Measure同步借用输入Mat，不负责释放调用方输入；调用者必须保证它在方法返回前有效且不被并发改写。方法内部的ROI视图、Clone、平均轮廓和滤波轮廓均局部using释放：
+
+```csharp
+ScanWindow w = recipe.Window;
+using Mat view = new(gray, new Rect(w.X, w.Y, w.Width, w.Height));
+using Mat isolated = view.Clone();
+using Mat mean = new();
+using Mat smooth = new();
+```
+
+返回值不含Mat或指针，只含只读托管数值。ROI的平均值本身不需要父邻域，但独占副本也明确了本例输入责任；滤波在单独的轮廓Mat上执行，不把输入ROI外的像素当成采样数据。
+
+## 4. Reduce的方向和dtype容易写错
+
+```csharp
+bool x = recipe.Axis == ScanAxis.X;
+Cv2.Reduce(isolated, mean,
+    x ? ReduceDimension.Row : ReduceDimension.Column,
+    ReduceTypes.Avg, MatType.CV_64F);
+
+Cv2.GaussianBlur(mean, smooth,
+    x ? new Size(5, 1) : new Size(1, 5),
+    recipe.Sigma, recipe.Sigma, BorderTypes.Reflect101);
+```
+
+ReduceDimension.Row对应dim=0，把多行压成一行：沿X扫描得到1×W；Column对应dim=1，把多列压成一列：沿Y扫描得到H×1。记“输出变成一行/一列”比只背名字更稳妥。
+
+固定C#重载的最后一项dtype类型是int，因此代码传MatType.CV_64F深度常量；直接传MatType.CV_64FC1结构会编译失败。输入是单通道，所以实际输出类型验证为CV_64FC1。不能用At&lt;byte&gt;去读这些double数据，也不依赖默认dtype回到8位整数。
+
+核5×1或1×5只沿扫描轴展开；sigmaX与sigmaY都显式指定，边界Reflect101。不是先把整幅图做5×5模糊，也不调用Canny/Sobel。固定核与sigma范围的适用性仍需实际图像验证。
+
+## 5. 读回轮廓，保留原始和滤波两份
+
+确认mean/smooth的类型、总样本数以及单行/单列布局后，读回：
+
+```csharp
+double[] raw = new double[recipe.Length];
+double[] filtered = new double[recipe.Length];
+for (int i = 0; i < raw.Length; i++)
+{
+    raw[i] = mean.At<double>(x ? 0 : i, x ? i : 0);
+    filtered[i] = smooth.At<double>(x ? 0 : i, x ? i : 0);
+}
+return StripeAnalysis.Analyze(raw, filtered, recipe);
+```
+
+Analyze只接受两条长度与配方一致、有限且在Mono8派生数值范围内的轮廓，各自深复制；Reverse=true时反转两份副本，再求差分。因此Report.MeanProfile与SmoothedProfile都是沿实际扫描顺序排列，检查两者时不需要手工反转其中一份。
+
+这个纯托管接口不验证mean与smooth确实来自同一幅图或实际高斯运算。原生Measure在一次同步调用中构造它们，托管测试则明确提供人工序列；不能把“格式检查通过”当成真实图像来源证明。
+
+## 6. 差分、分组与位置计算
+
+令d[i]=filtered[i+1]−filtered[i]。绝对值不小于DifferenceThreshold的样本才参与分组，等号保留。相邻同号为一组，门槛以下或符号改变就结束，结果：
+
+```csharp
+public sealed record ScanEdge(
+    double Position, double SignedPeak,
+    int FirstDifference, int LastDifference);
+```
+
+组位置为sum((i+.5)×abs(d[i]))/sum(abs(d[i]))，SignedPeak保留该组绝对值最大响应的符号和幅值，起止索引对应差分数组，不是原图x坐标。正阈值保证权重和不为零；超过64组显式异常，不静默截断。
+
+没有额外的局部极值抑制、峰形拟合、插值采样或RANSAC。用double存储及加权输出只能说明计算形式，不能给出真实亚像素精度承诺。
+
+## 7. 候选对、状态与宽度
+
+StripePolarity.Bright要求相邻正/负；Dark要求负/正。每一组合适的相邻边保存为StripePair(First,Second,WidthPixels)，宽度等于后位置减前位置，不跨过中间边。
+
+结果状态依次检查：任意边组触及Guard → BoundaryResponse；没有边 → NoEdges；没有合适对 → NoPair；不是恰好两边一对 → Ambiguous；其余 → WidthMeasured。边界条件是FirstDifference&lt;3或LastDifference≥Length−1−3。
+
+StripeReport保留Recipe、Outcome、两份Profile、Edges、Pairs；只有WidthMeasured才设置顶层WidthPixels、FirstImagePoint、SecondImagePoint，否则三者都是null。Pairs里可能仍有诊断宽度，不等于已授权对外发布的唯一尺寸。不要在调用方使用 `WidthPixels ?? 0` 掩盖失败。
+
+## 8. 实际输出与坐标还原
+
+默认夹具是128×128背景20、x40..71亮度220且贯穿图高的亮条。默认ROI(16,16,96,32)，真实输出：
+
+```text
+bright: WidthMeasured; edges=2, pairs=1, width=32.000000px
+scan=23.500000, signed peak=80.523989
+scan=55.500000, signed peak=-80.523989
+image points: (39.5,31.5) -> (71.5,31.5)
+```
+
+反向扫描得到scan39.5/71.5，恢复到输入图后端点为(71.5,31.5)→(39.5,31.5)，宽度仍32。暗槽使用相反灰度和Dark配方，位置相同、峰值符号相反；错用Bright配方返回NoPair，不自动替用户修改极性。
+
+沿Y示例采用ROI(16,16,32,96)和横向条带，结果为(31.5,39.5)→(31.5,71.5)。中心线位置仅代表投影，不是对这个y或x单独测到的边点。
+
+若输入Mat是原图裁掉(8,8)后的ROI，本方法位置相对该Mat；测试会得到局部x31.5而不是替调用方加回8。工程中的Frame/ROI坐标转换应另有显式记录，本例没有相机/工件身份信封。
+
+## 9. 失败与局限也要测试
+
+| 场景 | 本次实际结果 | 调用方不能做什么 |
+| --- | --- | --- |
+| 均匀暗图 | NoEdges，宽度null | 用0当作真实零宽度 |
+| ROI只包含一侧边 | NoPair，一条边 | 将ROI边界当作第二侧 |
+| 暗槽套亮条配方 | NoPair | 自动颠倒极性后发布 |
+| 两条亮条 | Ambiguous，4边/2对 | 默认取第一对 |
+| 一对加额外未配对边 | Ambiguous | 认为仅一对就一定唯一 |
+| 已检测响应靠近端部 | BoundaryResponse | 删除响应继续报宽度 |
+| 越界ROI、空图、三通道图 | 参数异常 | 悄悄裁剪、转灰或回填数值 |
+
+另有专门局限夹具：32行窗口中仅16行存在20列宽的亮条，MeanProfile平台实际读回120，测量仍返回WidthMeasured/20px。这证明投影可能掩盖材料缺失，不是产品完整性检验。它与“找不到宽度”的失败不同，应在工艺层增加独立检测而不是更改这个结果的含义。
+
+## 10. 检查范围与下一阶段
+
+34项纯托管检查覆盖配方/容量/有限性/窗口、人工序列的半像素位置、加权分组、等号、极性、反向/坐标、只读副本、空/单边/多边/端部及64组上限，不执行原生投影或平滑。
+
+28项真实原生路径检查覆盖Reduce/Gaussian、浮点平均/滤波、横纵/反向、32px夹具、暗槽、源不改写、局部坐标/非连续输入ROI、空图/多条/截断/端部、类型/越界与部分高度条带。配对和状态仍是本例C#代码，不把两类检查合并声称为62项原生测量测试。
+
+没有旋转采样窗口、逐行一致性、倾斜/畸变修正、标定毫米、公差判定、图像数据集重复性/真实精度、相机/WPF/PLC或运动接入，也没有长期吞吐/内存验收。接着进入 [WPF图像/结果/生命周期原理](/knowledge/industrial/host-computer/opencvsharp/wpf-mat-bitmap-frame-consistency-and-lifetime/)和 [C#离线查看器与Mat位图桥接](/knowledge/industrial/host-computer/opencvsharp/csharp-wpf-mat-bitmap-measurement-viewer/)，保持像素、结果、坐标域一致，并明确Mat与位图的交接和释放。

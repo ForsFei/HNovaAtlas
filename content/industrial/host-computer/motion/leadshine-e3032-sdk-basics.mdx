@@ -1,0 +1,174 @@
+---
+id: industrial-leadshine-e3032-sdk-basics
+title: 雷赛 E3032 SDK 导读：初始化、总线状态、使能与单轴接口
+description: 核对官方 DMC-E3032 总线卡资料，整理 C# 包装层、初始化关闭、状态读取、工程单位、定位回零与停止接口，并与 DMC3000 脉冲卡对照。
+tags: [工业自动化, 雷赛, E3032, EtherCAT, C#]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 10
+prerequisite: [industrial-motion-axis-units-coordinates]
+related: [industrial-csharp-single-axis-simulation, ethercat-pdo, industrial-device-command-handshake-idempotency]
+---
+
+## 本篇验证到哪一层
+
+用户的硬件方向是 E3032 总线卡。本篇查阅了雷赛官方 EtherCAT 总线卡手册，其中包含 DMC-E3032 系列；**尚未取得用户配套的 SDK、驱动器型号和固件版本，没有加载 LTDMC.dll，没有初始化、复位、使能或移动真实硬件**。
+
+下面是 API 查阅地图和用法导读，不冒充已完成实机接入。能直接运行的是下一篇的 [纯 C# 模拟项目](/knowledge/industrial/host-computer/motion/csharp-single-axis-simulation/)。实际 SDK 适配要等版本固定后单独编译、核对和验收。
+
+资料基线是[官方 EtherCAT 总线卡手册下载文件](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)：文件名含 20250728，封面标示 2024.11，正文标示 V2.0。文件名日期不是 DLL 版本，也不证明与手里的固件完全一致。下文页码均指**正文印刷页码**，不是 PDF 阅读器页序。
+
+## 1. E3032、轴号和从站地址不是同一个编号
+
+手册产品表列出 DMC-E3032-Axx 的多种轴数配置（正文第 10 页）。仅凭口头“E3032”不能直接确定已开通轴数、扩展板或本地 IO 资源；先记录完整铭牌型号、授权/配置、驱动器及拓扑。
+
+| 标识 | 代表什么 | 常见错误 |
+| --- | --- | --- |
+| CardNo / CardId | SDK 要访问的卡号/硬件 ID | 把发现卡数量当成卡号 |
+| axis | 卡配置中的逻辑轴号 | 按接线顺序猜，不核对映射 |
+| EtherCAT 从站地址 | 总线节点身份或地址 | 与逻辑轴号互换使用 |
+| 驱动器子轴 | 一个从站内可能有多个轴通道 | 认为一个从站一定只有一轴 |
+| IO 点号 | 本地或总线模块的信号编号 | 用轴号访问 IO 或套用其他扩展板点表 |
+
+`nmc_get_axis_node_address` 可用于查询轴与节点的关系，具体输出以该版本头文件为准。配方中至少保存卡、轴、机械名称与单位的映射；界面上的“X轴”不是 SDK 自动识别的名称。
+
+## 2. C# 不是另一个自动管理连接的运动库
+
+官方示例使用 `LTDMC` 包装层访问原生 DLL，常见形式是静态函数，而不是 `new MotionClient(ip)`。这里的“开启”是板卡资源初始化，“关闭”是释放资源，不是 TCP socket 的 Connect/Disconnect。
+
+在开始真实适配前，建立一份版本清单：完整卡型号、硬件/固件版本、驱动版本、SDK 包版本或文件哈希、配套 `LTDMC.cs`、原生 DLL 及附属依赖、进程 x86/x64、.NET 目标、伺服型号/固件、ESI 和已验证的总线配置。
+
+优先使用同一个 SDK 包内的 C# 声明，不从论坛复制另一代 `LTDMC.cs`。例如 Windows C 的 `long` 通常为 32 位，C# `long` 是 64 位；`WORD`、`DWORD`、指针、数组、字符串缓冲和调用约定都必须按头文件核对。位数不匹配可能加载失败，错误声明也可能造成内存破坏；不能靠“能编译”证明互操作正确。[Microsoft 原生互操作建议](https://learn.microsoft.com/en-us/dotnet/standard/native-interop/best-practices)
+
+### 本章需要的配置和状态属性
+
+SDK 以函数居多；应用可以整理成以下配置/快照，但它们不是官方 `LTDMC` 自带的 C# 属性：
+
+- 固定配置：卡号、轴号、总线端口、工程单位、当量、速度/时间参数、行程、方向、回零方法与超时。
+- 运行快照：调用质量、采样时间、总线诊断、驱动状态、指令位置、可确认的反馈、速度、停止原因、报警、参考有效性和当前命令身份。
+- 策略：允许的操作模式、互锁、谁能发命令、单轴是否已被任务占用、断线后如何重新核对。
+
+## 3. 初始化与关闭：特别注意返回值
+
+以下条目基于手册 9.1 节（第 197～198 页）：
+
+| 函数 | 作用 | 返回值应怎样解释 |
+| --- | --- | --- |
+| `dmc_board_init()` | 分配板卡资源并初始化 | 1～8 表示卡数量；0 表示未发现或异常；负值有重复卡号含义 |
+| `dmc_get_CardInfList(...)` | 读取成功初始化的卡数量、类型和 ID 列表 | 返回码与输出列表分别检查 |
+| `dmc_get_card_version(...)` / `dmc_get_card_soft_version(...)` | 读取硬件/固件信息 | 版本记录用于排查兼容性 |
+| `dmc_board_close()` | 释放 SDK 板卡资源 | 没有轴参数，不是单轴停止接口 |
+
+因此不能对所有函数统一套 `returnValue == 0` 才算成功。初始化返回 1 可能就是发现一张卡；读取位置可能通过输出参数返回；另一些状态函数直接返回枚举。
+
+启动建议先分配资源、核对卡列表与配置身份，再只读诊断，最后由操作流程明确决定是否使能。不要在窗口加载时自动冷复位、扫描下载总线配置、清驱动报警、使能所有轴并回零。
+
+关闭应由资源所有者统一执行，先禁止新命令，按设备规程停止并确认状态，再按机械条件处理使能/制动器，最后释放 SDK。若已失联，不能把“关闭成功”记录成“机械轴确认停止”。
+
+## 4. 总线诊断与驱动操作使能分开读取
+
+手册第 173、181～182 页涉及：
+
+| API | 调用目的 | 关键语义 |
+| --- | --- | --- |
+| `nmc_get_errcode(CardNo, PortNum, ref errcode)` | 总线诊断 | 本手册端口号固定为 2；函数返回码和输出诊断码不是一个值 |
+| `nmc_get_axis_state_machine(CardNo, axis, ref state)` | 读驱动轴状态 | 输出 4 表示此 SDK 枚举的 OP_ENABLE |
+| `nmc_set_axis_enable(CardNo, axis)` | 请求操作使能 | 返回调用结果，不等于实际驱动已使能 |
+| `nmc_set_axis_disable(CardNo, axis)` | 请求取消使能 | 不是普通停止的等价替代，垂直轴尤其要核对机械条件 |
+
+SDK 的轴状态枚举包含：0 未准备、1 禁止接通、2 准备接通、3 接通、4 操作使能、5 快速停止、6 故障反应、7 故障。**这里的 4 是 SDK 输出枚举值，不是把 CiA 402 原始 Statusword 的整数与 4 比较，也不是 EtherCAT 总线 OP 状态码。**
+
+总线诊断正常只是门槛之一，还要结合预期节点/轴映射、驱动状态、报警、互锁和数据新鲜度。`nmc_set_axis_enable` 中轴号 255 在本手册具有全轴含义；入门适配只允许经过配置核对的单轴，避免误传通配值。
+
+### C# 只读调用形态
+
+下面片段展示“返回码 + 输出参数”的分离方式。它假设使用配套官方 `LTDMC` 类型以及一致的 `ref ushort` 声明；**片段未在本项目针对原生 SDK 编译或执行**，不能直接替代用户版本的包装层核对。
+
+```csharp
+// 前置：资源已初始化，card/axis 来自已核对的配置。
+static void RequireNoError(short code, string operation)
+{
+    if (code != 0)
+        throw new InvalidOperationException($"{operation}: SDK code={code}");
+}
+
+ushort busError = 0;
+short rc = LTDMC.nmc_get_errcode(card, 2, ref busError);
+RequireNoError(rc, "Read bus diagnostic"); // 只用于返回错误码的接口
+if (busError != 0)
+    throw new InvalidOperationException($"Bus diagnostic={busError}");
+
+ushort driveState = 0;
+rc = LTDMC.nmc_get_axis_state_machine(card, axis, ref driveState);
+RequireNoError(rc, "Read drive state");
+bool operationEnabled = driveState == 4;
+
+double commandPosition = 0;
+rc = LTDMC.dmc_get_position_unit(card, axis, ref commandPosition);
+RequireNoError(rc, "Read command position");
+// commandPosition 是指令计数器的工程单位值，不擅自命名为 encoderActual。
+```
+
+真实适配还应把调用错误、状态不满足、超时和失联分别记录。使能等待使用有期限的轮询，并检查报警/取消；不在 UI 线程 `while(true)`，不复制老示例中的 `Application.DoEvents()` 作为 WPF 的异步方案。SDK 调用如何串行化、线程限制是什么，要按配套文档确认。
+
+## 5. 单位、位置、速度和运动请求接口
+
+以下为本手册第 200、203～204、236～238 页的查用入口。数字均需来自已审核的轴配置，不是默认现场参数。
+
+| 意图 | 常用接口 | 参数/结果重点 |
+| --- | --- | --- |
+| 配置工程单位 | `dmc_set_equiv` / `dmc_get_equiv` | pulse/unit；设置后核对读回与生效条件 |
+| 读指令位置 | `dmc_get_position_unit` | 输出 `double`，单位 unit |
+| 修改指令计数器 | `dmc_set_position_unit` | 修改坐标标记，不等于物理回零，不作为普通读写练习 |
+| 设速度曲线 | `dmc_set_profile_unit` / `dmc_get_profile_unit` | 起速、最高速、末速为 unit/s；Tacc/Tdec 为秒 |
+| 绝对/相对定位 | `dmc_pmove_unit(CardNo, axis, Dist, posi_mode)` | Dist 为 unit；0 相对、1 绝对 |
+| 定速运动 | `dmc_vmove(CardNo, axis, dir)` | 0 负向、1 正向；与模拟器 ±1 约定不同 |
+| 读当前单轴速度 | `dmc_read_current_speed_unit` | 输出 unit/s，返回码另查 |
+| 查单轴是否运动 | `dmc_check_done` | 0 运行、1 停止；不直接表示定位成功 |
+| 查停止原因 | `dmc_get_stop_reason` | 结合本次指令与报警解释，不能只读一次旧状态 |
+
+常见调用顺序是：核对资源/总线/驱动与互锁 → 确认参考与空闲 → 校验目标/速度/行程 → 设置并核对曲线 → 提交一次定位 → 持续读取匹配动作的状态 → 判断成功、停止、故障或结果未知。
+
+当量虽有允许在使能状态下设置的接口说明，课程仍采用“静止、受控配置阶段修改”的策略；禁止运行中随意改单位，并为生效和参数验证留出流程。不会为了省事把软件模拟参数直接灌入卡。
+
+特别注意编号差异：**模拟器** `Jog` 的方向为 -1/+1，**此 SDK** `dmc_vmove` 的方向为 0/1；适配层必须显式转换，不能直接把枚举强制转换后传入。
+
+## 6. 总线回零与停止
+
+本手册第 77～79、188 页列出 `nmc_set_home_profile`、`nmc_get_home_profile`、`nmc_home_move` 和 `dmc_get_home_result`。先按伺服支持的回零方法与实际接线核对参数，再发一次回零并查询。`dmc_get_home_result` 的输出状态 1 表示回零完成、0 表示未完成，函数本身还返回错误码。
+
+示例中的方法号不是跨驱动器通用方案。真实回零必须覆盖初始压住原点、找不到传感器、报警、限位、超时、停止和重试条件，不能仅等待 `dmc_check_done == 1` 后清零坐标并置 `Homed=true`。
+
+`dmc_stop(CardNo, axis, stop_mode)` 是单轴/PVT 的停止入口；本手册第 242 页将 0 标为减速停止、1 标为紧急停止，这仍是软件接口的命名。需要按所用版本、轴模式和驱动配置确认实际行为，再等待停止证据；插补运动另查坐标系停止接口。即使停止请求调用成功，也不能立即释放轴所有权或宣称到达原目标。断线后本地 `CancellationToken` 的取消更不等于卡已收到停止。
+
+急停和安全回路另外设计，不能因函数名称含“急停”便以软件调用替代安全系统。恢复时先查询真实状态，不自动重放旧相对运动或回零命令。
+
+## 7. 脉冲卡也学，但不要混用这一套配置
+
+对照资料为 [DMC3000 系列官方手册](https://www.leisai.com/upload/file/2025/07/31/DMC3000%E7%B3%BB%E5%88%97%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250710.pdf)，不是声称全部雷赛脉冲产品都相同。
+
+| 问题 | 本文 E3032 总线主线 | DMC3000 脉冲分支入口 |
+| --- | --- | --- |
+| 资源生命周期 | `dmc_board_init/close`，核对卡身份 | 也有同名函数，仍逐项核对版本和返回值 |
+| 准备动作 | 总线配置、映射、驱动轴状态 | 脉冲输出方式、方向、电子齿轮及就绪/报警接线 |
+| 速度/定位 | 本章优先 `_unit` 工程单位接口 | `dmc_set_profile` 速度 pulse/s、加减速时间 s；`dmc_pmove` 位移 pulse |
+| 回零 | `nmc_*home*` 驱动回零主线 | `dmc_set_homemode`、卡侧回零曲线与 `dmc_home_move` 等 |
+| 位置读取示例 | `dmc_get_position_unit` 输出参数 | `dmc_get_position` 直接返回指令位置计数，不是通用错误码 |
+| 到位证据 | 确认驱动反馈/到位来源 | 若没接编码器/到位信号，只能陈述已有的指令侧证据 |
+
+共同的危险误解是把 `dmc_check_done` 的“停止”当作“成功”，或把 close 当作 stop。脉冲分支后续单独补接线、电平、脉冲模式、卡侧回零与反馈；不会直接在 E3032 示例里切一个布尔值，就声称支持所有脉冲硬件。
+
+## 8. 接实机前要准备什么
+
+下一批真实 SDK 适配至少要有：完整 E3032 铭牌型号、配套 SDK 包和 `LTDMC.cs`、驱动/固件信息、伺服型号、轴/从站/机械映射、当量来源、总线配置与风险受控的单轴验收条件。先读身份和状态，再验证使能与参考，最后才是受控运动；没有这些资料也可以继续完成离线工程内容。
+
+本批没有安装驱动、改拓扑、下载配置、写对象字典、升级固件或操作轴。先通过 [C# 模拟器](/knowledge/industrial/host-computer/motion/csharp-single-axis-simulation/)把指令条件、完成身份、超时和恢复规则跑通，再读[总线接入与轴映射](/knowledge/industrial/host-computer/motion/e3032-ethercat-commissioning-and-axis-mapping/)和 [C# 只读诊断采样层](/knowledge/industrial/host-computer/motion/csharp-e3032-readonly-diagnostics/)。后者用测试替身验证应用逻辑，仍不等于真实 SDK 已接入。
+
+## 自测追问
+
+1. 初始化返回 1、状态函数返回 1、错误码函数返回 1，为什么不是同一种结果？
+2. `nmc_get_errcode` 返回 0，而输出 `errcode` 非 0，应该怎样处理？
+3. 为什么操作使能状态 4 不能直接拿来检查原始 CiA 402 状态字？
+4. C# 位置类型能否凭名称写成 `long`？轴号 255 有什么风险？
+5. 为什么读取到轴停止仍不能报告上一次定位成功？

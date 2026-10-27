@@ -1,0 +1,122 @@
+---
+id: industrial-host-computer-learning-path
+title: 工业上位机总览：通信、雷赛运动控制与机器视觉
+description: 以 C# 和 WPF 为应用主线，连接工业通信、雷赛运动控制、HALCON、OpenCvSharp、YOLO 与设备流程实践。
+tags: [工业自动化, 上位机, CSharp, WPF, 学习路线]
+difficulty: beginner
+status: published
+updated: "2026-10-27"
+order: 0
+related: [industrial-host-computer-chapter-map, industrial-communication-data-contracts, industrial-serialport-basics, wpf-learning-path, csharp-learning-path, ethercat-introduction]
+---
+
+## 从软件知识走向设备应用
+
+这条路线面向使用 C# 开发工业上位机的人：已经学过语言和 WPF，希望进一步理解软件如何与 PLC、运动控制卡、相机及机器人协作。应用层以 C# / WPF 为主，围绕设备读写、运动、检测和流程组织内容；进入具体 SDK 时再固定设备型号、驱动和运行环境。
+
+已按[分步章节目录](/knowledge/industrial/host-computer/chapters/)交付通信、运动及视觉基础主线，当前进入[YOLO任务、数据与评价](/knowledge/industrial/host-computer/yolo/tasks-datasets-metrics-and-deployment-contracts/)。教程/离线检查/原生与实机分别记录；目录中的“计划中”表示尚未交付，首批交付不表示整个阶段或现场质量完成。
+
+## 一张图看学习路线
+
+从中央的 C# / WPF 应用出发，按编号学习通信、运动、视觉，再进入综合工位。点击图中的阶段可查看章节范围；需要阅读细节时可打开大图，窄屏也可左右滚动。
+
+<IndustrialLearningRoadmap />
+
+## 三条技术主线与贯穿实践
+
+| 主线 | 学习范围 | 希望最终能完成的任务 |
+| --- | --- | --- |
+| 工业通信 | 串口与 RS-232/485、TCP/UDP、Modbus、PLC 协议、OPC UA、厂商 SDK | 解释一条数据的来源和含义，完成读写、超时处理与连接恢复 |
+| 运动控制 | 轴与坐标、雷赛单轴和多轴、IO、状态与动作流程；扩展 PLC 运动和机械臂集成 | 按设备状态发出动作请求，判断完成条件，处理异常和恢复 |
+| 机器视觉 | 成像与坐标基础、HALCON、OpenCvSharp、YOLO 的 C# 部署 | 从图像得到可解释的检测结果，再把结果交给设备流程 |
+| 贯穿实践 | 手动/自动状态、动作握手、配方、报警、日志、测试和部署 | 将三条主线组成可观察、可排障的小型设备应用 |
+
+先从通信进入，再学习以雷赛为主的运动控制，随后补视觉和综合实践。章节可以按工作需要调整，但通信请求的成功、控制器接受指令和机械动作完成，要始终分别判断。
+
+## 先分清几个容易混淆的边界
+
+### 接口、传输和设备协议
+
+RS-232/485、TCP、Modbus 与厂商 SDK 分别回答不同层次的问题。学习时会先说明连接与传输，再说明报文、数据类型和业务含义；例如 Modbus 的串行链路规范与 TCP 实现指南就属于不同的配套文档。[Modbus 官方规范](https://www.modbus.org/modbus-specifications)
+
+### 上位机与运动控制器
+
+上位机负责界面、参数、任务编排与状态监控，运动执行还涉及控制卡、PLC 或机器人控制器。雷赛产品同时存在脉冲型和 EtherCAT 总线型；本课程按用户硬件方向，以 **E3032 总线卡为主线，脉冲卡作为对照**，先讲共同概念，再进入对应 SDK。具体功能与接口仍按完整型号和版本核对。[雷赛控制卡产品说明](https://www.leisai.com/product/product_details_1412.html)
+
+PLC 会在通信章节讨论数据访问，在运动章节讨论动作执行和握手。机械臂以发那科/爱普生为背景，先学习六轴通用基础、上位机任务集成、坐标与结果交互；暂无型号，品牌接口随实际控制器扩充。
+
+### 视觉算法与 C# 应用
+
+HALCON 路线包含 HDevelop 算法验证和 C# 集成；OpenCvSharp 路线包含 OpenCV 算法及 .NET 资源管理。YOLO 路线侧重模型部署，计划采用 ONNX 与 ONNX Runtime 的 C# 接口，训练和导出的必要工具作为配套内容。[HALCON 集成方式](https://www.mvtec.com/products/halcon/features-tools/development-tools-programming/hdevengine)、[OpenCvSharp](https://github.com/shimat/opencvsharp)、[ONNX Runtime C#](https://onnxruntime.ai/docs/get-started/with-csharp)
+
+## 每一步怎样学习和验收
+
+每个专题按“问题与概念 → 最小可运行示例 → 边界与现场故障 → 自测追问”展开。协议帧、坐标变化等适合对照观察的地方再加入交互，代码与说明保持可直接阅读。
+
+通信优先用本地模拟设备验证数据、超时与重连；运动先验证状态和指令契约，再按型号做实机验收；视觉先用可重复的离线图片，再接相机与设备流程。每份示例会说明需要的硬件、SDK 或模型，以及实际验证到了哪一步。
+
+综合案例计划采用一个小型检测工位：接收到料信号，运动到位，触发采图，完成判定，交接处理结果并记录追溯信息。过程中逐步加入互锁、超时和恢复条件，控制系统规模随内容交付增长。
+
+## 已有基础与下一步
+
+- [C# 学习路线](/knowledge/programming/csharp/overview/)：复习类型、数据处理、异步、异常和资源释放。
+- [WPF 七步路线](/knowledge/desktop/wpf/overview/)：掌握布局、绑定、命令、异步与状态测试。
+- [EtherCAT 入门](/knowledge/industrial/ethercat/basic/introduction/)与[PDO](/knowledge/industrial/ethercat/communication/pdo/)：已有的总线知识，后续在雷赛总线型控制器章节中关联使用。
+
+通信先读[设备角色与数据契约](/knowledge/industrial/host-computer/communication/roles-and-data-contracts/)，再通过[SerialPort](/knowledge/industrial/host-computer/communication/serialport-basics/)查用配置、打开关闭和读取写入，随后完成[接收缓冲、组帧与 WPF 交接](/knowledge/industrial/host-computer/communication/serial-receive-framing-and-wpf/)。网口部分从 [TCP 对象与字节流](/knowledge/industrial/host-computer/communication/tcp-client-listener-and-stream/)进入，对照 [UDP 数据报与响应匹配](/knowledge/industrial/host-computer/communication/udp-client-and-datagrams/)，再完成 [TCP 长连接、心跳、有限恢复与 WPF](/knowledge/industrial/host-computer/communication/tcp-long-connection-heartbeat-and-recovery/)。Modbus 从[数据区、地址与功能码](/knowledge/industrial/host-computer/communication/modbus-addresses-functions-and-frames/)开始，再用 [NModbus 完成读写](/knowledge/industrial/host-computer/communication/nmodbus-tcp-and-rtu-basics/)，最后结合[数据解释、轮询与 WPF](/knowledge/industrial/host-computer/communication/modbus-value-decoding-and-wpf-monitor/)。
+
+PLC 部分先读[协议选择与数据契约](/knowledge/industrial/host-computer/communication/plc-protocols-and-data-contracts/)，再用 [S7.NET+ 完成 DB 读写](/knowledge/industrial/host-computer/communication/csharp-s7netplus-db-read-write/)。OPC UA 从[节点、质量、订阅与证书](/knowledge/industrial/host-computer/communication/opcua-nodes-quality-and-security/)进入，再用 [C# 完成安全连接、读写与订阅](/knowledge/industrial/host-computer/communication/opcua-csharp-secure-read-write-subscribe/)。三菱部分先读 [MC/SLMP 设备地址与3E报文](/knowledge/industrial/host-computer/communication/mc-slmp-frames-and-device-addresses/)，再查用 [C# McpX 连接、D/M读写与关闭](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)。
+
+读写之后完成[动作请求号、状态与断线去重](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)，用 [C#命令邮箱与恢复查询](/knowledge/industrial/host-computer/communication/csharp-command-mailbox-and-recovery/)验证业务交接。
+
+运动部分从[总线与脉冲、轴单位、坐标和速度曲线](/knowledge/industrial/host-computer/motion/axis-units-coordinates-and-profiles/)进入，结合 [E3032 SDK 接口导读](/knowledge/industrial/host-computer/motion/leadshine-e3032-sdk-basics/)查用初始化、状态、使能与单轴接口，再运行 [C# 单轴模拟](/knowledge/industrial/host-computer/motion/csharp-single-axis-simulation/)。
+
+接着读[总线接入与轴映射](/knowledge/industrial/host-computer/motion/e3032-ethercat-commissioning-and-axis-mapping/)，运行 [C# 只读诊断采样层](/knowledge/industrial/host-computer/motion/csharp-e3032-readonly-diagnostics/)的测试替身检查；再学习[驱动回零与参考有效性](/knowledge/industrial/host-computer/motion/e3032-drive-homing-and-reference/)，用 [C# 动作观察与停止诊断](/knowledge/industrial/host-computer/motion/csharp-e3032-motion-observation/)区分完成、停止与未知结果。
+
+手动部分读[点动、互锁与故障恢复](/knowledge/industrial/host-computer/motion/e3032-manual-jog-interlocks-and-recovery/)，结合 [WPF单轴模拟面板](/knowledge/industrial/host-computer/motion/wpf-manual-axis-panel-and-input-lifecycle/)理解输入生命周期。脉冲分支再读[脉冲方向、卡侧回零与编码器反馈](/knowledge/industrial/host-computer/motion/dmc3000-pulse-direction-homing-and-feedback/)，运行 [C#位域/计数契约](/knowledge/industrial/host-computer/motion/csharp-dmc3000-pulse-io-and-position-contracts/)的纯值检查。
+
+第6步基础教学已交付，第7步进入[E3032多轴组织与IO契约](/knowledge/industrial/host-computer/motion/e3032-multiaxis-coordination-and-io/)，结合 [C#常用接口与离线工步](/knowledge/industrial/host-computer/motion/csharp-e3032-positioning-cycle-and-io/)学习部分失败、汇合和信号交接。基本插补与E5000连续轨迹的能力边界分别说明，不把缓存IO套到E3032。
+
+接着学习[直线/圆弧坐标、参数与途经范围](/knowledge/industrial/host-computer/motion/e3032-line-and-arc-geometry/)，运行 [C#插补几何校验](/knowledge/industrial/host-computer/motion/csharp-interpolation-geometry-checks/)理解方向、优劣弧、绝对/相对直线和圆弧内部极值；它是二维纯数值模型，不是实际速度规划或防碰撞算法。
+
+再读[位置比较、锁存与拍照触发](/knowledge/industrial/host-computer/motion/e3032-position-compare-latch-and-camera-trigger/)，用 [C#接口与单拍证据配对](/knowledge/industrial/host-computer/motion/csharp-trigger-and-frame-evidence/)区分比较计数、锁存位置、曝光和图像身份。缺少身份或关联失效不自动配图；离线模型不输出脉冲或采集图像。
+
+然后读[工艺暂停、停止与恢复交接](/knowledge/industrial/host-computer/motion/e3032-process-pause-stop-and-recovery/)，运行 [C#恢复复核与过期确认](/knowledge/industrial/host-computer/motion/csharp-recovery-review-and-stale-confirmation/)理解九项外部事实、工件处置与旧确认失效。复核记录不是运动许可，不生成新计划，不自动续走或补拍。
+
+再学习[PLC与雷赛运动任务交接](/knowledge/industrial/host-computer/motion/plc-and-leadshine-motion-task-handoff/)，运行 [C#一次意图、结果关联与断线不重放](/knowledge/industrial/host-computer/motion/csharp-plc-motion-task-handoff/)理解PLC请求域与PC执行域的边界。本批只做应用层交接，不将旧MC邮箱的回环验证当成本方向的实机闭环。
+
+机械臂从[六轴关节、坐标、TCP、姿态与运行模式](/knowledge/industrial/host-computer/motion/six-axis-robot-frames-posture-and-modes/)开始，以发那科/爱普生为背景，结合 [C#坐标变换与上下文复核](/knowledge/industrial/host-computer/motion/csharp-robot-frame-transforms-and-context/)的58项离线检查理解变换顺序和状态边界。暂无型号，不提供猜测的品牌SDK，不将普通复核当启动许可。
+
+再读[机械臂工艺任务握手与异常对账](/knowledge/industrial/host-computer/motion/robot-job-handshake-results-and-reconciliation/)，结合 [C#单任务会话](/knowledge/industrial/host-computer/motion/csharp-robot-task-session-and-results/)的66项离线检查，理解一次发布、OK/NG终态、结果确认和失联后的只读历史补充。厂商选程序/远程命令与业务任务分别建模，不把通信回执当整件工艺完成。
+
+第7步通用教学主线已交付，当前验证的是离线基础与应用逻辑，窗口编译不等于人工操作验收；PLC/雷赛/机械臂原生适配、机器人程序与实机验收仍单列未完成。
+
+第8步已开始：[视觉成像、曝光、像素格式与采集流程](/knowledge/industrial/host-computer/vision/imaging-exposure-pixels-and-acquisition/)，结合 [C# Mono8离线回放与缓冲生命周期](/knowledge/industrial/host-computer/vision/csharp-mono8-replay-and-buffer-lifetime/)学习逐行复制、ROI和借用/自有图像。63项离线检查不代替真实相机效果或SDK验收。
+
+继续学习[采集会话、触发与帧身份](/knowledge/industrial/host-computer/vision/acquisition-sessions-triggers-and-frame-identity/)，运行 [C#单次采集关联](/knowledge/industrial/host-computer/vision/csharp-single-capture-session-and-frame-correlation/)的73项离线检查，区分调用应答、原触发关联、匹配图像与产品结果。关联证明由外层负责，未知后不补拍，晚到只记元数据。
+
+再读[有界处理与结果/预览分流](/knowledge/industrial/host-computer/vision/bounded-processing-preview-and-result-handoff/)，运行 [C#单处理器、结果收据与最新预览槽](/knowledge/industrial/host-computer/vision/csharp-bounded-inspection-and-latest-preview/)的71项离线检查：检测满载明确拒收，未确认结果占容量，预览可独立替换旧帧，处理Completed不等于产品OK。
+
+随后学习[像素/平面坐标、标定与误差](/knowledge/industrial/host-computer/vision/image-coordinates-planar-calibration-and-errors/)，运行 [C#三点仿射与独立误差报告](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)的72项纯数值检查。三点拟合不代替实际精度验证，毫米点不直接当运动目标。
+
+最后读[WPF显示坐标与同帧结果](/knowledge/industrial/host-computer/vision/wpf-image-display-coordinates-and-frame-consistency/)，运行 [C#离线查看器](/knowledge/industrial/host-computer/vision/csharp-wpf-offline-viewer-and-overlay/)。54项几何/身份与22项WPF离屏/事件检查验证留白、Gray8、ROI、迟到隔离和关闭排空，未接相机或完成人工UI验收。第8步通用教学主线已交付，下一阶段HALCON对象与C#集成，再按路线进入OpenCvSharp与YOLO。
+
+第9步已开始：[HALCON 24.11对象、元组与算子基础](/knowledge/industrial/host-computer/halcon/iconic-objects-tuples-domains-and-operators/)，结合 [C#真实API、资源释放与输出契约](/knowledge/industrial/host-computer/halcon/csharp-first-pipeline-and-resource-lifetime/)学习。接着读[阈值/ROI、形态学与区域筛选](/knowledge/industrial/host-computer/halcon/threshold-roi-morphology-and-region-selection/)，运行 [C#分步面积读回示例](/knowledge/industrial/host-computer/halcon/csharp-roi-segmentation-and-stage-readback/)。随后进入[NCC定位、模板原点与搜索区域](/knowledge/industrial/host-computer/halcon/ncc-matching-models-origins-and-search/)，结合 [C#模型创建、查找与释放](/knowledge/industrial/host-computer/halcon/csharp-ncc-model-search-and-lifetime/)。再学习[形状匹配、旋转与检测ROI跟随](/knowledge/industrial/host-computer/halcon/shape-matching-rotation-and-roi-following/)，运行 [C#两套矩阵与区域统计](/knowledge/industrial/host-computer/halcon/csharp-shape-model-and-roi-following/)。接下来是[一维边缘、配对与像素宽度](/knowledge/industrial/host-computer/halcon/one-dimensional-edges-pairs-and-measurement/)及 [C#测量对象与宽度读回](/knowledge/industrial/host-computer/halcon/csharp-measure-objects-edge-pairs-and-width/)。之后读[直线、圆与二维Metrology模型](/knowledge/industrial/host-computer/halcon/lines-circles-and-metrology-models/)及 [C#模型、参数与几何结果](/knowledge/industrial/host-computer/halcon/csharp-metrology-model-lines-circles-and-results/)。官方24113.0.0接口编译及34＋27＋35＋53＋56＋58项托管检查通过；原生尝试因缺少运行库未通过，实际分割/匹配/测量/HDevelop与精度尚待验证。继续读[过程接口与两种导出路线](/knowledge/industrial/host-computer/halcon/hdevelop-procedure-contracts-and-export-options/)及 [C# HDevEngine加载、传参与释放](/knowledge/industrial/host-computer/halcon/csharp-hdevengine-procedure-call-and-lifetime/)，新增20项托管契约检查通过；过程原生加载与数值对照仍未验证。再读[WPF后台调用、同帧结果与关闭排空](/knowledge/industrial/host-computer/halcon/wpf-background-execution-frame-results-and-shutdown/)及 [C# WPF像素桥接与查看器](/knowledge/industrial/host-computer/halcon/csharp-wpf-halcon-frame-session-and-viewer/)。新增26项会话/实际位图检查通过，原生与人工UI仍待验收；HALCON基础教学主线已交付，原生与现场仍待验收。
+
+第10步基础教学主线已交付：[OpenCvSharp Mat、像素类型、stride与ROI所有权](/knowledge/industrial/host-computer/opencvsharp/mat-pixel-types-stride-roi-and-ownership/)，结合 [C# Mat创建、读回、转换与释放](/knowledge/industrial/host-computer/opencvsharp/csharp-mat-creation-pixel-access-roi-and-lifetime/)。独立固定4.13.0.20260627托管/Windows原生包，20项托管布局与26项真实Mat检查通过，实际OpenCV 4.13.0。检测质量、真实相机、WPF人工/多DPI及长期内存仍未验收。
+
+继续读[滤波、阈值与形态学](/knowledge/industrial/host-computer/opencvsharp/smoothing-thresholds-and-morphology/)，运行 [C#配方、分步掩膜与检查](/knowledge/industrial/host-computer/opencvsharp/csharp-filter-threshold-morphology-and-stage-readback/)。新增21项托管与28项真实原生检查通过，保留原始孔洞/孤点证据与可选处理差别，前景数不当对象数或产品OK。接着读[连通域、轮廓与层级](/knowledge/industrial/host-computer/opencvsharp/connected-components-contours-and-hierarchy/)及 [C#标签统计、筛选与坐标](/knowledge/industrial/host-computer/opencvsharp/csharp-components-contours-hierarchy-and-readback/)。新增18项托管与24项真实原生检查通过；像素面积、轮廓面积和外接框分开记录，不把轮廓索引当工件号。继续读[几何特征、旋转框与形状筛选](/knowledge/industrial/host-computer/opencvsharp/geometric-features-rotated-boxes-and-shape-selection/)及 [C#凸包、近似、矩与规范化角度](/knowledge/industrial/host-computer/opencvsharp/csharp-rotated-boxes-hulls-and-shape-features/)。新增16项托管与20项原生检查通过，保留近方形方向歧义和带孔外轮廓的筛选差别。继续读[边缘、Hough候选与直线/圆拟合](/knowledge/industrial/host-computer/opencvsharp/edges-hough-line-and-circle-fitting/)及 [C# Canny、Hough、FitLine与圆最小二乘](/knowledge/industrial/host-computer/opencvsharp/csharp-canny-hough-fitline-and-circle-least-squares/)。新增18项托管与27项真实原生检查通过，保留候选偏差和短圆弧/异常点限制。
+
+第六批继续读[局部灰度轮廓、极性与像素宽度](/knowledge/industrial/host-computer/opencvsharp/local-edge-profiles-polarity-and-pixel-width/)及 [C# Reduce、边缘配对与宽度](/knowledge/industrial/host-computer/opencvsharp/csharp-projected-profiles-edge-pairs-and-width/)。新增34项纯托管与28项真实原生路径检查通过，横纵/反向亮条暗槽实际32px；单边、多边和端部响应不发布宽度。原生投影/平滑与C#分组/配对明确分工，平均轮廓不能证明材料完整。接着进入下列WPF集成。
+
+第七批学习[WPF位图桥接、同帧叠加与生命周期](/knowledge/industrial/host-computer/opencvsharp/wpf-mat-bitmap-frame-consistency-and-lifetime/)及 [C#离线查看器、后台测量与关闭排空](/knowledge/industrial/host-computer/opencvsharp/csharp-wpf-mat-bitmap-measurement-viewer/)。新增36项WPF/会话与26项真实OpenCV/WPF检查通过，位图深复制/Freeze、迟到结果隔离、离屏测量叠加和Mat释放有实际检查；可见窗口人工、多DPI及长期性能仍待验收。接着进入下面的有界处理。
+
+第八批阅读[有界测量、最新预览与资源观察](/knowledge/industrial/host-computer/opencvsharp/bounded-measurement-preview-and-resource-observation/)及 [C# Channel账本、结果收据与预览槽](/knowledge/industrial/host-computer/opencvsharp/csharp-channel-ledger-receipts-and-preview-slot/)。新增51项通道/WPF替身与16项真实原生路径检查，含32轮短回放；预览可替换，已接收检测终态保留至明确确认。基础主线到此交付，下一阶段YOLO；短回放和内存点采样不替代实际质量、长期资源或现场验收。
+
+第11步首批阅读[YOLO任务、数据集、评估与部署契约](/knowledge/industrial/host-computer/yolo/tasks-datasets-metrics-and-deployment-contracts/)，配合 [C#分组审计、IoU与误检漏检评估](/knowledge/industrial/host-computer/yolo/csharp-dataset-audit-box-iou-and-evaluation/)。独立.NET10无第三方依赖，69项手写数据/契约检查通过，明确没有模型推理；不把固定阈值统计当AP/mAP或现场质量。后续依次补输入预处理/坐标往返、固定模型与真实ONNX Runtime、输出解析/必要后处理和WPF/部署验收。
+
+第二批阅读[颜色通道、NCHW、Letterbox与坐标空间](/knowledge/industrial/host-computer/yolo/image-channels-nchw-letterbox-and-coordinate-spaces/)及 [C# BGR缓冲、输入数组与框还原](/knowledge/industrial/host-computer/yolo/csharp-bgr-nchw-letterbox-and-box-restoration/)。新增76项纯托管检查，其中一项含36组往返，既有69项评价回归通过；实际执行自有像素的教学预处理，没有真实模型或参考库逐像素对照。下一批固定模型/导出契约与ONNX Runtime CPU会话，输出解析和现场质量仍待交付/验收。
+
+第三批进入[YOLOX-Nano固定产物、输入与CPU契约](/knowledge/industrial/host-computer/yolo/yolox-nano-model-contract-and-cpu-runtime/)及 [C#会话、OrtValue、Run与释放](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)。新增31项托管与17项真实CPU检查，固定官方约3.66MB模型及ONNX Runtime1.27.0；自有BGR夹具实际输出[1,3549,85]，301665个原始值与Python同引擎参考逐项对照，本机最大绝对误差0。模型/全量参考仅放忽略缓存，尚未做解码/NMS、一般图片、真实质量或WPF/GPU验收。
+
+第四批阅读[YOLOX网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)及 [C#解码、抑制记录与完整参考](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)。新增66项手写检查与12项真实CPU链路检查；NumPy完整3549行、候选/保留顺序和裁剪对照通过，最大坐标差约0.000061px。明确+1跨类NMS与连续评价IoU不同，仍限r=1自有渐变图；下一批一般图片与模型专属缩放，实际检测质量/现场和WPF/GPU继续单列。

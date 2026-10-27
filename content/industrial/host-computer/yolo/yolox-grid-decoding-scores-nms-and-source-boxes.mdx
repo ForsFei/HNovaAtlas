@@ -1,0 +1,139 @@
+---
+id: industrial-yolox-postprocessing
+title: YOLOX后处理：网格解码、置信度、NMS与原图框
+description: 针对固定YOLOX-Nano解释三尺度网格、指数宽高、objectness与类别分数，明确严格阈值、跨类别NMS和上游加1面积口径，再将保留框映射回r=1源图。
+tags: [工业自动化, YOLOX, 后处理, NMS, 坐标变换]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 60
+prerequisite: [industrial-csharp-yolo-onnx-session]
+related: [industrial-csharp-yolox-postprocessing, industrial-yolo-foundations]
+---
+
+## 本批位置：从原始数组走到可解释的框
+
+上一批完成[真实CPU会话与原始输出](/knowledge/industrial/host-computer/yolo/yolox-nano-model-contract-and-cpu-runtime/)。本批沿用同一模型、CPU包及受限r=1输入，不新增依赖、模型下载或界面交互；新增66项手写数据检查与12项实际CPU后处理检查。
+
+本批交付解码、分数、NMS、抑制记录和源图框，不等于现场检测质量完成。输入仍是自有416×208渐变图，不是真实物体照片，低阈值下的候选不能当目标数量或产品NG。
+
+## 1. 先确认85列分别是什么
+
+本产物输出float32 [1,3549,85]，本例按行读取，每行4个定位原始量、1个objectness和80个类别相关概率。不是[1,85,3549]，也不是已经解码的xyxy。
+
+定位量按对应grid/stride解码；输出概率不重复sigmoid；分数由objectness与类别概率组合。依据是固定上游版本的[demo_postprocess与NMS实现](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/yolox/utils/demo_utils.py)及[官方ONNX推理调用顺序](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/demo/ONNXRuntime/onnx_inference.py)，不是对所有YOLO模型的假设。
+
+## 2. 3549个位置从哪里来
+
+固定416画布的三个尺度按stride8、16、32拼接，每层X先变化、Y后变化：
+
+| 层次 | 网格宽高 | 本层行数 | 全局行索引 |
+| --- | --- | --- | --- |
+| stride8 | 52×52 | 2704 | 0..2703 |
+| stride16 | 26×26 | 676 | 2704..3379 |
+| stride32 | 13×13 | 169 | 3380..3548 |
+
+总数2704+676+169=3549。对某层局部索引local，gx=local%gridWidth，gy=local/gridWidth的整数部分。stride16层要先减2704，不能直接拿全局索引除26。
+
+例如行53属于stride8，对应(gx,gy)=(1,1)；行2704是stride16的(0,0)；行3380是stride32的(0,0)。本例用GridAt做可单独检查的映射，不从“看起来差不多”的输出长度猜层次。
+
+## 3. 定位解码：偏移和指数宽高
+
+设原始四项为tx、ty、tw、th，该行网格为gx、gy，stride为s：
+
+```text
+cx = (tx + gx) * s
+cy = (ty + gy) * s
+w  = exp(tw) * s
+h  = exp(th) * s
+x1 = cx - w/2;  y1 = cy - h/2
+x2 = cx + w/2;  y2 = cy + h/2
+```
+
+tw不是“已经是宽度”，省略exp会把框弄错；cx/cy也不是左上角。若某导出已包含decode，再执行这段则会重复解码，所以只用于当前固定产物。
+
+行0四项都是0时，中心是(0,0)、宽高8，网络框为(-4,-4,4,4)，不是零面积框。负边界在解码阶段可能正常，不能先一律置0；等NMS结束再按源图内容处理。
+
+行53取tx=ty=0.5、tw=ln2、th=ln3，则中心(12,12)，宽16、高24，网络xyxy=(4,0,20,24)。独立手算案例能发现漏grid、漏stride和cxcywh/xyxy混淆，不能只依赖正反变换“能够来回”。
+
+本例对每一行都检查有限值与几何可表示性；指数溢出、下溢为零宽、取整后端点重合及超出教学算术边界会失败，不把异常输出藏到低分过滤里。
+
+## 4. objectness、类别与最终分数
+
+每个类别先计算score[c]=objectness×classProbability[c]，再选最大乘积。假设objectness=0.8、某类概率0.5，则最终score=0.4，不能只拿0.8当该类置信度。
+
+这里的第4列和后80列已经是概率范围输出，本例要求它们在0..1，不再做sigmoid。对0.8再sigmoid会改变阈值含义；直接接收logit也不能靠“先随便sigmoid一下”修补错误模型契约。
+
+本例每行只选一个类别，不做多标签展开；类别乘积并列时取较小类别索引。必须对乘积取argmax：objectness=0时各类乘积都为0，即使某个类别原概率更高，也不能声称它成为有意义的高分预测。
+
+ClassId只是索引。当前模型是80类COCO路线，不能把第一批手写夹具的0=scratch、1=dent套进来。本批先输出ClassId，不引入未经核对的显示标签表或工件判定规则。
+
+分数是排序与筛选依据，不自动等于经过校准的缺陷概率，更不等于尺寸精度或整件产品合格概率。
+
+## 5. 分数阈值为什么是严格大于
+
+本后处理按选定上游示例采用Score>ScoreThreshold，恰好相等排除；第一批手写评价器约定Score>=Threshold，两者可以不同，但必须写清，不用一个模糊的“阈值相同”掩盖边界差别。
+
+该渐变图最高分约0.073345，默认阈值0.1得到0个候选，这是正常空结果，不是运行失败。为了让后续步骤有可核对的数据，demo明确用0.01作数值演示，得到36个候选。
+
+这个0.01不是现场推荐值。降低阈值会让更多背景响应进入后处理，不能创造模型没有学过的缺陷识别能力；真实阈值还需要代表性标注数据及误检/漏检成本。
+
+## 6. 贪心NMS怎样执行
+
+候选按分数降序排列，逐个检查与已保留框的重叠。只要与某个保留框的NMS重叠率大于阈值，就记录“当前行被哪个保留行抑制”；否则保留。
+
+本批固定class-agnostic，即跨类别共同抑制。例如同位置两个框，类0分数0.9、类1分数0.8，只保留较高者，不因为类别不同就都留。类感知、软NMS、多标签等是不同策略，本例没有开一排配置开关，先把一个选定规则讲透。
+
+同分候选显式按较小行号优先，便于复现。上游NumPy默认argsort对相等分数的顺序不作同样承诺，因此不能声称本例与所有上游版本在并列场景逐项一致。
+
+NMS是消除重复候选的启发式，不是“判断哪个框是真的”的真值评价，也不能保证不误删互相遮挡的真实物体。第一批TP/FP/FN评价仍然需要标注和一对一匹配，NMS通过不等于质量验收。
+
+## 7. 上游NMS的+1口径与评价IoU区别
+
+本批保留选定示例的面积公式：
+
+```text
+area = (x2-x1+1) * (y2-y1+1)
+intersectionWidth  = max(0, min(a.x2,b.x2)-max(a.x1,b.x1)+1)
+intersectionHeight = max(0, min(a.y2,b.y2)-max(a.y1,b.y1)+1)
+overlap = intersection / (areaA+areaB-intersection)
+```
+
+第一批评价BoxMath.IoU使用连续面积边界，不加1，保持原样。以A=(0,0,1,1)、B=(1,0,2,1)为例，连续框只边接触，评价IoU=0；上述NMS公式得到1/3，小框上差别明显。
+
+因此函数明确命名UpstreamInclusiveNmsIou，不叫一个含糊的通用IoU。保留这个口径是为了学习所选参考路线，不是在推荐所有连续坐标都加1。换评价器、模型或后处理策略时要重新固定规则。
+
+NMS重叠率恰好等于阈值时保留，仅大于才抑制。NMS阈值、分数阈值、评价匹配IoU三者分别管理，不应共用一个Threshold属性。
+
+## 8. 先做NMS，再得到源图框
+
+本批NMS使用未裁剪的网络框，之后才与源图内容求交。若先裁剪，两个原本范围不同的网络框可能变成同一个局部框，改变抑制结果。手写检查专门覆盖“裁剪后几乎重合，但NMS前仍分别保留”的场景。
+
+当前输入适配限定r=1、原点(0,0)、宽416、高1..416。因此源图坐标与网络坐标在内容区相同，只需与[0,0,416,SourceHeight]求交；无需减居中padding，也没有除缩放比例或加ROI偏移。
+
+完全在底部padding、图外或只有边接触时，Original=null；部分重叠时保留裁剪框并标记WasClipped。NMS保留项仍记在报告中，Visible只统计有原图面积的项，不能把padding响应补成零框。
+
+这不是一般Letterbox逆变换，更不能接上一批RGB/居中教学策略的结果。未来一般图片与ROI的缩放还原要单独适配，不能把本批r=1代码改个函数名当通用解法。
+
+## 9. 本机参考结果与数值差别
+
+在自有渐变图、score0.01/NMS0.45条件下，实际链路得到：
+
+```text
+Rows=3549  Filtered=3513
+Candidates=36  Suppressed=33
+Kept=3  Visible=3
+保留行号：[3453,3436,3041]
+```
+
+对应类别索引为25、33、33，分数约0.073345、0.050478、0.016533。这些是渐变图上的网络响应，不是在图片中找到三个真实物体，更不能命名为三个工业缺陷。
+
+NumPy参考从上一批已经验证的原始浮点参考文件出发，比较全部3549行xyxy/类别/分数、36个候选、NMS保留顺序以及源图裁剪，全部通过。最大坐标差约0.000061035像素，来自本次数值路径差别，不是实际定位精度。
+
+C#使用MathF.Exp/float32解码和分数，再以double计算NMS几何；参考也显式采用相同double NMS与稳定并列策略。它核对明确的本地策略，不宣称与原始NumPy默认排序/float32 NMS在所有边界位级相同，也不是独立模型质量评测。
+
+## 10. 本批验收与下一步
+
+66项手写检查覆盖网格分层、解码黄金值、分数/并列/严格阈值、跨类抑制、+1差别、抑制记录、NMS与裁剪顺序、padding空框和非法数值；12项真实CPU检查连接模型输出并验证输入/原始结果未改写。完整参考比较另列，不把3549行当3549个模型测试案例。
+
+继续阅读[C#解码、抑制记录与完整参考实践](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)。下一批再加入一般图片读取、模型专属缩放/填充与数值对照；真实图片/标注质量、WPF/GPU和长期资源继续分别验收。

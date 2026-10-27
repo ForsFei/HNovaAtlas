@@ -1,0 +1,147 @@
+---
+id: industrial-csharp-opencvsharp-edge-fitting
+title: C#实践：Canny、Hough、FitLine与圆最小二乘
+description: 使用固定OpenCvSharp包执行边缘与候选检测，读回Line2D和CircleSegment，以SVD实现教学圆拟合，验证18项托管与27项真实原生检查。
+tags: [工业自动化, C#, OpenCvSharp, Canny, 最小二乘]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 90
+prerequisite: [industrial-opencvsharp-edge-fitting, industrial-csharp-opencvsharp-shapes]
+related: [industrial-csharp-planar-calibration, industrial-csharp-inspection-pipeline]
+---
+
+## 本轮交付与运行
+
+沿用examples/industrial-opencvsharp/，固定OpenCvSharp4与Windows运行包4.13.0.20260627，实际OpenCV版本4.13.0，不引入新依赖。新增EdgeRules.cs、EdgeDemo.cs、EdgeChecks.cs和三个显式入口。Release编译零警告零错误，18项纯托管检查、27项真实原生检查通过。
+
+```powershell
+dotnet restore examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj --locked-mode
+dotnet build examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-restore
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --edges-contract-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --edges-native-test
+dotnet run --project examples/industrial-opencvsharp/IndustrialOpenCvSharp.csproj -c Release --no-build -- --edges-demo
+```
+
+托管入口不调用OpenCV；native-test执行真实滤波/检测/拟合和断言；demo只打印真实结果，不打开HighGUI/WPF窗口或相机。成功退出0，托管失败1，用法错误2，原生路径失败3；不会失败后用人工数值回填结果。
+
+## 1. 先看对象、方法与属性
+
+| 对象/方法 | 本例使用的成员或返回值 | 使用责任 |
+| --- | --- | --- |
+| Mat | Empty()、Dims属性、Type()、Total()、Clone()、Dispose() | 灰度输入验证与临时对象释放 |
+| EdgeRules | Low、High、Aperture、L2Gradient、LineVotes、MinimumLength、MaximumGap | 教学配方，Validate后使用 |
+| Cv2.Canny | 输入、输出、两阈值、孔径、L2Gradient | 生成8位边缘图 |
+| Cv2.HoughLinesP | rho、theta、threshold、minLineLength、maxLineGap | 返回LineSegmentPoint数组 |
+| LineSegmentPoint | P1、P2，各自有X、Y | 候选线段的整数端点 |
+| Cv2.HoughCircles | Gradient、dp、minDist、param1、param2、min/maxRadius | 返回CircleSegment数组 |
+| CircleSegment | Center.X、Center.Y、Radius | 原始圆候选，不带本例置信分数 |
+| Cv2.FitLine | 点集、距离类型、param、reps、aeps | 返回Line2D |
+| Line2D | Vx、Vy、X1、Y1 | 方向向量与线上一点，不是两个端点 |
+| Cv2.Solve | A、b、solution、DecompTypes.SVD，返回bool | 求线性最小二乘，不是圆搜索器 |
+
+这些是固定包实际编译的C#名称，不将C++的四元素输出直接当成C#属性名。接口原理可对照[OpenCV形状接口](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)及[线性求解接口](https://docs.opencv.org/4.13.0/d2/de8/group__core__array.html)；C#重载以本项目固定包及其XML为准。
+
+## 2. 配方与输入保护
+
+EdgeRules默认Low50、High150、Aperture3、L2Gradient=true、LineVotes20、MinimumLength30、MaximumGap3。Validate检查有限数、0≤Low&lt;High≤10000、孔径3/5/7、投票1..10000、最短线段1..4096、间隙0..128。这里的上限与严格阈值次序是教学策略，不宣称是OpenCV全部可用范围。
+
+Detect同步借用Mat，要求非空二维CV_8UC1且最多1048576像素；调用者保持它有效并且不并发写入。先Clone成独占输入，避免ROI父图邻域影响本例处理。返回坐标仍是传入图的局部坐标；没有自动添加裁剪原点或变换到机械坐标。
+
+点拟合接口另要求坐标有限、绝对值≤1000000，最多1024点；直线至少2点，圆至少6点。复制点数组后计算，不改写调用方点集。数量不足/非有限等格式问题抛ArgumentException；已通过格式检查但几何退化时返回null，不能把null转成零尺寸。
+
+## 3. 灰度分成两条检测支路
+
+```csharp
+using Mat isolated = gray.Clone();
+using Mat smooth = new();
+using Mat edges = new();
+Cv2.GaussianBlur(isolated, smooth, new Size(5, 5),
+    1, 1, BorderTypes.Reflect101);
+Cv2.Canny(smooth, edges, rules.Low, rules.High,
+    rules.Aperture, rules.L2Gradient);
+
+LineSegmentPoint[] lines = Cv2.HoughLinesP(edges,
+    1, Math.PI / 180, rules.LineVotes,
+    rules.MinimumLength, rules.MaximumGap);
+
+CircleSegment[] circles = Cv2.HoughCircles(smooth,
+    HoughModes.Gradient, 1, 32, 100, 20, 20, 28);
+```
+
+线段支路读edges，圆支路读smooth，不能写成所有接口都顺序处理同一张二值图。Gaussian的5×5、sigmaX/Y1、Reflect101是显式配方；圆的半径20..28、圆心最小间距32仅适用于夹具，不做成“万能检测参数”。[Hough圆输入与流程](https://docs.opencv.org/4.13.0/d4/d70/tutorial_hough_circle.html)
+
+返回EdgeCandidates：EdgePixels、Lines、Circles。原生返回后限制两种候选各最多64，过量抛错而非静默截取前64；这是输出资源上限，不是原生峰值内存/耗时限制。数组封装成只读托管快照，Mat在方法结束释放，不将裸指针、Mat或可变原始数组暴露到UI。
+
+## 4. 实际检测输出，不假设顺序
+
+本机运行demo得到：
+
+```text
+bar: edge pixels=190, line candidates=2, circle candidates=0
+disk: edge pixels=176, line candidates=0, circle candidates=1
+Hough candidate center=(62.500,62.500), R=22.700px
+```
+
+亮条是128×128暗背景20上Rect(20,58,88,9)的亮度220矩形；圆盘是同尺寸背景上的中心(64,64)、半径24、亮度220的实心圆。边缘像素数不等于亮区面积，条带两条边也不是两个工件。
+
+测试要求至少一个长水平候选，而不固定候选第一项、端点先后或整个候选数组。圆要求存在中心/半径分别在3px夹具容差内的候选，不声称每次环境下输出逐位相同，也不把该门槛当精度标准。空白图检查全部空候选，没有默认圆心(0,0)或半径0。
+
+## 5. FitLine读回与垂距RMS
+
+实际方法先计算样本均值、展开尺度，重合点返回null；中心化后再转Point2f，以减小大坐标直接转float的损失：
+
+```csharp
+Point2f[] centered = p.Select(v => new Point2f(
+    (float)(v.X - mx), (float)(v.Y - my))).ToArray();
+Line2D fit = Cv2.FitLine(centered,
+    DistanceTypes.L2, 0, .01, .01);
+double x = mx + fit.X1, y = my + fit.Y1;
+```
+
+随后重新核对/归一化Vx、Vy，统一无向向量的表示；正负规范化只为输出一致，不编码头尾或运行方向。param=0用于该调用的默认选择，L2下不当作异常点距离；reps/aeps=.01也不是“测量误差≤.01px”。
+
+对每点用方向向量计算垂距，返回LineFit中的X、Y、Vx、Vy、RmsPixels。ProjectionStart/ProjectionEnd来自样本投影极值，表示支持范围，非原生返回端点、自动裁剪后的显示线或真实物理端点。横线、竖线、斜线统一处理，不通过除以Vx计算主流程。
+
+已知点(0,2)、(5,2)、(10,2)实际拟合P0=(5,2)、v=(1,0)、RMS0，投影范围x0..10。加一个偏离点后RMS非零；本批没有异常点剔除，也没有用全部Canny像素拟合。
+
+## 6. 圆的SVD最小二乘实现
+
+完整实现见EdgeDemo.FitCircle。先求均值mx/my与中心二阶量xx、yy、xy，trace=xx+yy。trace&lt;1e-12或 `(xx*yy-xy*xy)/(trace*trace)&lt;1e-4` 返回null。第二个条件只是近共线性守卫，不是完整的圆弧覆盖或条件数证明。
+
+scale=sqrt(trace)，归一化坐标u=(x−mx)/scale、v=(y−my)/scale。矩阵均为CV_64FC1：A为N×3、b为N×1，结果3×1。核心代码：
+
+```csharp
+using Mat a = new(p.Length, 3, MatType.CV_64FC1);
+using Mat b = new(p.Length, 1, MatType.CV_64FC1);
+using Mat solution = new();
+for (int i = 0; i < p.Length; i++)
+{
+    double u = (p[i].X - mx) / scale;
+    double v = (p[i].Y - my) / scale;
+    a.Set(i, 0, 2 * u); a.Set(i, 1, 2 * v); a.Set(i, 2, 1.0);
+    b.Set(i, 0, u * u + v * v);
+}
+if (!Cv2.Solve(a, b, solution, DecompTypes.SVD)) return null;
+double cx = solution.At<double>(0, 0);
+double cy = solution.At<double>(1, 0);
+double c = solution.At<double>(2, 0);
+```
+
+继续检查c+cx²+cy²正且有限，圆心还原为(mx+scale·cx,my+scale·cy)，半径为scale·sqrt(c+cx²+cy²)。算完再核对有限结果，另算径向残差RMS，返回CircleFit；不是几何迭代拟合，也不是RANSAC。
+
+只检查Solve返回true不足以排除病态几何；SVD可能给出伪解。本例前置展开检查仍不能替代实际覆盖、异常点、独立检查和成像模型验证。临时矩阵均using释放，输出只有独立double值。
+
+## 7. 理想圆与异常点的对照
+
+八个已知点为(25,30)、(23,34)、(20,35)、(17,34)、(15,30)、(17,26)、(20,25)、(23,26)，都在中心(20,30)、R5圆上。实际SVD输出圆心(20,30)、R约4.999999999999999、径向RMS约8.88×10⁻¹⁶；这只是理想数值夹具的浮点误差，不是从图像得到的测量精度。
+
+平移(+1000,−500)后圆心改变但半径仍5；坐标乘2后圆心(40,60)、R10。追加远点(35,30)会明显偏置半径并增大RMS，检查明确要求观察到这种局限，不自动“修复”样本。
+
+MinEnclosingCircle只另测理想点上的外接圆，允许.001数值容差，不用于本例FitCircle实现。Hough圆候选也不作为这里的样本来源；两套独立示例没有隐含目标匹配。
+
+## 8. 验证范围与下一步
+
+18项托管检查覆盖配方边界、NaN/无穷、孔径白名单、点容量/坐标与深复制，不执行OpenCV。27项原生路径检查覆盖Canny/Hough、灰度输入、ROI隔离、空候选/只读输出、水平/竖直/斜线、投影、退化点、平移、SVD圆/缩放/近共线/极短弧/异常点及独立外接圆调用。并非45项都在测试原生算法。
+
+检测误差与代数拟合偏置被保留，没有亚像素边缘提取、自动点关联、鲁棒拟合、实际标定、毫米公差、产品OK/NG、相机/WPF、PLC/运动或长期内存/吞吐验收。继续读[局部轮廓、极性与像素测量](/knowledge/industrial/host-computer/opencvsharp/local-edge-profiles-polarity-and-pixel-width/)及 [C#投影、差分分组与边缘配对](/knowledge/industrial/host-computer/opencvsharp/csharp-projected-profiles-edge-pairs-and-width/)，再接显示与有界处理，先完成可解释的小案例。

@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { Fragment } from "react";
+import { readFile } from "node:fs/promises";
 import { renderToStaticMarkup } from "react-dom/server";
 import { unified } from "unified";
 import remarkParse from "remark-parse";
@@ -12,6 +13,26 @@ import { collectTabs, nextTabIndex } from "../src/lib/mdx/tabs";
 import { validateMermaidSource, MAX_DIAGRAM_LENGTH } from "../src/lib/mdx/mermaid-policy";
 import { transformMermaid } from "../src/lib/mdx/remark-mermaid.mjs";
 import { collectHeadings } from "../src/lib/mdx/remark-headings.mjs";
+import { IndustrialLearningRoadmap } from "../src/components/knowledge/IndustrialLearningRoadmap";
+import nextConfig from "../next.config";
+
+test("Next registers Markdown imports for server React resolution without dropping code extensions", () => {
+  const extensions = new Set(nextConfig.pageExtensions);
+  for (const extension of ["js", "jsx", "ts", "tsx", "md", "mdx"]) {
+    assert(extensions.has(extension), `Missing Next page extension: ${extension}`);
+  }
+});
+
+test("industrial roadmap stage links resolve to all twelve chapter headings", async () => {
+  const source = await readFile("content/industrial/host-computer/chapters.mdx", "utf8");
+  const headings = collectHeadings(unified().use(remarkParse).use(remarkMdx).parse(source));
+  const headingIds = new Set(headings.map((heading) => heading.id));
+  const html = renderToStaticMarkup(<IndustrialLearningRoadmap />);
+  const links = new Set([...html.matchAll(/href="(\/knowledge\/industrial\/host-computer\/chapters\/#([^"]+))"/g)].map((match) => match[2]));
+  assert.equal(links.size, 12);
+  for (const id of links) assert(headingIds.has(id), `Missing chapter heading: ${id}`);
+  assert(html.includes('<dialog') && html.includes('aria-label="工业上位机学习路线大图"'));
+});
 
 test("Callout supports semantic variants and escapes author text", () => {
   for (const type of ["info", "tip", "warning", "danger"] as const) {

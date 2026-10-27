@@ -1,0 +1,191 @@
+---
+id: industrial-csharp-halcon-shape-following
+title: C#实践：形状模型、两套变换矩阵与ROI跟随
+description: 固定HALCON 24.11.3真实接口编译形状匹配、XLD叠加与参考ROI跟随链，53项托管几何/夹具检查与五组未通过原生验证的匹配预期分开记录。
+tags: [工业自动化, C#, HALCON, 形状匹配, ROI]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 70
+prerequisite: [industrial-halcon-shape-roi-following, industrial-csharp-halcon-ncc]
+related: [industrial-csharp-wpf-vision-viewer, industrial-csharp-inspection-pipeline]
+---
+
+## 本轮做了什么，哪些没有实测
+
+继续沿用`examples/industrial-halcon/`，固定MVTec.HalconDotNet 24113.0.0与锁文件，.NET10/x64。新增真实CreateShapeModel/FindShapeModel与变换接口，不用自写搜索替代HALCON；不新增UI、相机或设备控制。
+
+| 验证项 | 本轮结果 |
+| --- | --- |
+| 真实API Release编译、锁模式还原 | 通过，零警告零错误 |
+| 新增数值几何/夹具/输出检查 | 53项纯托管检查通过 |
+| 既有三批托管检查 | 34＋27＋35项回归通过 |
+| 形状匹配原生test | DllNotFoundException，退出3，未通过 |
+| 五组匹配/区域变换、释放和长时内存 | 尚未原生验证 |
+
+没有安装原生库、修改PATH/注册表/许可或写模型文件。缺库不等于许可错误，更不是算法正常返回NoMatch。
+
+## 1. 文件与命令
+
+| 文件 | 责任 |
+| --- | --- |
+| ShapeFixture.cs | 原创96×96 F形参考/平移/90°/纯背景/双目标图像数值 |
+| ShapeGeometry.cs | 原始位姿、只读数值输出、刚体矩阵快照与边界 |
+| ShapeDemo.cs | 真实模型、查找、XLD/区域变换与统计 |
+| ShapeChecks.cs | 53项不调用HALCON的数值与夹具检查 |
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --shape-contract-test
+```
+
+只有具备匹配24.11.3原生运行库、x64及合法许可的厂商环境，才能继续验证：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --shape-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --shape-native-test
+```
+
+demo先做参考图自匹配，再处理90°图；test额外检查参考、平移、背景和双目标。退出码仍为0所选路径完成、1托管失败、2CLI用法错误、3原生路径未通过。本机未得到原生匹配结果。
+
+## 2. 常用对象、方法与输出
+
+| 对象/接口 | 用途 |
+| --- | --- |
+| HShapeModel / HTuple模型句柄 | 专用对象风格与本例静态算子风格，二者不要随意混用所有权 |
+| CreateShapeModel | 模板图domain→模型句柄 |
+| SetShapeModelOrigin | 设置相对原点偏移，本例固定(0,0) |
+| FindShapeModel | 图像＋模型→Row/Column/Angle/Score四元组 |
+| GetShapeModelContours | 读取模型归零坐标下的XLD轮廓 |
+| VectorAngleToRigid | 由对应位姿构造刚体变换 |
+| HomMat2dInvert / HomMat2dCompose | 求逆与按方向组合矩阵 |
+| AffineTransContourXld | 将模型归零轮廓变换到当前图 |
+| AffineTransRegion | 将参考原图ROI变换到当前图 |
+| GetDomain / Intersection / TestEqualRegion | 检查变换后的区域是否完整落在当前domain |
+| AreaCenter / Intensity | 区域像素面积、中心与灰度统计 |
+| ClearShapeModel / Dispose | 显式使模型失效与归还拥有的包装引用，须统一策略 |
+
+本例HObject.CountObj只用于轮廓/区域对象数量，不当成匹配数量。匹配候选数来自四个控制输出元组；原生矩阵是HTuple数值，不是HObject。[形状模型接口](https://www.mvtec.com/doc/halcon/2411/en/create_shape_model.html)、[轮廓输出](https://www.mvtec.com/doc/halcon/2411/en/get_shape_model_contours.html)
+
+## 3. 创建模型：别把所有参数都当阈值
+
+以下为完整函数中的片段，变量在外层声明并统一finally释放：
+
+```csharp
+double start = -Math.PI / 2 - 0.02;
+double extent = Math.PI + 0.04;
+HOperatorSet.CreateShapeModel(reduced, 1, start, extent,
+    Math.PI / 180, "none", "use_polarity", 30, 10, out model);
+HOperatorSet.SetShapeModelOrigin(model, 0, 0);
+HOperatorSet.GetShapeModelContours(out contours, model, 1);
+```
+
+这里依次是NumLevels、AngleStart、AngleExtent、AngleStep、Optimization、Metric、Contrast、MinContrast。none对应不减少模型点的本例策略；30/10是夹具的局部对比度设置，不是分割灰度，也不是最低匹配分数。[建模参数](https://www.mvtec.com/doc/halcon/2411/en/create_shape_model.html)
+
+模板由GenImageConst/SetGrayval生成新独占图像，完成写入后才建domain和模型。模型ROI为40×40；F形亮像素532，检测ROI仅15。没有相机缓冲、任意文件解码、色彩转换或缩放。
+
+## 4. 查找：返回候选，不自动选第一项
+
+```csharp
+HOperatorSet.FindShapeModel(image, model,
+    start, extent, 0.85, 2, 0.3, "least_squares", 1, 0,
+    out rows, out columns, out angles, out scores);
+```
+
+最后的0是Greediness，前面的1是NumLevels；本例least_squares属于形状匹配的SubPixel模式。这里没有减少为“设一个Threshold就够了”的万能配置。[FindShapeModel参数](https://www.mvtec.com/doc/halcon/2411/en/find_shape_model.html)
+
+四元组经TupleReal和有效Length复制到ShapePose。当前输出契约只接受本96×96、零原点偏移夹具：行列0..95、有限角度且绝对值不超过1.7弧度、score在0.85..1、最多2项。范围包含教学余量，不是HALCON所有模型/原点的合法域，也不替代搜索角度策略。
+
+0项返回NoMatch；2项返回Ambiguous。只有1项才进入变换。参考图自匹配本身若不是1项，整个示例失败，不能随意选一个建立全局基准。
+
+## 5. 模型轮廓用H当前
+
+```csharp
+HOperatorSet.VectorAngleToRigid(0, 0, 0,
+    p.RawRowPixels, p.RawColumnPixels, p.AngleRadians, out currentPose);
+HOperatorSet.AffineTransContourXld(normalizedContours,
+    out overlay, currentPose);
+```
+
+GetShapeModelContours得到的轮廓已经按模型原点归零，所以此处起点用(0,0,0)。本批只查询变换后轮廓对象数并释放，没有打开HALCON窗口或在WPF画图。[XLD变换](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_contour_xld.html)
+
+模型轮廓是匹配表示，不应冒充经过独立边缘测量的产品真实轮廓。一个模型可有多段轮廓，OverlayContourObjects也不是产品或候选数量。
+
+## 6. 参考原图ROI用H当前×H参考逆
+
+参考图自匹配后同样构造referencePose，即H参考。跟随时：
+
+```csharp
+HOperatorSet.HomMat2dInvert(referencePose, out inverseReference);
+HOperatorSet.HomMat2dCompose(currentPose,
+    inverseReference, out referenceToCurrent);
+
+PixelRoi r = ShapeFixture.InspectionRoi;
+HOperatorSet.GenRectangle1(out roiReference,
+    r.Row1, r.Column1, r.Row2, r.Column2);
+HOperatorSet.AffineTransRegion(roiReference, out roiCurrent,
+    referenceToCurrent, "nearest_neighbor");
+```
+
+referenceToCurrent的输入是参考原图绝对坐标；currentPose的输入则是模型归零坐标。不可因为它们都是六元素HTuple，就混用。这一组合的左/右顺序有意义，完整坐标关系见[理论篇](/knowledge/industrial/host-computer/halcon/shape-matching-rotation-and-roi-following/)。[组合接口](https://www.mvtec.com/doc/halcon/2411/en/hom_mat2d_compose.html)、[区域变换](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_region.html)
+
+## 7. 数值快照：只接受本批刚体变换
+
+PixelRigidSnapshot保存独立的六元素数组，检查有限性、教学数值上限、旋转部分单位正交以及行列式接近+1。拒绝缩放、剪切、镜像和投影矩阵；这些并非HALCON不支持，只是不属于本批刚体流程。
+
+Map按AffineTransPixel的中心→角点→变换→中心约定计算，Corners保留按顺序排列的四个角点中心，不替换成轴向外接框。这是纯数值契约，不执行图标变换，不负责栅格化。[像素变换约定](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_pixel.html)
+
+例如90°并平移(4,6)的夹具使用角点矩阵[0,-1,100,1,0,6]，Map(47,44)得到(55,53)。直接把(47,44)不加减半像素就代入同一矩阵，会得到(56,53)，暴露出一个像素差。不要为修正这一例而给所有矩阵无条件再补一次0.5。
+
+## 8. 越界不能静默裁掉继续测
+
+在调用区域变换前，检查四个角点中心是否都在0..95内；这是保守的矩形几何检查，不是滤波邻域有效性证明。随后对实际变换区域做当前domain交集并判断区域相等：
+
+```csharp
+HOperatorSet.GetDomain(image, out domain);
+HOperatorSet.Intersection(roiCurrent, domain, out clipped);
+HOperatorSet.TestEqualRegion(roiCurrent, clipped, out equal);
+```
+
+完整函数先检查对象数量，再读取equal标量。若交集不再等于整个变换区域，返回RoiOutsideImage，Roi统计为空。程序不改变系统裁剪/空区域设置，也不把算子异常吞成越界；异常独立报执行失败。[区域相等检查](https://www.mvtec.com/doc/halcon/2411/en/test_equal_region.html)
+
+当前夹具使用完整图像domain和内部ROI，不覆盖任意非矩形domain、缩放、透视或滤波边缘策略；真实集成还需记录并统一管理HALCON系统/线程配置。
+
+## 9. 读取ROI统计与输出对象
+
+```csharp
+HOperatorSet.AreaCenter(roiCurrent, out area, out row, out column);
+HOperatorSet.Intensity(roiCurrent, image, out mean, out deviation);
+```
+
+Intensity依照传入区域统计，不是自动按图像先前的reduced domain统计，所以前面的区域/domain检查有明确作用。均值不要求整数；面积则必须是正整数像素数，Row/Column和均值都要有限。[Intensity参考](https://www.mvtec.com/doc/halcon/2411/en/intensity.html)
+
+ShapeFollowReport包含Outcome、CandidateCount、可选Pose、四角点、可选FollowedRoi和OverlayContourObjects。结果只有独立托管数值；FollowedRoi保存面积、中心和平均灰度，没有原生对象、毫米或工件身份。
+
+| Outcome | 是否有ROI统计 | 意义 |
+| --- | --- | --- |
+| NoMatch | 无 | 当前搜索条件没有匹配 |
+| Ambiguous | 无 | 多个候选，不自动选择 |
+| RoiOutsideImage | 无 | 有单候选，但检测区域不完整可用 |
+| RoiPrepared | 有 | 完成当前ROI跟随与统计，不等于产品OK |
+
+没有“本帧失败就复用上帧矩阵”的分支。实际接入相机/检测队列时，还需同帧、同模型和同配方身份约束，不能只靠这些数值DTO。
+
+## 10. 生命周期：模型、轮廓、矩阵各自归还
+
+Run拥有模板、模型、归零轮廓与referencePose；Follow只借用这些输入，拥有当前矩阵、逆矩阵、组合矩阵、变换轮廓和当前ROI。每次Follow的finally归还自己的输出，不销毁借来的模型。
+
+最终Run通过固定包HTuple.Dispose归还模型句柄引用，没有另行强制ClearShapeModel。显式Clear会使模型失效，共享别名/线程不能继续使用，不能把它当“关闭本次查找”。本例无并发、缓存、换型、文件保存或模型共享。[ClearShapeModel](https://www.mvtec.com/doc/halcon/2411/en/clear_shape_model.html)
+
+释放路径已编译，但原生加载失败发生在真正建模前，因此不能报告资源释放、反复建模或长期内存测试通过。
+
+## 11. 检查覆盖与下一步
+
+53项纯托管检查覆盖刚体矩阵与半像素、独立快照、角点次序/越界、四元组长度/上限/有限值、统计边界、F形532像素、双目标1064像素和90°整数映射。它们不实现形状搜索或区域栅格化。
+
+五组原生预期为参考、平移、90°、背景与双目标。前三组检查角度、ROI中心/面积/均值与轮廓对象；后二组检查不跟随ROI。角点越界只在托管几何检查中验证，尚没有真实原生越界样本通过记录。
+
+原生test当前仍因DllNotFoundException返回3，不能将手算(47,44)/(51,50)/(55,53)视作实测。后续需要合法环境下的HDevelop对照，再加任意角度、模糊/遮挡、弱边缘、边界、相似目标、时延和内存数据集。
+
+下一批已接续为[一维测量窗口、边缘与配对](/knowledge/industrial/host-computer/halcon/one-dimensional-edges-pairs-and-measurement/)及 [C#测量对象、像素宽度与释放](/knowledge/industrial/host-computer/halcon/csharp-measure-objects-edge-pairs-and-width/)。这里完成的是“匹配后让检测范围随工件移动”的接口与教学案例，不是已交付的生产检测、标定定位或机械视觉引导。

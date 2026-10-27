@@ -1,0 +1,179 @@
+---
+id: industrial-csharp-robot-frames-context
+title: C# 六轴基础实践：带坐标名的变换、工具偏移与上下文复核
+description: 用可编译纯C#实现旋转与坐标链，验证工具偏移和帧匹配，再用默认拒绝的普通状态复核理解模式与任务接入边界。
+tags: [工业自动化, C#, 机械臂, 坐标系, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 220
+prerequisite: [industrial-six-axis-robot-foundations]
+related: [industrial-csharp-plc-motion-handoff, industrial-csharp-recovery-review, industrial-device-command-handshake-idempotency]
+---
+
+## 本篇交付什么
+
+配套`examples/industrial-robotics/`是独立.NET 10控制台，无第三方包、网络和原生库。它实现旋转矩阵、带坐标名的刚体变换以及普通上下文复核，不模拟六轴机构，不求逆解，不调用发那科/爱普生SDK，也不派发运动。
+
+先读[六轴概念与模式](/knowledge/industrial/host-computer/motion/six-axis-robot-frames-posture-and-modes/)。本项目独立于既有雷赛模拟器，避免给SimAxis贴上“六轴机器人”标签；也没有新增交互面板，先用能复算的代码建立基础。
+
+## 1. 运行与文件结构
+
+在仓库根目录执行：
+
+```powershell
+dotnet build examples/industrial-robotics/IndustrialRobotics.csproj -c Release
+dotnet run --project examples/industrial-robotics/IndustrialRobotics.csproj -c Release -- --self-test
+dotnet run --project examples/industrial-robotics/IndustrialRobotics.csproj -c Release -- --demo
+```
+
+| 文件 | 主要对象 | 作用 |
+| --- | --- | --- |
+| FrameTransform.cs | Vec3、Rotation3、FramedPoint、FrameTransform | 有限数值、纯旋转和坐标链 |
+| RobotContextReview.cs | RobotBinding、RobotContextSample、Assess | 复核调用者提供的普通上下文 |
+| RobotChecks.cs | Run、Demo | 58项确定性检查与数值演示 |
+| Program.cs | 两个CLI参数 | 没有硬件或远程控制模式 |
+
+这里没有连接对象，因此不存在Open/Close/Read/Write方法。将来接SDK时再按已确定版本补连接、关闭和读取；本批不会为了凑齐方法名伪造RobotClient。读取出来的位姿也必须先经过厂商约定解码，才可成为本项目的输入。
+
+## 2. 把数学约定写进类型和名字
+
+本项目采用右手系、列向量，矩阵数组按行存储。长度以mm表达，`Around`只接收弧度。`baseFromWork`表示把work中的值转换到base；`Target`是base，`Source`是work。
+
+```csharp
+FrameTransform baseFromWork = new(
+    target: "base",
+    source: "work",
+    rotation: Rotation3.Around(RotationAxis.Z, Math.PI / 2),
+    translationMm: new Vec3(500, 100, 0));
+
+FramedPoint point = new("work", new Vec3(20, 0, 30));
+FramedPoint result = baseFromWork.ApplyPoint(point);
+// result.Frame == "base"
+// result.Millimeters ≈ (500, 120, 30)
+```
+
+`FrameTransform`不接受空白或带首尾空格的名称。`ApplyPoint`要求点的Frame与Source精确匹配；不能把base点再当work点转换。比较区分大小写，不自动猜测或纠正坐标名。
+
+名称只是程序标签，不是物理标定证明。两个对象都写“work”也可能来自不同标定版本；这种一致性需要外部绑定和资料管理，不由字符串相等解决。
+
+## 3. Rotation3的属性方法怎么用
+
+| 成员 | 输入/输出 | 约束或含义 |
+| --- | --- | --- |
+| Identity | 单位旋转 | 不改变向量 |
+| Around(axis, radians) | 明确轴与弧度 | 教学范围为±2π，不识别厂商姿态字段 |
+| FromRowMajor(matrix) | 九个double | 校验正交和行列式，复制数组 |
+| Apply(vector) | Vec3→Vec3 | 只旋转，不加平移 |
+| Compose(inner) | Rotation3→Rotation3 | 当前矩阵乘inner，先应用inner |
+| Inverse() | 逆旋转 | 对合格旋转取转置 |
+| ToRowMajor() | 新数组 | 修改导出值不修改原对象 |
+
+导入矩阵必须有限；行之间正交、长度为1，行列式接近+1，校验容差为`1e-9`。缩放、剪切、镜像和明显无效输入被拒绝，不静默正交化。这个容差是教学数值策略，不是机器人定位精度。
+
+`Around(Z, 90)`在本项目中会因超出范围而拒绝，但这不是可靠的角度单位自动识别：把1°误写成1弧度仍可通过。单位必须由调用方确认。多圈关节角也不应送入这个单次旋转构造器，不能从旋转矩阵反推腕轴圈数。
+
+## 4. Compose为什么是先右边、再左边
+
+若`baseFromWork`把work转换到base，`workFromTcp`把tcp转换到work，则：
+
+```csharp
+FrameTransform workFromTcp = new(
+    "work", "tcp", Rotation3.Identity, new Vec3(20, 0, 30));
+
+FrameTransform baseFromTcp = baseFromWork.Compose(workFromTcp);
+```
+
+内部执行以下关系：
+
+```text
+R_base_tcp = R_base_work × R_work_tcp
+t_base_tcp = R_base_work × t_work_tcp + t_base_work
+```
+
+`Compose`验证当前Source等于inner.Target，不相接就抛异常。不能把两个同样以base为Target的变换直接连乘；应先明确是要取逆、重表达，还是施加一个位移。
+
+矩阵乘法不交换。测试用绕X与绕Z的90°旋转，明确检查换序后结果不同。不要用全零姿态样例来验证组合顺序，那样很容易掩盖错误。
+
+## 5. 工具偏移如何倒算到法兰
+
+```csharp
+FrameTransform flangeFromTcp = new(
+    "flange", "tcp", Rotation3.Identity, new Vec3(0, 0, 100));
+
+FrameTransform baseFromFlange =
+    baseFromTcp.Compose(flangeFromTcp.Inverse());
+
+// 本例法兰原点在base中约为(500, 120, -70) mm。
+```
+
+`Inverse()`交换坐标名，旋转取逆，平移用`-R逆 × t`。不是XYZ全取负后就完成逆变换。
+
+测试还有倾斜工具的夹具：目标TCP在base的`(500,0,300)`，工具方向绕Y旋转90°，同一100mm偏移倒算后法兰在`(400,0,300)`。如果简单在base Z减100，会得到另一位置。这只是数学反例，不是实际机器人目标或操作步骤。
+
+需要进一步区分：控制器通常自己根据TCP目标和工具定义计算关节/法兰关系。不要把PC倒算的法兰坐标又作为TCP目标发送，造成工具偏移被应用两次。本项目没有发送器，示例仅用于理解和核对。
+
+## 6. 点、方向和单位的边界
+
+`ApplyPoint(FramedPoint)`执行旋转加平移，返回带Target名称的点。`RotateVector(Vec3)`只旋转，适合方向分量；它没有给向量附坐标标签，调用者必须确保输入确实在Source中，结果才可解释为Target中的方向。
+
+`Vec3`本身只是三个double，不区分mm、m或单位方向；项目在命名和边界上约定单位，没有实现量纲类型系统。不要直接把HALCON的像素、相机米制坐标或SDK角度放进来。
+
+所有运算入口检查有限性；平移或旋转结果溢出到无穷会拒绝。没有给坐标设置实机行程限值，因为那需要具体机构和工具。有限值不等于可达、参考正确或途经空间允许。
+
+## 7. 为什么再加一个上下文复核
+
+坐标计算正确仍不足以执行工艺。PC还要确认当前控制器、工具和工件系是审核时的那一组，且普通状态数据有效。
+
+`RobotBinding`有四个字段：
+
+| 字段 | 本项目含义 | 不代表什么 |
+| --- | --- | --- |
+| ControllerBoot | 已归一化的控制器启动代 | 随机Guid不是设备身份或重启证明 |
+| Revision | 审核后程序/坐标/工具定义的绑定版本 | 类本身不读取或校验实际标定数据 |
+| ToolId | 当前选择的工具标识 | 同号工具没有被碰歪的证明 |
+| WorkFrameId | 当前工件系标识 | 字符串/编号相等不是精度验收 |
+
+实际控制器是否提供可靠启动代，多个版本如何组合成Revision，都要由外部适配及管理流程解决。测试中的Guid和版本只是虚构夹具，不伪装成品牌原生字段。工具/工件系编号允许0，但其语义必须由对应设备确认。
+
+## 8. RobotContextSample与Assess怎么调用
+
+`RobotContextSample`包含Binding、SampledAt、Mode和五个普通布尔事实。除时间与Binding外，构造时Mode默认Unknown，其余正向事实默认false，避免忘记填字段就得到肯定结果。
+
+```csharp
+RobotBinding binding = new(
+    Guid.Parse("1b4f254b-1170-4a67-ae28-8242b426b515"),
+    Revision: 1, ToolId: 2, WorkFrameId: 3);
+
+// 全是离线夹具值，不是从真实控制器采集。
+RobotContextSample sample = new(
+    binding, SampledAt: 10,
+    Mode: RobotMode.Automatic, Valid: true, RemoteSelected: true,
+    ProgramIdle: true, NoFaultObserved: true, ProcessPermit: true);
+
+ContextReview review = RobotContextReview.Assess(binding, sample, now: 10.1);
+Console.WriteLine(review.PrerequisitesObserved);
+Console.WriteLine(review.Reason);
+```
+
+`Assess(expected, sample, now, maxAge)`先检查调用参数，再检查质量、时间、绑定、模式/控制来源和普通事实。默认年龄预算0.25秒是教学策略，不是协议、控制器实时性或现场要求。SampledAt与now必须属于同一单调时钟域；不能直接比较PC秒表与控制器墙上时间。
+
+多个源拼成摘要时，不能把刚读到的Mode更新时间盖在很旧的工具数据上。Valid及摘要时间须由外层按覆盖范围保守维护，项目不实现原子采集或多源一致性。
+
+## 9. PrerequisitesObserved不是Ready，更不是安全许可
+
+返回true只表示：调用者声明的普通事实满足这一次复核。它不证明现场安全系统正常、机械停止、路径可行、工具实际正确、程序有权启动或任务已完成。
+
+特别注意，这个检查是无状态的：旧数据过期后，新鲜同值数据再次输入可以重新得到true；它不检测采样历史缺口，也不保留粘性锁定，不应直接驱动自动启动按钮或重连续跑。
+
+真正任务执行仍需要单所有者、一次派发、任务身份、完整载荷、结果保留、期限与失联对账。可复习[PLC—运动交接](/knowledge/industrial/host-computer/motion/csharp-plc-motion-task-handoff/)和[恢复复核](/knowledge/industrial/host-computer/motion/csharp-recovery-review-and-stale-confirmation/)，但不能把其中内存对象直接包装成已验证的机器人远程接口。
+
+程序空闲不证明伺服已停止；无报警也不证明有运动许可。普通ProcessPermit不承担安全功能。本项目没有MotorOn、Start、Stop、Reset、Continue或自动恢复方法。
+
+## 10. 58项检查覆盖什么
+
+检查包括三轴旋转方向、组合顺序、逆和数组隔离；拒绝非有限、缩放、剪切、镜像、错坐标链和溢出；验证旋转工装点、工具倒算及重建。48组确定性三轴往返只作为一项补充数值回归，不算48次现场试验。
+
+上下文检查覆盖默认false、失效/旧/未来时间、控制器代、绑定版本、工具和工件系变化、示教/未知模式、远程来源、空闲/无故障/普通许可缺失，以及无状态复核的边界。
+
+本篇没有：厂商Euler解码、关节正逆解、机构/构型模型、奇异/可达/避障计算、负载/标定、实际网络、SDK生命周期、任务派发或真实安全验收。继续读[任务握手与异常对账](/knowledge/industrial/host-computer/motion/robot-job-handshake-results-and-reconciliation/)和 [C#单任务会话](/knowledge/industrial/host-computer/motion/csharp-robot-task-session-and-results/)，说明品牌接入前的数据契约；型号和软件版本确定后再补真实对象属性与连接/读取/写入/关闭流程。

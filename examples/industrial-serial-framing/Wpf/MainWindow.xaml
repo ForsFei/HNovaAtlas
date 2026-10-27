@@ -1,0 +1,27 @@
+<Window x:Class="SerialFraming.Wpf.MainWindow"
+ xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+ xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+ Title="串口组帧教学 · 默认离线" Width="760" Height="500"
+ MinWidth="620" MinHeight="380" Closing="OnClosing">
+ <Grid Margin="20">
+  <Grid.RowDefinitions>
+   <RowDefinition Height="Auto"/><RowDefinition Height="Auto"/>
+   <RowDefinition Height="Auto"/><RowDefinition Height="*"/>
+  </Grid.RowDefinitions>
+  <StackPanel Orientation="Horizontal">
+   <CheckBox x:Name="RealPort" Content="使用真实/虚拟 COM 端口" VerticalAlignment="Center" Margin="0,0,12,0"/>
+   <TextBox x:Name="PortName" Text="COM3" Width="75" Margin="0,0,8,0" AutomationProperties.Name="端口名"/>
+   <TextBox x:Name="BaudRate" Text="9600" Width="85" AutomationProperties.Name="波特率"/>
+  </StackPanel>
+  <StackPanel Grid.Row="1" Orientation="Horizontal" Margin="0,14">
+   <Button x:Name="Connect" Content="连接" Click="OnConnect" Padding="15,7"/>
+   <Button x:Name="ReadOnce" Content="读取一次温度" Click="OnRead" IsEnabled="False" Padding="15,7" Margin="10,0"/>
+   <Button x:Name="Disconnect" Content="断开" Click="OnDisconnect" IsEnabled="False" Padding="15,7"/>
+  </StackPanel>
+  <StackPanel Grid.Row="2" Margin="0,0,0,12">
+   <TextBlock x:Name="Status" Text="未连接。未勾选 COM 时仅使用内存教学设备。" TextWrapping="Wrap"/>
+   <TextBlock x:Name="Temperature" Text="温度：—（无有效读数）" FontSize="24" Margin="0,10,0,0"/>
+  </StackPanel>
+  <ListBox Grid.Row="3" ItemsSource="{Binding History}" FontFamily="Consolas" AutomationProperties.Name="通信记录"/>
+ </Grid>
+</Window>

@@ -80,6 +80,25 @@ async function article(root: string, file: string, overrides: Record<string, unk
   await writeFile(target, `---\n${stringify(metadata)}---\n\n${body}`, "utf8");
 }
 
+test("CRLF frontmatter with a trailing flow sequence matches LF metadata and headings", async () => fixture(async (root) => {
+  await article(root, "domain/tech/a.mdx");
+  await article(root, "domain/tech/b.mdx");
+  const target = path.join(root, "domain/tech/a.mdx");
+  const source = [
+    "---", "id: a", "title: 示例文章", "description: 测试内容",
+    'updated: "2026-09-29"', "status: published", "prerequisite: [b]", "related: [b]",
+    "---", "", "## 换行兼容", "", "正文。",
+  ].join("\n");
+
+  for (const production of [false, true]) {
+    await writeFile(target, source, "utf8");
+    const expected = await scanContent(root, production);
+    assert.deepEqual(expected.articles.find((item) => item.id === "a")?.related, ["b"]);
+    await writeFile(target, source.replace(/\n/g, "\r\n"), "utf8");
+    assert.deepEqual(await scanContent(root, production), expected);
+  }
+}));
+
 test("production excludes drafts and their empty folders; scanner never executes MDX", async () => fixture(async (root) => {
   await article(root, "industrial/ethercat/basic/intro.mdx");
   await article(root, "industrial/ethercat/advanced/draft.mdx", { status: "draft" }, "{(() => { throw new Error('must not execute'); })()}");

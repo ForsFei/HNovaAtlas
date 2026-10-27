@@ -45,7 +45,9 @@ export async function scanContent(root: string, production: boolean): Promise<Co
         identifier.parse(stem);
         const file = path.join(directory, entry.name);
         try {
-          const source = await readFile(file, "utf8");
+          // gray-matter excludes the closing LF but leaves its CR behind on Windows.
+          // Normalize before extracting frontmatter so YAML flow sequences remain valid.
+          const source = (await readFile(file, "utf8")).replace(/\r\n/g, "\n");
           if (!/^---\r?\n/.test(source)) throw new Error("文章必须以 YAML Frontmatter 开始（独立的 --- 行）");
           const { data, content } = matter(source, { engines: { yaml: (text: string) => parse(text) } });
           const metadata = frontmatterSchema.parse(data);

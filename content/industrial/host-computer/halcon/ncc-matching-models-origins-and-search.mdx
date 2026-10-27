@@ -1,0 +1,126 @@
+---
+id: industrial-halcon-ncc-matching
+title: HALCON定位匹配：NCC、模板原点、搜索区域与分数
+description: 从分割中心转向模板定位，理解NCC与形状匹配选择、模型ROI/搜索ROI、参考点、弧度、候选数量和原始位姿的边界，避免把匹配分数当产品合格率。
+tags: [工业自动化, HALCON, 模板匹配, NCC, 视觉定位]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 40
+prerequisite: [industrial-halcon-segmentation-and-morphology, industrial-csharp-halcon-segmentation]
+related: [industrial-csharp-halcon-ncc, industrial-csharp-planar-calibration]
+---
+
+## 从“亮块中心”走到“指定目标的位置”
+
+上一批按灰度得到区域，再计算面积与中心。但一个工件上有几个亮块时，哪个才是定位标记？工件旋转后，应该跟随哪个方向？模板匹配要回答的是“参考图里的这个结构，在当前图什么位置出现”，不只是“哪里有一块亮区域”。
+
+本批先学习NCC灰度相关匹配，并交付真实C#接口的小型平移案例。形状匹配先作选择对照，旋转/缩放、定位后ROI跟随与测量继续分批补充。仍固定HALCON 24.11.3接口；本机缺匹配原生运行库，下面夹具预期不等于原生实测。
+
+## 1. 分割、匹配、测量与判定分别回答什么
+
+| 工作 | 主要问题 | 不能直接推出 |
+| --- | --- | --- |
+| 分割 | 哪些像素符合当前灰度/颜色等条件 | 它必然就是指定工件 |
+| 匹配定位 | 哪些位置与参考模板相似，位姿如何 | 尺寸已测准、产品合格 |
+| 测量 | 指定边、孔、线之间的几何量是多少 | 未经标定就得到真实毫米 |
+| 工艺判定 | 测量与上下文是否满足工艺规则 | 自动获得机械启动许可 |
+
+常见流程是先定位，再把参考位置上的检测ROI移动到当前工件，最后测量或判定。也可能先用分割缩小搜索范围，但不要把每一步输出混成一个布尔值。
+
+## 2. NCC在比较什么
+
+可把模板内一组灰度记为T，当前候选位置对应灰度记为I。理解NCC的一个常用数学形式是：分别减去均值，再计算两组数的相关程度，并按各自变化量归一化。
+
+```text
+相关值 = Σ[(T-均值T) × (I-均值I)]
+         / sqrt(Σ(T-均值T)² × Σ(I-均值I)²)
+```
+
+这是帮助理解的数学表达，不是本项目自写的HALCON替代实现。若I只是T在理想条件下整体加亮或正比例改变对比度，归一化后仍可能保持很强相关；如果发生饱和、反光、遮挡、局部阴影或纹理变化，就不能据此保证不受影响。常量模板缺乏灰度变化，也不是一个好定位标记。
+
+NCC倾向于比较区域内灰度结构；应挑选稳定、可区分、不会频繁变化的局部图案。不要把日期、随机字符、可变印刷内容或反光背景全部圈进模板，随后期待它在批次变化后仍稳定。
+
+HALCON的CreateNccModel以模板图像domain作为建模区域，生成供查找使用的模型句柄；它不是保存了一张显示截图，也不是二值连通域。[CreateNccModel参考](https://www.mvtec.com/doc/halcon/2411/en/create_ncc_model.html)
+
+## 3. NCC与形状匹配怎么选
+
+| 候选方向 | 可以先尝试的条件 | 需要特别检查 |
+| --- | --- | --- |
+| NCC灰度相关 | 内部纹理稳定且区分度高 | 局部光照、遮挡、纹理/印刷变化 |
+| 形状匹配 | 稳定边缘比内部灰度更有意义 | 边缘对比度、重复轮廓、对称性 |
+| 分割＋几何特征 | 目标简单、背景可分离 | 粘连、反光、目标身份与方向歧义 |
+
+这不是“形状匹配永远更高级”的排名。HALCON的经典CreateShapeModel/FindShapeModel有自己的模型点、对比度、优化、SubPixel和Greediness等参数，不能把NCC的参数和分数直接复制过去。[形状建模](https://www.mvtec.com/doc/halcon/2411/en/create_shape_model.html)、[形状查找](https://www.mvtec.com/doc/halcon/2411/en/find_shape_model.html)
+
+本批可执行代码只使用NCC，没有创建形状模型。后续会用形状匹配接着讲旋转与检测ROI跟随；缩放或形变也需要对应算法，不由普通刚性模板自动解决。
+
+## 4. 模板ROI与搜索ROI：含义不一样
+
+模板ROI决定“拿什么内容当标记”。本例源图64×64，模板矩形为行12..35、列10..41，共24×32=768个像素，区域中心为(Row=23.5,Column=25.5)。
+
+搜索ROI决定“允许在什么位置找”。对FindNccModel，搜索图像domain限制的是原始模板domain重心的位置；不是要求模板覆盖的全部像素都在这块搜索ROI内。模板仍需满足完整位于图像中的条件。更改模型输出原点也不会把这个搜索依据一起换掉。[FindNccModel的domain说明](https://www.mvtec.com/doc/halcon/2411/en/find_ncc_model.html)
+
+因此，目标中心在一个4×4小搜索框中，模板本身比这个框大很多，也不必然找不到。反过来，搜索框看起来盖住目标一部分，参考点却不在框内，也可能没有匹配。不要沿用上一批Threshold“只选ROI内像素”的直觉。
+
+## 5. 模型原点不是模板左上角
+
+默认参考原点是模板domain重心。SetNccModelOrigin的Row/Column是相对于这个重心的偏移，不是原图绝对坐标。例如本例(0,0)保留默认重心；(2,-3)是从重心向下2、向左3，而不是把原点搬到原图(2,-3)。该操作修改模型状态，共享模型时不能与查找无协调地并发。[SetNccModelOrigin参考](https://www.mvtec.com/doc/halcon/2411/en/set_ncc_model_origin.html)
+
+选择原点应服务于后续任务，例如某个定位销或工艺基准。改原点后，返回位置的语义也改变；模板图像、模型参数、原点与后续测量ROI必须一起管理。只保存一个ModelID数字没有这种语义。
+
+## 6. 角度先分清单位和范围
+
+Angle使用弧度，π弧度等于180°。如果希望覆盖-10°到+10°，概念上AngleStart为-10°换算后的弧度，AngleExtent为20°换算后的弧度，而不是把结束角+10°直接当Extent。
+
+AngleStep决定建模时角度离散采样，搜索范围还受到已创建模型的约束；增加范围、减小步长会增加模型资源需求。Metric的use_polarity要求保持对比度方向，ignore_global_polarity允许整体反转，不能据此推导任意局部反光都能忽略。[建模参数与极性](https://www.mvtec.com/doc/halcon/2411/en/create_ncc_model.html)
+
+本批为了把输入/输出与原点讲清，创建和查找均固定AngleStart=0、AngleExtent=0，仅搜索平移；AngleStep=0.05不是“能查找±0.05弧度”。没有旋转样本，也没有经过原生验证的角度准确率。将来开放旋转时必须同时修改模型、输出契约、数据集和叠加坐标链。
+
+## 7. Score、NumMatches和“唯一目标”
+
+MinScore是搜索门槛，不是工艺尺寸公差，也不是“合格概率”。本例同一纹理的理想平移使用0.99，只为构造易核对夹具；真实现场阈值要用正样本、干扰样本和失败代价确定。
+
+NumMatches限制返回数量；设为1只能拿到最好的一项，不能证明没有第二个相似目标。设为2能观察部分歧义，但仍受分数、搜索范围和重叠抑制影响，不是工位唯一性证明。MaxOverlap控制重复候选的允许重叠，也不是工件间安全距离。[查找数量与重叠参数](https://www.mvtec.com/doc/halcon/2411/en/find_ncc_model.html)
+
+工程上可进一步要求候选数量、指定区域、允许方向、与前序身份的关系；若要求比较前两名分差，也必须说明何时第二名根本没有返回。不要仅取score[0]就决定机械抓取。
+
+## 8. 原始匹配位姿与准确像素点要区分
+
+HALCON官方特别说明FindNccModel的Row/Column与模型原点相关，但做过适合构造变换矩阵的修正，不应在有旋转时直接当作精确变换后的像素点。配套C#输出因此命名RawRowPixels/RawColumnPixels，而不命名“机械抓取点”。[官方输出说明](https://www.mvtec.com/doc/halcon/2411/en/find_ncc_model.html)
+
+需要图标对象兼容的变换时，要明确参考坐标系，使用VectorAngleToRigid构造刚体变换，再按像素/轮廓/区域各自接口处理。AffineTransPixel包含像素中心与角点约定的转换，不能混同AffineTransPoint2d后随意补半像素。[VectorAngleToRigid](https://www.mvtec.com/doc/halcon/2411/en/vector_angle_to_rigid.html)、[AffineTransPixel](https://www.mvtec.com/doc/halcon/2411/en/affine_trans_pixel.html)
+
+本批零旋转平移预期只检查原始位姿接近定义的参考位置，容差0.75像素是夹具教学策略，不是厂商精度指标。毫米与机械坐标仍须参考[具名标定与误差](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)，不把匹配输出直接给雷赛或机械臂。
+
+## 9. 模型与每帧结果的生命周期
+
+通常先在确认过的模板上建模或读取已保存模型，运行时对不同图查找，结束或换型时归还自己拥有的模型。别在每帧回调里反复建模，也别让UI关闭时直接清除后台仍在使用的共享模型。
+
+本例在同一次CLI中创建一次，复用到多个夹具查找，最后释放，不实现全局缓存。模型文件可通过WriteNccModel保存、ReadNccModel读回，默认扩展名ncm；文件不等于当前进程的活句柄，也不替你管理配方版本。[模型写入](https://www.mvtec.com/doc/halcon/2411/en/write_ncc_model.html)、[模型读取](https://www.mvtec.com/doc/halcon/2411/en/read_ncc_model.html)
+
+ClearNccModel会使模型句柄失效，不能清除后让别名继续查找。C#包装器的Dispose与显式Clear要按固定版本和所有权统一安排，完整示例在下一篇解释。本批没有写模型文件，也没有用真实许可/原生环境验证模型持久化。[清理模型参考](https://www.mvtec.com/doc/halcon/2411/en/clear_ncc_model.html)
+
+## 10. 四个夹具预期与三种结果
+
+纹理由原创确定性公式生成，不依赖外部照片。模板中心(23.5,25.5)，向下18、向右14后中心预期(41.5,39.5)。下面是待原生执行的预期，不是本机匹配结果：
+
+| 场景 | 预期 | 要观察的含义 |
+| --- | --- | --- |
+| 搜索平移图，较大搜索ROI | 一个候选，原始位姿接近(41.5,39.5) | 模板对应位置随图案移动 |
+| 在模板原图中查找 | 一个候选，接近(23.5,25.5) | 原点不是左上角(12,10) |
+| 平移图，ROI行40..43/列38..41 | 仍能找到同一候选 | 搜索ROI约束参考点，不是完整模板范围 |
+| 平移图，ROI行0..5/列0..5 | NoMatch | 该区域没有合适且能完整落在图像中的参考位置 |
+
+最后一个不是“图中没有目标”，而是“按这组搜索条件没有结果”。原生调用失败则是另一条执行失败分支，不能伪装成NoMatch。找到了候选，也只代表当前算法条件下的Candidates，不等于产品OK或执行许可。
+
+## 11. 调试与面试追问
+
+1. 分割能找到亮块，为什么还需要匹配？需要识别指定结构和稳定参考位置时，灰度块本身可能不足以区分。
+2. 模板原点与模板左上角是一回事吗？不是；默认跟domain重心有关，修改参数是相对偏移。
+3. NumMatches=1能说明图中只有一个目标吗？不能，返回上限与真实唯一性不同。
+4. 分数很高为什么仍不能直接输出抓取点？还缺坐标约定、标定、身份与机械/工艺约束。
+5. 找不到时应一直降低MinScore吗？先看输入、模板、搜索范围、方向、极性与成像变化，再判断该算法是否合适。
+6. C#编译通过说明什么？接口与类型成立；不说明匹配、许可、内存或精度已通过。
+
+接着读[C# NCC模型创建、查找、结果与释放](/knowledge/industrial/host-computer/halcon/csharp-ncc-model-search-and-lifetime/)。随后学习[形状匹配、旋转与定位后的ROI跟随](/knowledge/industrial/host-computer/halcon/shape-matching-rotation-and-roi-following/)，再进入边缘/尺寸测量。

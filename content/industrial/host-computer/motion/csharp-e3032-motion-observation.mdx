@@ -1,0 +1,192 @@
+---
+id: industrial-csharp-e3032-motion-observation
+title: C# 单轴动作观察：回零、定位完成、停止原因与结果未知
+description: 以官方状态接口和纯离线观察器解释运动命令生命周期，区分旧完成位、指令结束、反馈到位、普通停止、超时与未知结果。
+tags: [工业自动化, E3032, C#, 运动控制, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-20"
+order: 60
+prerequisite: [industrial-e3032-drive-homing-reference]
+related: [industrial-csharp-single-axis-simulation, industrial-csharp-e3032-readonly-diagnostics, industrial-device-command-handshake-idempotency]
+---
+
+## 本批交付与运行边界
+
+本批在已有 `examples/industrial-motion/` 内增加 `MotionObservation.cs` 和 `ObservationChecks.cs`，不新建框架或UI。观察器消费脚本化状态，判断一条动作的证据是否足够；它**不调用SDK、不发送命令、不停止轴，也不模拟驱动回零方式**。
+
+新增52项观察检查，包含两项与既有SimAxis的集成观察；原有68项单轴模拟检查保持独立。真实 SDK ABI、驱动返回行为、反馈映射和实机动作仍未验证。本章的C# SDK片段是调用导读；可运行部分只使用项目自己的纯C#类型。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --observation-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --observation-demo
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --self-test
+```
+
+演示依次给出：旧回零完成位经过本次动作的有效变化后才能建立参考；定位等待模拟反馈与到位证据；错过启动时保留Unknown。没有DLL、网络或硬件入口。
+
+## 1. 一次动作分成哪些证据
+
+```text
+构造观察记录 → 记录本次调用结果 → 等待启动证据 → 运行观察
+ → 停止后核对目标/结果/反馈 → 重复观察满足约定 → 记录结果
+任一阶段：数据失效/失联/超时 → Unknown，不暗中发送停止或重发
+```
+
+`dmc_pmove_unit` 或 `nmc_home_move` 返回成功，首先是一次调用确认；`dmc_check_done=1` 是指定轴已停止。是否属于本次动作、为什么停止、是否到达目标，需要额外证据。
+
+本例要求同一时刻只有一个应用动作所有者。`CommandKey` 的会话代次/序号只用于本地记录，**不是雷赛设备端的事务ID**，不能阻止另一程序抢轴、证明exactly-once或在失联后自动恢复动作归属。现场可能存在第二发布者时，需先解决所有权与仲裁。
+
+## 2. 对照官方函数读取什么
+
+| 需要的证据 | 官方接口或确认来源 | 本例中的字段 |
+| --- | --- | --- |
+| 调用是否确认 | 本次SDK调用返回值与异常 | `DispatchEvidence`，不直接映射成完成 |
+| 数据/总线可用 | 返回码、总线诊断和采样质量 | `DataValid / BusError` |
+| 轴驱动状态 | `nmc_get_axis_state_machine` | `DriveState`，本手册4为操作使能 |
+| 轴诊断 | `nmc_get_axis_errcode` | `AxisError` |
+| 正在运行/已停止 | `dmc_check_done` | 校验0/1后转为`IsStopped` |
+| 回零结果 | `dmc_get_home_result` | 校验0/1后转为`HomeResult` |
+| 为什么停止 | `dmc_get_stop_reason` | `StopReason` |
+| 指令侧位置 | `dmc_get_position_unit` | `CommandPosition` |
+| 实际反馈与到位 | 按具体驱动/PDO/SDK及接线确认的通道 | 可空`FeedbackPosition / InPosition` |
+| 限位 | 已核对的卡/驱动信号及极性 | 归一化`LimitActive` |
+
+前一篇[只读诊断采样层](/knowledge/industrial/host-computer/motion/csharp-e3032-readonly-diagnostics/)尚不包含这里全部状态，不能直接把它的快照标成动作完成依据。本批也没有为未知反馈通道杜撰通用读取函数。
+
+SDK接口依据[雷赛官方 EtherCAT 总线卡手册](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)8.4与9.16节，停止原因数值应以所用版本再核对。
+
+### SDK读取的C#形态
+
+下面假设配套包装层将C的32位`long*`正确声明为`ref int`；如果用户版本声明不同，先查原始头文件与厂商说明。**本片段未针对用户SDK编译或执行。**
+
+```csharp
+short done = LTDMC.dmc_check_done(card, axis);
+if (done is not (0 or 1))
+    throw new InvalidOperationException($"Unexpected run state: {done}");
+bool isStopped = done == 1;
+
+int reason = 0; // Windows C long通常32位，不能仅凭名称改用C# long。
+short rc = LTDMC.dmc_get_stop_reason(card, axis, ref reason);
+if (rc != 0)
+    throw new InvalidOperationException($"Read stop reason: {rc}");
+// 把读到的reason与其他本次动作证据一起记录，不单独据此置Done。
+```
+
+不要将所有返回值都送进“0成功”的通用检查器：`done=1`是停止状态，`reason`则由输出参数返回，二者不是同类返回契约。
+
+## 3. 可运行的MotionAttempt怎样使用
+
+下面可在示例项目内部运行，全部数据人为构造：
+
+```csharp
+var baseline = new ObservedAxis(SampledAt: 0, ConnectionGeneration: 1);
+var attempt = new MotionAttempt(ObservedMotionKind.Move,
+    new CommandKey(1, 1), baseline, now: 0, target: 10, requireFeedback: true);
+
+// 仅记录虚构的调用确认，方法本身不会发运动命令。
+attempt.RecordDispatch(DispatchEvidence.Acknowledged, now: 0);
+attempt.Observe(new ObservedAxis(.1, IsStopped: false), now: .1);
+attempt.Observe(new ObservedAxis(.2, CommandPosition: 10,
+    FeedbackPosition: 10, InPosition: true), now: .2);
+attempt.Observe(new ObservedAxis(.31, CommandPosition: 10,
+    FeedbackPosition: 10, InPosition: true), now: .31);
+Console.WriteLine($"{attempt.State}: {attempt.Evidence}");
+// Completed: FeedbackAndInPosition，仅限脚本数据和本例契约。
+```
+
+构造应发生在真正尝试调用之前，以便先校验目标、基线质量与本地身份；但构造函数不代替机械互锁、权限、轴参考和运动条件检查。项目没有实际提交步骤，真实适配要另行实现并验证。
+
+### 常用成员
+
+| 成员 | 含义 |
+| --- | --- |
+| `Key` | 本地动作身份，与会话代次绑定 |
+| `State / Reason` | 当前观察阶段或终态及说明 |
+| `Evidence` | 回零变化、指令位置、反馈到位或停止观察的证据级别 |
+| `Terminal` | 本条观察已结束，不等于机械已停止 |
+| `ReferenceEstablished` | 只有Home观察成功时为true，不管理整机参考生命周期 |
+| `RecordDispatch` | 仅能记录一次调用结果，不执行SDK调用 |
+| `Observe` | 消费一份归一化状态，不进行IO |
+| `CheckDeadline` | 无新样本时检查观察是否已失效/超时 |
+| `Withdraw` | 撤销本地观察，不发送停止或取消设备动作 |
+
+`ObservedAxis`是教学输入，不是原生结构，也不是原子过程映像。限位等布尔量已经归一化；不能直接将未知IO电平或原始状态字强行转换成它们。
+
+## 4. 调用结果分三类，而不是只有成功/失败
+
+- `NotAttempted`：本地流程能确定没有尝试提交，例如提交前取消；结果是NotSubmitted。
+- `Acknowledged`：本次调用已确认，接着观察动作；不等于已经运行或完成。
+- `OutcomeUnknown`：已尝试但结果不明确；保留Unknown，不根据当前恰好在目标位置就补判成功。
+
+非0返回码是否足以证明动作未启动，需要按厂商该接口的明确定义分类，不能一律当作NotAttempted。同步原生函数的外层等待超时也不能证明它没执行。
+
+若调用耗时过长导致原基线已经过期，本例同样保留Unknown，不会倒推为未提交。需要查询和人工/业务核对时，另开协调流程，不复用旧记录盲目重试。
+
+## 5. 回零与定位的成功规则
+
+### 搜索式回零：防旧HomeDone
+
+本例要求调用确认后出现可观察运动，以及一次`HomeResult=0`，再出现停止、`HomeResult=1`和正常停止原因。它不把基线的0/1视为本次执行证据，也不因看到Busy便相信一直保持为1的旧完成位。
+
+这是一种保守教学策略，只面向有可观察搜索过程的回零。若驱动不清结果、回零很快、状态变化被采样错过，或方法本身不运动，就不能用它确认成功。最终Unknown不等于回零失败或未执行；必须依据[具体驱动回零语义](/knowledge/industrial/host-computer/motion/e3032-drive-homing-and-reference/)完善判据。
+
+### 定位：指令结束不等于反馈到位
+
+先要求看到本次观察中的运行，再检查停止原因与目标误差。若`requireFeedback=true`，必须有已确认来源的反馈位置、到位状态和目标容差；缺失反馈不能自动用指令位置代替。
+
+若明确只检查指令侧，完成证据标为`CommandPositionOnly`。有反馈条件时标为`FeedbackAndInPosition`；在本次脚本测试中这仍是虚构反馈，不是物理到位证明。
+
+### 为什么还要重复观察
+
+达到候选完成条件后进入Settling，按约定重复观察；中途再次运动或条件不满足就重新累计。默认稳定窗口0.1秒、容差0.01、最大样本年龄/间隔0.25秒、启动观察期限0.5秒、总期限3秒，全部为教学数字，不是设备推荐值。
+
+离散采样只能说明若干采样点满足条件，**不能证明两点之间连续稳定**；采样带宽不够时需要设备侧到位判据或更强记录，不能将这个窗口包装成安全保证。
+
+## 6. 停止原因怎样辅助诊断
+
+所查手册第238～239页中，0为正常停止；1/2与ALM有关，4为EMG，5～8为硬限位，9～12为软限位，13/14为命令停止，24表示未找到EZ。完整表还包含其他原因，应保留原始值和版本再查，不把未知值默认为正常。
+
+| 情形 | 对原定位/回零记录的影响 | 现场还需确认 |
+| --- | --- | --- |
+| 正常停止，目标/结果条件满足 | 可进入完成证据核对 | 实际反馈与业务条件 |
+| 普通停止请求导致中止 | 原目标不再按成功处理 | 停止请求结果与机械状态 |
+| 限位/报警停止 | 动作失败，保留原因 | 根因、驱动/机械状态和参考 |
+| 未找到EZ | 回零不能确认为成功 | 方法、信号及搜索路径 |
+| 失联或读取错误 | 结果未知 | 重新获得可信状态，而非自动重发 |
+
+停止原因本身也可能是上一条动作留下的状态，不带应用事务身份；要与动作前基线、启动观察和本次其他状态一起使用。一个0不能单独证明新动作成功。
+
+## 7. 请求停止、观察停止、原动作中止分别记录
+
+真实单轴/PVT停止入口为 `dmc_stop(card, axis, stop_mode)`，所查手册0为减速停止、1名为紧急停止；它们都是软件接口，不能替代安全回路。插补需另查坐标系停止接口。
+
+```csharp
+// 调用导读，未执行。实际停止条件和控制责任须另行确认。
+short rc = LTDMC.dmc_stop(card, axis, 0);
+// 检查本次调用结果，再观察停止；不立即报告原目标完成。
+```
+
+在本例中，Stop观察的正常停止原因接受0/13/14，并在重复观察停止后返回`Stopped`与`ObservedStandstill`，而不是Completed。这只表示按本SDK观察契约看到了停止状态，不证明机械静止或安全停止；其他型号/版本不能不经核对照搬原因列表。
+
+一个新的Stop观察器不会自动找到并中止另一个Move/Home观察器。唯一动作所有者应先撤销原观察的成功资格、保留原记录，再独立处理停止请求与结果；真实SDK命令仲裁和停止发送不在本例内。
+
+`Withdraw()`只结束本地观察。若已尝试提交，结果是Unknown；尚未提交才是NotSubmitted。回零观察撤销后，即使后续脚本输入HomeDone，也不会把旧记录升级为成功。
+
+## 8. 超时、失联、错过启动和时钟
+
+观察器使用同一单调时钟域中的秒数，不用UTC计算期限。样本必须递增、不能来自未来、不能过旧、不能跨会话，也不能用一个新鲜样本掩盖中间过大的观察缺口。
+
+若始终看到停止和目标位置，却没看到启动，可能是没执行，也可能是动作太快被漏采；本例保守保留Unknown。零距离定位、即时参考设定等也不适用这条“必须看到运动”的规则，需单独设计，不为了通过检查而人为抖动轴。
+
+`CheckDeadline`只有被调用才工作；进程卡死后不会独立计时，也不会对控制卡执行停止。超时、取消、关UI或结束观察都不等于轴停止。失联后的参考与任务恢复需另按设备状态和现场流程处理。
+
+终态是历史记录，不是实时许可：记录Completed后再发生报警，不应篡改过去结果，但实时显示、互锁和参考有效性必须继续由另一条新鲜诊断链维护。不能把一个历史Completed长期绑定成“允许运动”。
+
+## 9. 本轮检查与未覆盖范围
+
+52项离线检查覆盖：基线/参数、提交前后分类、重复提交记录拒绝、旧回零完成位、缺少反馈、重复到位观察、普通停止与异常原因、观察撤销、采样乱序/过期/缺口、失联/换代、故障/失能、启动和总超时、稳定条件重置，以及既有SimAxis的理想回零/定位集成观察。集成测试中的反馈与回零结果映射只针对该内存模型，不是实际SDK适配。
+
+没有验证真实 SDK 调用、原生函数阻塞/取消、结果位清除语义、设备反馈、驱动回零方法、机械限位/制动、安全系统、并发命令或长期运行。用户配套SDK与伺服资料齐备后，先核对只读与结果语义，再做受控单轴验收；不要把脚本测试数当作实机验收数。
+
+继续读 [E3032 手动点动与故障恢复](/knowledge/industrial/host-computer/motion/e3032-manual-jog-interlocks-and-recovery/)，再用 [WPF单轴模拟面板](/knowledge/industrial/host-computer/motion/wpf-manual-axis-panel-and-input-lifecycle/)观察输入持有、松开/失焦停止和显式恢复。之后独立展开脉冲卡侧回零/反馈，再进入多轴和IO联动，未验收的硬件项持续保留。

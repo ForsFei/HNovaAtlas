@@ -1,0 +1,166 @@
+---
+id: industrial-csharp-halcon-segmentation
+title: C#实践：HALCON ROI分割、形态学与分步读回
+description: 固定HALCON 24.11.3真实.NET接口，编译ROI/开运算/填孔/交集/多特征筛选链，用27项纯托管参数检查和四组待原生执行的夹具预期区分验证层级。
+tags: [工业自动化, C#, HALCON, 图像分割, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 30
+prerequisite: [industrial-halcon-segmentation-and-morphology, industrial-csharp-halcon-first-pipeline]
+related: [industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 本批交付与运行限制
+
+沿用`examples/industrial-halcon/`，增加真正HOperatorSet调用，不自造HALCON类，也没有托管替代分割器。依赖仍固定官方MVTec.HalconDotNet 24113.0.0与锁文件，.NET10/x64；安装原生运行环境、修改PATH或许可都不在本批范围。
+
+| 验证层 | 状态与含义 |
+| --- | --- |
+| 真实.NET方法签名、输出类型 | Release编译验证 |
+| ROI/阈值/核/面积参数校验 | 27项纯托管检查，不调用HALCON |
+| 原有数值输出边界 | 34项纯托管检查回归 |
+| 原生分割、形态学及四组数值 | 当前运行库加载失败，尚未通过 |
+| HDevelop对照、性能/内存、工艺质量 | 待具备环境与数据集后验收 |
+
+不能把编译通过、参数拒绝通过或手算面积，写成HALCON原生运行通过。CLI的原生失败返回3，不自动回退为NoCandidates。
+
+## 1. 文件与快速运行
+
+| 文件 | 作用 |
+| --- | --- |
+| SegmentationRecipe.cs | 原图整数ROI、byte阈值、开运算核与面积参数 |
+| SegmentationDemo.cs | 真实算子链、分步面积、四组原生夹具检查入口 |
+| SegmentationChecks.cs | 不使用HALCON的参数边界检查 |
+| fixtures/region-target.pgm | 原创16×16带孔目标、孤点和ROI外反光 |
+| BlobReadback.cs | 复用独立托管像素特征DTO边界 |
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --segmentation-contract-test
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --contract-test
+```
+
+匹配24.11.3原生运行库、x64与合法许可的厂商配置环境中，再执行：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --segmentation-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --segmentation-native-test
+```
+
+demo打印默认路线，test才逐个检查四组手算预期。退出0只说明所选路径完成；托管失败为1，CLI用法错误为2，原生路径失败为3。四组原生测试本机尚未通过，不能用前两条托管检查替代。
+
+## 2. 配方属性：先校验，再接触原生算子
+
+```csharp
+SegmentationRecipe recipe = SegmentationRecipe.Default;
+recipe.Validate(16, 16);
+SegmentationRecipe keepHole = recipe with { FillHoles = false };
+```
+
+| 属性 | 默认值 | 解释 |
+| --- | --- | --- |
+| Roi | (2,2)..(13,13) | 原图Row/Column，包含两端 |
+| Low / High | 200 / 255 | byte灰度闭区间，不是亮度百分比 |
+| OpeningWidth / OpeningHeight | 3 / 3 | 结构矩形列方向/行方向尺寸 |
+| FillHoles | true | 本例外形掩膜路线；孔检测必须重新定义策略 |
+| MinimumArea / MaximumArea | 40 / 60 | 最终正面积候选的像素区间 |
+
+配方是不可变record，`with`创建另一份；不会一边处理一边修改同一份参数。ROI必须在图像内且不反向，图像最多1,048,576像素；面积上限不得大于ROI像素数。核仅接受奇数1..7是教学策略，不是厂商API限制。[官方OpeningRectangle1参数](https://www.mvtec.com/doc/halcon/2411/en/opening_rectangle1.html)
+
+PixelRoi.Area先转long再计算，避免普通int面积乘法溢出；它只给出几何面积，外部数据仍必须先Validate。此处不实现任意图像服务、浮点ROI、旋转ROI或配置热更新。
+
+## 3. 常用算子怎么调用
+
+下表以本批真实编译的静态API为主。输入图标对象不会因为方法返回就自动被销毁；out产生的输出由本调用拥有并负责释放。
+
+| HOperatorSet成员 | 主要输入→输出 | 用途 |
+| --- | --- | --- |
+| ReadImage | 路径→image | 打开图像文件并解码；不是打开相机连接 |
+| GenRectangle1 | row1,col1,row2,col2→roi | 生成检测区域 |
+| ReduceDomain | image,roi→reduced | 限制处理domain，不裁剪矩阵 |
+| Threshold | reduced,low,high→threshold | 得到原始候选区域 |
+| OpeningRectangle1 | threshold,width,height→opened | 按指定矩形结构元素开运算 |
+| FillUp | opened→filled | 填孔，无“小孔尺寸”参数 |
+| CopyObj | opened,1,-1→filled | 不填孔路线的对象引用复制，不是深复制 |
+| Intersection | filled,roi→clipped | 最终区域与ROI取交集 |
+| Connection | clipped→connected | 拆出连通区域对象 |
+| SelectShape | connected,features,operation,min,max→selected | 逐对象按区间筛选 |
+| AreaCenter | selected→areas,rows,columns | 读回面积与原图行列中心 |
+| GetSystem | 参数名→当前值 | 只读检查当前运行约定 |
+
+图像处理没有“读完后CloseImage连接”的通用步骤；本例用Dispose结束拥有的HObject引用。采集句柄、模型句柄和HDevEngine各有自己的生命周期，不套用此处规则。资源规则先复习[首个C#算子链](/knowledge/industrial/host-computer/halcon/csharp-first-pipeline-and-resource-lifetime/)。
+
+## 4. 读图、类型与系统前提
+
+Analyze先验证文件存在且不大于1MiB，再通过HALCON ReadImage/GetImageSize/CountChannels/GetImageType确认一个16×16、单通道byte图。后缀和PGM注释不作为类型证明。文件大小上限是教学输入限制，不是恶意解码服务的完整防护。
+
+例子只读检查neighborhood=8、max_connection=0，以及no_object_result、empty_region_result、store_empty_region均为`true`。后者约束空对象/空区域的运行行为；不满足便报告前提失败，不调用SetSystem偷偷改变其他算法的设置。官方允许查询可设置的系统参数。[GetSystem](https://www.mvtec.com/doc/halcon/2411/en/get_system.html)、[空区域设置说明](https://www.mvtec.com/doc/halcon/2411/en/set_system.html)
+
+这是隔离教学进程，不提供多算法并发配置锁。检查时符合也不能阻止别的线程之后改变设置；真实集成必须统一管理。单次CLI的原生缺库错误仍会在算子调用处单独失败，不说明许可一定有问题。
+
+## 5. 真实调用片段与完整代码位置
+
+```csharp
+PixelRoi r = recipe.Roi;
+HOperatorSet.GenRectangle1(out roi, r.Row1, r.Column1, r.Row2, r.Column2);
+HOperatorSet.ReduceDomain(image, roi, out reduced);
+HOperatorSet.Threshold(reduced, out threshold, recipe.Low, recipe.High);
+double thresholdArea = Area(threshold);
+```
+
+这些是SegmentationDemo.Analyze中的片段，nullable输出在外部声明并在finally统一释放，不能脱离函数直接粘贴就当完整程序。原始阈值面积为0时成功返回空候选，后续步骤跳过；不执行catch→空结果的替代逻辑。
+
+```csharp
+HOperatorSet.OpeningRectangle1(threshold, out opened,
+    recipe.OpeningWidth, recipe.OpeningHeight);
+double openedArea = Area(opened);
+if (recipe.FillHoles) HOperatorSet.FillUp(opened, out filled);
+else HOperatorSet.CopyObj(opened, out filled, 1, -1);
+double filledArea = Area(filled);
+HOperatorSet.Intersection(filled, roi, out clipped);
+```
+
+不填孔时CopyObj让两个包装器引用原有存储。本链只读输入，不对任何别名做原地修改；finally分别归还各自拥有的引用。它不是为了制造独立像素副本。[FillUp](https://www.mvtec.com/doc/halcon/2411/en/fill_up.html)、[Intersection](https://www.mvtec.com/doc/halcon/2411/en/intersection.html)
+
+本批没有在原生链中调用ClosingRectangle1；其适用条件与逐对象边界在[理论篇](/knowledge/industrial/host-computer/halcon/threshold-roi-morphology-and-region-selection/)讲解，不将查过资料写成已实现/运行。
+
+## 6. 多特征HTuple：数组逐项对应
+
+```csharp
+HOperatorSet.Connection(clipped, out connected);
+using HTuple features = new(new string[] { "area", "width", "height" });
+using HTuple minima = new(new double[] { recipe.MinimumArea, 3, 3 });
+using HTuple maxima = new(new double[] { recipe.MaximumArea, 10, 10 });
+HOperatorSet.SelectShape(connected, out selected,
+    features, "and", minima, maxima);
+```
+
+第0项是area，1为width，2为height；不能把三个下限写成另一种顺序。width/height范围在本夹具固定为3..10，未暴露成庞大配置界面。三项同时满足才保留，不负责将粘连目标重新切开。[SelectShape参考](https://www.mvtec.com/doc/halcon/2411/en/select_shape.html)
+
+count=0时直接构造NoCandidates；正数才调用AreaCenter。输出经TupleReal，再按HTuple.Length复制有效前缀，最后与真实CountObj匹配。不要把DArr的内部容量当有效长度，也不要把第一个候选默认为主工件。
+
+## 7. 分步读回，不混淆统计对象
+
+SegmentationTrace保存ThresholdArea、OpenedArea、FilledArea、ClippedArea、Components与最终Selected。前四项是相应阶段区域面积总和；Components是最终交集区域拆开后的对象数；Selected只包含筛选留下的对象。
+
+以1×1开运算为例，填孔后总面积50，但最终目标面积49：另一个孤点被筛掉了。用“总面积50”核对单个候选49会得到错误结论。理论篇给出四条路线的完整手算表。
+
+Area辅助方法遇到0对象直接返回0，其他输入才读AreaCenter；只取有限、非负、整数面积。阶段面积允许0，最终候选必须正面积并在配方区间，两者不能混用一个“目标有效”判断。[AreaCenter参考](https://www.mvtec.com/doc/halcon/2411/en/area_center.html)
+
+输出为独立托管数值，不把HALCON包装器交给WPF或后台队列；也未携带帧/工件身份。因此这还是独立离线算法示例，不是已接入上一阶段采集会话的工位。
+
+## 8. 检查覆盖与尚未覆盖
+
+27项纯托管检查覆盖包含端点的ROI、单像素、越界/反向、图像上限、byte区间、核策略、面积区间、配方副本及long面积运算。它们不读取图像，不计算开运算，也不证明HALCON许可或内存正确。
+
+四组原生预期分别为默认填孔、不填孔、1×1对照和230..255空结果。只有实际执行native-test并全部断言通过，才能记为夹具原生通过；即使如此也不等于真实相机数据集的准确率、耗时、内存稳定性或部署验收。
+
+仍需补充的现场样本：亮度漂移、噪点尺寸变化、目标贴边/被ROI截断、多个相似目标、粘连、孔与背景连通、uint2/RGB输入和错误文件。本代码会拒绝不支持的类型/尺寸，不悄悄转换后沿用旧预期。
+
+## 9. 接下来怎么接工程
+
+先在具备合法环境的HDevelop/C#对照同一夹具和中间区域，再用真实数据集修订配方、触边/缺陷规则。真正接入检测流水线时，应将本次输入帧身份、配方版本、执行状态与结果一并封装，而不是只发布一个中心点。
+
+本批没有相机、模型句柄、模板匹配、尺寸/毫米测量、WPF新控件或PLC/运动输出。下一批已接续为[NCC定位、原点、搜索区域与分数](/knowledge/industrial/host-computer/halcon/ncc-matching-models-origins-and-search/)及 [C#模型创建、查找与释放](/knowledge/industrial/host-computer/halcon/csharp-ncc-model-search-and-lifetime/)，再逐步做形状匹配、测量、HDevelop导出/HDevEngine及显示集成。

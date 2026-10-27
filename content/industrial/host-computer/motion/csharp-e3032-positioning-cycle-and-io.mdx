@@ -1,0 +1,216 @@
+---
+id: industrial-csharp-e3032-positioning-cycle
+title: C# E3032 多轴与 IO：常用接口和离线工步检查
+description: 查用雷赛坐标系曲线、直线插补、组状态与停止、本地及扩展IO读写；以51项纯C#检查演示工步汇合、结果身份和输入交接。
+tags: [工业自动化, 雷赛, C#, 运动控制, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-20"
+order: 120
+prerequisite: [industrial-e3032-multiaxis-io]
+related: [industrial-csharp-e3032-motion-observation, industrial-csharp-dmc3000-pulse-contracts, industrial-wpf-manual-axis-panel]
+---
+
+## 两部分代码，不混淆验证范围
+
+SDK导读按[官方固定手册](https://www.leisai.com/upload/file/2025/07/31/%E9%9B%B7%E8%B5%9B%E6%8E%A7%E5%88%B6EtherCAT%E6%80%BB%E7%BA%BF%E5%8D%A1%E7%94%A8%E6%88%B7%E4%BD%BF%E7%94%A8%E6%89%8B%E5%86%8C20250728.pdf)核对9.5/9.6、9.16/9.17及总线扩展IO接口，**未针对用户配套LTDMC.cs编译或执行**。原生函数声明、位数、调用约定、数组和ref宽度必须按同包头文件及C#包装再核对。
+
+可运行部分是既有 `examples/industrial-motion/` 中的 `PositioningCycle.cs`、`CycleChecks.cs`。它只做纯状态转移和脚本输入检查，没有SDK后端、真实运动、多轴轨迹、IO驱动或网络，也没有把WPF面板接到卡。
+
+```powershell
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --cycle-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --cycle-demo
+```
+
+检查数量为51。下面SDK片段用于查调用形态，不可拼成可直接运行的设备程序。
+
+## 1. 连接与关闭仍由板卡资源所有者负责
+
+仍使用`dmc_board_init`、卡清单查询与`dmc_board_close`，不是每个轴、每次IO读取都初始化/关闭一次。板卡资源通常由进程内唯一所有者管理，按配套SDK确认线程和阻塞规则；单轴、坐标系与输出的所有权必须在其上明确。
+
+开始多轴前分别核对：卡ID与类型、总线状态、实际轴映射、各轴单位/参考/报警/静止、坐标系空闲及工艺条件。诊断读取有效只证明读取层满足契约，不能自动得到运动许可。退出时先禁止新任务、按规程请求并观察停止，再处理机械和输出状态，最后关闭资源；关闭不是停止。
+
+初始化细节见[SDK导读](/knowledge/industrial/host-computer/motion/leadshine-e3032-sdk-basics/)，只读核对见[采样层](/knowledge/industrial/host-computer/motion/csharp-e3032-readonly-diagnostics/)。
+
+## 2. 坐标系曲线、直线提交、读取与停止
+
+| 方法 | 常用参数 | 返回含义 |
+| --- | --- | --- |
+| `dmc_set_vector_profile_unit` | Card、Crd、起始/最大/停止速度、Tacc/Tdec | 错误码；速度unit/s，时间s |
+| `dmc_get_vector_profile_unit` | Card、Crd、多个输出ref | 错误码与读回参数分开检查 |
+| `dmc_line_unit` | Card、Crd、AxisNum、AxisList、Target_Pos、posi_mode | 错误码；0相对、1绝对；目标unit |
+| `dmc_read_vector_speed_unit` | Card、Crd、ref速度 | 错误码，输出合速度unit/s |
+| `dmc_check_done_multicoor` | Card、Crd | 状态枚举：0使用中、1正常停止，不是0成功 |
+| `dmc_stop_multicoor` | Card、Crd、stop_mode | 错误码；0减速、1立即停止，适用于插补 |
+
+`Crd`为坐标系号。固定手册给出0～7、直线轴数2～16；这是API资料的范围，具体卡配置、占用与驱动能力仍需核对。不在轴活动时切换其所属坐标系或同时下单轴命令。
+
+以下方法假定调用者已完成独占、映射、路径、曲线和现场条件审核；代码本身不提供这些审核，也不自动重试：
+
+```csharp
+// SDK调用形态，未编译/运行。此处坐标和速度为调用者已审核值。
+static short RequestLine(ushort card, ushort crd,
+    ushort[] axes, double[] targets,
+    double startSpeed, double maxSpeed,
+    double accelerationSeconds, double decelerationSeconds, double stopSpeed)
+{
+    if (axes.Length < 2 || axes.Length > 16 || axes.Length != targets.Length ||
+        axes.Distinct().Count() != axes.Length || targets.Any(v => !double.IsFinite(v)))
+        throw new ArgumentException("Invalid axis/target arrays.");
+
+    short rc = LTDMC.dmc_set_vector_profile_unit(card, crd,
+        startSpeed, maxSpeed, accelerationSeconds, decelerationSeconds, stopSpeed);
+    if (rc != 0) return rc; // 未调用line；配置是否部分生效另行核对。
+
+    return LTDMC.dmc_line_unit(card, crd, checked((ushort)axes.Length), axes, targets, 1);
+    // line返回后保存尝试及返回码，不把返回0当到位。
+}
+```
+
+这个片段不验证速度/限位/路径，不是完整安全包装；异常或非0返回也不能不加分析就认定整个工艺从未执行。对真实包装层，有些不确定失败可能发生在设备接受之后，不重放原请求。
+
+```csharp
+// SDK调用形态，未编译/运行；在单所有者采样任务中调用，不在UI线程忙等。
+double vectorSpeed = 0;
+short rc = LTDMC.dmc_read_vector_speed_unit(card, crd, ref vectorSpeed);
+if (rc != 0 || !double.IsFinite(vectorSpeed))
+    throw new InvalidOperationException($"Invalid vector speed: {rc}");
+
+short state = LTDMC.dmc_check_done_multicoor(card, crd);
+bool coordinateStopped = state switch
+{
+    0 => false,
+    1 => true,
+    _ => throw new InvalidOperationException($"Unexpected coordinate state: {state}")
+};
+// coordinateStopped仅是一个状态读数；还要关联本轮动作、反馈、停止原因及有效性。
+
+// 只有进入已审核的停止流程才调用，不在每次正常轮询中发送。
+// short stopRc = LTDMC.dmc_stop_multicoor(card, crd, 0);
+// stopRc为0也必须继续观察，不能宣称机械已停止。
+```
+
+单轴独立定位对应`dmc_set_profile_unit`、`dmc_pmove_unit`、`dmc_check_done`和`dmc_stop`；插补采用坐标系对应接口，不把单轴停止函数当组停止。SDK命名“立即/紧急”不自动意味着经认证的安全停止。
+
+`dmc_conti_*`不在本例调用，E3032不能因共享头文件中有声明就视为支持E5000连续轨迹。
+
+## 3. 本地通用 IO：分开返回码与电平
+
+| 方法 | 常用参数 | 注意 |
+| --- | --- | --- |
+| `dmc_read_inbit` | Card、bitno | 直接返回0/1电平，不套用错误码判断 |
+| `dmc_read_inbit_ex` | Card、bitno、ref ushort | 返回错误码，输出为0/1 |
+| `dmc_write_outbit` | Card、bitno、on_off | 返回错误码，0低、1高 |
+| `dmc_read_outbit_ex` | Card、bitno、ref ushort | 输出寄存器/SDK状态读回，不是负载检测 |
+| `dmc_read_inport_ex` / `dmc_read_outport_ex` | Card、portno、ref uint | 32位组，保留无符号高位 |
+| `dmc_write_outport` | Card、portno、uint值 | 整组覆盖；本例不使用 |
+
+通道范围按实际接线板/映射表，不用通用接口表中的0～7覆盖所有配置。
+
+```csharp
+// SDK调用形态，未编译/运行；没有给真实端子分配任何默认编号。
+static bool ReadLocalInput(ushort card, ushort bit, bool activeHigh)
+{
+    ushort raw = 0;
+    short rc = LTDMC.dmc_read_inbit_ex(card, bit, ref raw);
+    if (rc != 0 || raw > 1)
+        throw new InvalidOperationException($"Input read invalid: rc={rc}, raw={raw}");
+    return (raw == 1) == activeHigh;
+}
+
+static void RequestReviewedIndicator(ushort card, ushort bit, ushort highOrLow)
+{
+    if (highOrLow > 1) throw new ArgumentOutOfRangeException(nameof(highOrLow));
+    short rc = LTDMC.dmc_write_outbit(card, bit, highOrLow);
+    if (rc != 0) throw new InvalidOperationException($"Output request failed/uncertain: {rc}");
+    ushort actual = 0;
+    rc = LTDMC.dmc_read_outbit_ex(card, bit, ref actual);
+    if (rc != 0 || actual > 1 || actual != highOrLow)
+        throw new InvalidOperationException("Output readback not confirmed; do not resend automatically.");
+}
+```
+
+读异常由外层标记该采样无效，不沿用旧值继续完成工步。写后读失败只说明确认失败，不证明输出没有改变；外层进入人工/停止核对，不自动恢复旧电平或再次写。
+
+## 4. 总线扩展模块与驱动器 IO
+
+扩展模块单点调用形态如下，PortNum按固定手册为2；节点和位号从实测映射表取得：
+
+```csharp
+// SDK调用形态，未编译/运行。WORD与DWORD输出宽度在这两个接口中不同。
+uint rawInput = 0;
+short rc = LTDMC.nmc_read_inbit_extern(card, 2, confirmedNode, confirmedInputBit, ref rawInput);
+if (rc != 0 || rawInput > 1) throw new InvalidOperationException("Extension input invalid.");
+
+// 仅为经审核指示灯通道示意，不操作阀、制动器或其他机械负载。
+rc = LTDMC.nmc_write_outbit_extern(card, 2, confirmedNode, confirmedOutputBit, reviewedLevel);
+if (rc != 0) throw new InvalidOperationException("Extension output request failed/uncertain.");
+ushort rawOutput = 0;
+rc = LTDMC.nmc_read_outbit_extern(card, 2, confirmedNode, confirmedOutputBit, ref rawOutput);
+if (rc != 0 || rawOutput > 1 || rawOutput != reviewedLevel)
+    throw new InvalidOperationException("Extension output readback not confirmed.");
+```
+
+驱动器本体使用`nmc_get_axis_io_in(card,axis)`、`nmc_get_axis_io_out`读取DWORD位域，`nmc_set_axis_io_out`设置位域；语义还依赖驱动器PDO与IO功能映射，不能拿扩展模块节点接口代替。完整位图写入可能改动多个功能，本例不提供写驱动器IO的可执行封装。
+
+固定手册的`nmc_write_outport_extern`声明把IoValue写成WORD，参数说明却写32位。这是原文中的宽度冲突，不靠猜测用ushort或uint补齐；必须核对同包头文件、C#声明并向厂商确认。本例仅展示无该冲突的单点形态，仍未做ABI验收。
+
+## 5. 离线模型只管顺序，不管运动
+
+`PositioningCycle`是单次、串行使用的教学归约器，不是设备会话。主要成员：
+
+| 成员 | 用途 | 不负责的内容 |
+| --- | --- | --- |
+| `Start(frame, now, confirmed)` | 显式开始一次工步 | 不检测真实轴静止/回零/方案安全 |
+| `Stage`、`Reason` | 当前步骤和原因 | 非SDK状态或实时安全许可 |
+| `Pending` | 当前尚未完成的动作意图，只读列表 | 不是每次读取都要再次发命令的发送队列 |
+| `Report(ticket,result,frame,now)` | 注入已经关联本轮的归一化结果 | 不把原始done或返回码转换成业务成功 |
+| `Observe(frame,now)` | 新采样、工艺条件和确认输入交接 | 不执行采样，不做硬件滤波 |
+| `CheckDeadline(now)` | 采样停止时检查本地期限 | 不提供独立线程或失联看门狗 |
+| `Withdraw()` | 禁止后续意图并保留异常状态 | 不发送停止、关使能或写输出 |
+| `IndicatorRequested` | 记录已经产生过亮灯意图 | 不证明已派发、读回、灯亮或当前电平 |
+
+每个实例只能启动一次。`CycleTicket`为实例Guid加动作枚举，隔离前一工步/其他实例；它不是设备事务ID，也不持久化，不能证明掉电后设备未执行旧动作。同一动作在本流程内只出现一次，不支持循环复用同一Ticket。
+
+`Pending`反复读取返回的是相同未完成意图。真实适配器必须单所有者记录“准备/已尝试/确认/未知”，每张Ticket最多尝试一次，不得在UI刷新或轮询里对列表反复发送。当前代码**没有这样的真实派发器**；demo仅注入一次假完成。
+
+`Start`的确认参数由教学夹具直接给true，只说明输入契约；程序无法验证用户是否审核了路径。`Report(Completed)`同样需要外部观察器提供匹配动作、质量、反馈与停止原因的合格证据。模型故意不重复实现单轴观察器，也不把其搜索式回零规则扩展成坐标系通用算法。
+
+## 6. 演示怎样推进
+
+```csharp
+// 本仓库实际可编译纯C#代码形态；下面所有状态均为虚构教学输入。
+var cycle = new PositioningCycle();
+cycle.Start(new CycleFrame(0), now: 0, stationaryReferencedAndPlanReviewed: true);
+
+CycleTicket retract = cycle.Pending.Single();
+cycle.Report(retract, CycleResult.Completed, new CycleFrame(.01), now: .01);
+// 现在Pending有MoveX与MoveY；这里只是意图，没有运动调用。
+
+CycleTicket x = cycle.Pending.Single(t => t.Action == CycleAction.MoveX);
+CycleTicket y = cycle.Pending.Single(t => t.Action == CycleAction.MoveY);
+cycle.Report(x, CycleResult.Completed, new CycleFrame(.02), now: .02);
+// 仍在PositionXY，不能提前接近Z。
+cycle.Report(y, CycleResult.Unknown, new CycleFrame(.03), now: .03);
+// Halted，Pending为空，RequiresStopReview为true；没有停止或回滚任何东西。
+```
+
+`CycleFrame`的`InterlocksOk`是已归一化的工艺条件，不是把“所有轴都静止/Ready”每轮作为运行许可，否则正常运动也会被误判。静止、参考和方案检查作为开始前独立条件，运行中报警、限位、总线和工艺异常由外层映射为无效或不允许。
+
+## 7. 时间、输入和恢复规则
+
+模型使用调用者传入的单调秒数，默认数据最大年龄和采样间隔均0.25s，每步预算3s；它们只是教学值。所有有效Report/Observe需提供严格递增的新采样时间，相同批次不能复制成两条新采样；当前简化接口不支持一份原子快照批量完成XY。真实批处理适配应另建明确契约，不修改时间戳伪造新样本。
+
+错误或不连续样本、未来时间、时钟倒退、连接代变化、互锁丢失和期限到达都中止后续意图。外来/过期/已完成Ticket的结果直接忽略且不刷新时效；调用者仍必须独立持续Observe或CheckDeadline，不依赖旧回执维持健康。
+
+进入WaitAck时清除之前的低电平资格：先在等待内观察已知false，再观察已知true才完成；null会取消资格。它没有防抖时间要求，也不捕获短脉冲，不代替工件身份或设备命令握手。
+
+终态保持为历史。成功后不会自动把灯关掉；中止后也不会假设关灯就是安全状态。`RequiresStopReview=false`不表示轴当前安全，只有true表示本轮需移交异常处理。程序重启、创建新实例或现场条件恢复均不能作为旧动作已停止/允许重放的证据。
+
+## 8. 实际验证与下一批
+
+51项检查覆盖：无隐式开始、Z/XY顺序、任意XY报告先后、部分成功后拒绝/停止/未知、跨实例/迟到/重复结果、输出意图与读回交接、旧高电平、未知输入、新低高变化、质量/时效/采样间隔、代变化、超时边界与中止不重启。demo输出仅为脚本化历史，不证明轴或输出改变。
+
+尚未实现：原生SDK派发器、真实组完成观察、轨迹模拟、实机停止、物理IO、输出安全状态、WPF多轴窗口、暂停/续走、重启持久化和独立看门狗。没有因离线模型通过就将这些项标为完成。
+
+继续阅读[E3032直线/圆弧参数与途经范围](/knowledge/industrial/host-computer/motion/e3032-line-and-arc-geometry/)和 [C#几何校验](/knowledge/industrial/host-computer/motion/csharp-interpolation-geometry-checks/)，再逐步补位置比较、锁存和触发证据。几何代码是独立纯数值教学，没有接到本工步中自动派发运动。PLC运动握手、机械臂具体品牌接入，以及支持设备上的连续轨迹缓冲仍按独立范围分批进行。

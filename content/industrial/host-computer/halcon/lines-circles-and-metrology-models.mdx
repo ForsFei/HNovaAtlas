@@ -1,0 +1,160 @@
+---
+id: industrial-halcon-two-dimensional-metrology
+title: HALCON二维测量：直线、圆、卡尺与Metrology模型
+description: 从多处一维找边到二维几何拟合，理解近似位置、测量卡尺、RANSAC、分数与实例，区分圆半径、无限直线距离、拟合证据和真实测量精度。
+tags: [工业自动化, HALCON, Metrology, 直线拟合, 圆测量]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 100
+prerequisite: [industrial-halcon-one-dimensional-measurement, industrial-csharp-halcon-one-dimensional-measurement]
+related: [industrial-csharp-halcon-metrology, industrial-halcon-shape-roi-following, industrial-csharp-planar-calibration]
+---
+
+## 从一条剖面到一个几何对象
+
+上一批用一个矩形窗口找边、配对、读像素宽度。但工件上有一个圆孔时，沿一个方向量到的弦长不一定是直径；在外边缘某一点找到了边，也不能据此知道整条边的方向。
+
+二维Metrology的思路是：先给近似几何位置，在多处放置局部测量窗口，提取边缘，再拟合直线、圆等模型。本批只做直线和完整圆，继续使用HALCON 24.11.3，不增加交互控件。[二维测量概念](https://www.mvtec.com/doc/halcon/2411/en/toc_2dmetrology.html)
+
+配套C#接口已经编译，但当前缺少匹配的原生运行库，实际执行仍是DllNotFoundException/退出3。下文夹具尺寸是定义和待验证预期，不是HALCON实测值或精度承诺。
+
+## 1. 什么时候用哪一种方法
+
+| 问题 | 更直接的起点 | 不应混淆的结果 |
+| --- | --- | --- |
+| 一个明确位置的两边间距 | 一维MeasurePairs | 局部宽度不是整件轮廓 |
+| 沿较长边确定方向和基准线 | 多处卡尺＋直线拟合 | 拟合线不是每一点都完全重合 |
+| 已知圆大致在哪里，量圆心和半径 | 圆Metrology对象 | 半径不是直径 |
+| 完全不知道目标在哪里 | 先定位，再安排测量 | 局部测量不是全图目标搜索 |
+| 判断缺口、毛刺、边缘波动 | 保留原始边缘/残差等证据 | 一条平滑拟合曲线不能代表所有缺陷 |
+
+这里的“卡尺”是沿目标边界分布的局部矩形采样区，不是WPF里画出来的一个矩形控件。显示层只是帮助检查；真正的搜索范围由模型参数决定。
+
+## 2. 三种身份：模型、对象索引、实例
+
+| 名称 | 表示什么 | 本例 |
+| --- | --- | --- |
+| MetrologyHandle | 一组测量对象及其参数、结果的容器句柄 | 一个模型 |
+| Object Index | 往模型加入一个测量对象后返回的索引 | 一个直线对象、一个圆对象 |
+| Instance | 某个对象在当前执行中拟合出的一个候选 | 每个对象可能0、1或多个 |
+| HObject/XLD | 测量框或拟合轮廓的图形对象 | 诊断显示用，不是模型句柄 |
+
+模型中加了两个对象，不表示每次一定能得到两份有效结果。num_instances=2也不是“这张图有两个圆”，只是搜索的候选数量设置。不能用图形CountObj代替几何实例数。[模型建立](https://www.mvtec.com/doc/halcon/2411/en/create_metrology_model.html)、[对象参数](https://www.mvtec.com/doc/halcon/2411/en/set_metrology_object_param.html)
+
+加入对象后要保存返回的Index，不假定永远是0和1。读取时先按对象索引区分形状，再按实例拆分结果，避免把圆的三个参数按直线的四个参数解析。
+
+## 3. 直线的近似端点不是最终测量结果
+
+AddMetrologyObjectLineMeasure接收近似起点RowBegin/ColumnBegin和终点RowEnd/ColumnEnd。沿线分布多个矩形测量区，每处沿法向穿过边界，取得候选边缘点。[直线对象参考](https://www.mvtec.com/doc/halcon/2411/en/add_metrology_object_line_measure.html)
+
+本例近似线从(24,40)到(104,40)，即一条竖直线；实际灰度阶跃发生在列39与40之间，理想边界为Column=39.5。近似Column=40不是强制最终结果必须等于40。
+
+MeasureLength1控制跨边界的搜索半长度，MeasureLength2控制沿边界的平均半宽。直线示例取6和3，表示完整采样尺寸约12×6，不是6×3；采样和插值仍需额外边界余量。拟合线偏出这个局部带太多时，应先检查定位和配方，不是无限放大卡尺。
+
+端点顺序还会影响测量方向和极性解释。教学示例先用measure_transition=all观察两种明暗变化，实际工艺确定后再约束极性；不能武断规定“竖线一定positive”。
+
+## 4. 圆对象怎样安排卡尺
+
+AddMetrologyObjectCircleMeasure接收近似圆心Row/Column、Radius和相同的采样半长度、Sigma、Threshold。完整圆的测量区沿圆周分布，各处主要沿圆的法向找边；圆弧范围等还可以另设参数，本批不实现圆弧场景。[圆对象参考](https://www.mvtec.com/doc/halcon/2411/en/add_metrology_object_circle_measure.html)
+
+示例近似圆心(64,88)、半径20，MeasureLength1=6、Length2=2。Radius=20不是Diameter=20，最终若拟合半径约20，直径才约40像素。
+
+如果实际圆半径只有8，即使圆心正确，其边缘也可能完全不在半径20附近的局部测量带内。找不到不能直接解释为“图中没有圆”；也不能为了让它通过，偷偷把模型改成全图找圆。
+
+只有一小段圆弧、边缘大面积遮挡或测量点集中在一侧时，圆心/半径可能不稳定。点数够并不等于几何约束分布良好；是否允许不完整圆应由工艺和独立数据验证决定。
+
+## 5. 采样、找边和拟合的参数分开调
+
+| 参数 | 影响哪一步 | 本例 | 常见误解 |
+| --- | --- | --- | --- |
+| MeasureLength1 / Length2 | 搜索距离/局部平均范围 | 直线6/3、圆6/2 | 越大越准 |
+| MeasureSigma | 局部边缘平滑 | 1 | 等于噪声方差的实测值 |
+| MeasureThreshold | 边缘幅值门槛 | 20 | 选出灰度大于20的像素 |
+| num_measures | 期望布置的测量区数 | 20/32 | 就是最终内点数 |
+| measure_transition / select | 极性与候选选择 | all/all | all等于没有歧义 |
+| min_score | 需要的有效测量占比 | 0.8 | 80%尺寸准确率 |
+| distance_threshold | 拟合内点距离条件 | 1.5px | 与灰度幅值阈值相同 |
+| num_instances | 搜索候选上限设置 | 2 | 一定返回2项 |
+| max_num_iterations | 拟合迭代上限 | 500 | 整体调用硬实时500ms |
+| rand_seed | 随机过程种子 | 42 | 固定后保证生产精度 |
+
+num_measures与measure_distance是不同的布置方式，后设置的相关参数会覆盖先前设置；不要同时随意填值后以为两者都独立生效。以上都是固定夹具的教学选择，不是厂商对任意工件的推荐配方。[参数含义与相互作用](https://www.mvtec.com/doc/halcon/2411/en/set_metrology_object_param.html)
+
+调试顺序应是：先看近似几何和采样区是否正确，再看局部找到了哪些边，之后看拟合能否稳定区分正确候选，最后制定尺寸与质量规则。只降低min_score让程序“有数”很容易掩盖错误边缘。
+
+## 6. RANSAC是在做什么
+
+ApplyMetrologyModel在局部测量区提取边缘后，通过RANSAC寻找满足几何关系的点集并拟合对象。直线至少需要两个不同点，圆至少需要三个不退化的点，但实际测量需要足够且分布合理的证据；最低几何点数不是工业测量验收标准。[执行与拟合说明](https://www.mvtec.com/doc/halcon/2411/en/apply_metrology_model.html)
+
+直观上，RANSAC尝试用部分点提出候选形状，再观察其他点是否靠近它，以减少离群点的影响。但如果局部窗口稳定地取到了另一条平行边，这些“错误但一致”的点同样可能拟合出高分直线。鲁棒拟合不能代替目标身份约束。
+
+多实例返回顺序不保证按分数排名。因此“取第一个”既不是唯一性验证，也不是可靠的最优选择策略。本例一旦任一对象有多个候选就返回Ambiguous，不发布单一尺寸。
+
+## 7. Score不是拟合残差
+
+HALCON此处的score描述参与结果计算的测量数相对于最大测量区数的比例。它不是圆度、位置偏差、毫米误差，也不是产品合格概率。[结果与分数定义](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_result.html)
+
+两条线都可能有score=1：一条是正确外边缘，另一条是清晰但错误的内边缘。即使身份正确，还应按任务评估有效点分布、残差、重复性、对标准件的偏差和采样覆盖，而不是只设一个Score门槛。
+
+本批没有计算原生内点残差、圆度或质量分级；也不把所有候选边缘到拟合曲线的距离混成一份“拟合精度报告”。
+
+## 8. 四层诊断证据不能互相代替
+
+| 证据 | 获取方式 | 能看什么 |
+| --- | --- | --- |
+| 测量区轮廓 | GetMetrologyObjectMeasures | 卡尺放在哪、方向/覆盖是否合理 |
+| 检测到的候选边缘坐标 | 同一接口的Row/Column | 实际提到了哪些边，但未必全参与拟合 |
+| 真正参与某个实例的边缘 | GetMetrologyObjectResult的used_edges | 核对该实例用了哪些点，本批仅导读 |
+| 最终拟合轮廓 | GetMetrologyObjectResultContour | 便于叠加观察最终直线/圆 |
+
+GetMetrologyObjectMeasures返回的候选点不一定都是拟合内点。结果轮廓的Resolution指定相邻轮廓点的采样间隔，不是算法精度旋钮；把它改小只是让显示轮廓更密，不能据此宣称测得更准。[测量区与候选点](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_measures.html)、[结果轮廓](https://www.mvtec.com/doc/halcon/2411/en/get_metrology_object_result_contour.html)
+
+配套示例只读回前两层和最后一层的有界数值/数量，不建立HALCON显示窗口，不把HObject交给网页或WPF。真正的内点提取与残差分析仍未实现。
+
+## 9. 本例算的是哪三个尺寸
+
+128×128图像中，列0..39为暗16、40..127为亮220，再放入圆心(64,88)、半径20的暗圆盘。理想直线为Column=39.5；圆边缘由离散像素构成，不假定实际拟合恰好等于理想连续圆。
+
+| 输出 | 定义 | 理想算术预期 |
+| --- | --- | --- |
+| DiameterPixels | 2×拟合半径 | 40px |
+| CenterToInfiniteLinePixels | 圆心到拟合无限直线的垂距 | 88−39.5=48.5px |
+| SignedCircleLineClearancePixels | 上述垂距−半径 | 28.5px |
+
+最后一个量是圆与无限直线的几何分离指标：大于0表示分离，等于0相切，小于0表示直线穿过圆。它不是任意有限线段到圆的最短距离，也不是工件上任意两处真实材料的最小间隙。
+
+直线倾斜后要用点到线的垂距，不能继续直接减Column。若圆心垂足在线段外，点到线段的距离还要考虑端点；本例明确不计算这一种距离。
+
+## 10. domain、对齐和坐标单位
+
+ApplyMetrologyModel忽略输入图像domain。先ReduceDomain再调用旧模型，不能保证只测ROI内部；需要正确布置模型、验证图像尺寸及完整采样覆盖。该调用会修改模型状态，共享模型的多线程访问需要同步，本例没有并发复用。[执行边界](https://www.mvtec.com/doc/halcon/2411/en/apply_metrology_model.html)
+
+工件平移/旋转时，可通过AlignMetrologyModel对齐模型，但必须先约定模型参考系与定位模型原点。不能直接把前篇任意RawRow/Column/Angle塞进去；官方说明要让两套参考系一致。对齐还会改写模型状态，本批仅讲概念，没有把定位与测量串成实际流水线。[对齐与参考系](https://www.mvtec.com/doc/halcon/2411/en/align_metrology_model.html)
+
+本例没有设置相机内参与测量平面，所有几何量均为像素。若以后启用模型标定，返回参数的单位/坐标含义会变化，不能继续用本例0..127的像素适配器或随意乘一个比例。复习[平面标定与独立误差检查](/knowledge/industrial/host-computer/vision/csharp-planar-affine-calibration-and-validation/)。
+
+## 11. 五组原生预期与尚未完成的验收
+
+| 场景 | 直线/圆实例预期 | 本例状态 |
+| --- | --- | --- |
+| 正常线＋半径20圆 | 1/1 | DimensionsMeasured，像素尺寸 |
+| 只有线 | 1/0 | MissingObject，尺寸null |
+| 只有圆 | 0/1 | MissingObject，尺寸null |
+| 纯背景 | 0/0 | NoResult，尺寸null |
+| 线＋半径8小圆 | 1/0，圆不在当前搜索带 | MissingObject，尺寸null |
+
+这些是native-test中的待验证断言。当前原生加载失败，五组均未验收；多实例Ambiguous只验证了人工输出契约，没有原生多目标场景。不能将“58项托管检查通过”解释成58张图检测通过。
+
+正式测量还要补噪声/模糊、双边缘、毛刺/倒角、遮挡、倾斜、不同视野位置、工件高度和温漂等数据；核对HDevelop与C#结果，再评估长期内存/性能、标定、量具对照与工艺公差。
+
+## 12. 复习与面试追问
+
+1. Metrology与MeasurePairs有什么区别？前者沿多处局部测量拟合几何对象，后者主要处理一个剖面的边缘配对。
+2. 对象索引和实例索引为什么不能共用？前者选模型中的测量对象，后者选该对象本次拟合候选。
+3. Score很高为何还可能测错？边缘身份可能错误，且Score不是残差或物理精度。
+4. 圆心正确、半径变化很大为何找不到？近似模型的局部测量带可能没有覆盖真实圆边缘。
+5. 结果轮廓更密，是否测得更准？不是，显示采样间隔与测量精度不同。
+6. 线和圆各有两个实例，怎样给上位机一个尺寸？先解决对应关系和歧义；不能默认取第一个发送给PLC。
+
+接着读[C# Metrology创建、参数、直线/圆结果与释放](/knowledge/industrial/host-computer/halcon/csharp-metrology-model-lines-circles-and-results/)。继续学习[HDevelop过程接口与导出路线](/knowledge/industrial/host-computer/halcon/hdevelop-procedure-contracts-and-export-options/)，后续再补WPF集成。

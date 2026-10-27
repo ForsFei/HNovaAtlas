@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<hdevelop file_version="1.2" halcon_version="24.11.3">
+<procedure name="atlas_blob_v1">
+<interface>
+<io><par name="Image" base_type="iconic" dimension="0"/></io>
+<oo><par name="Selected" base_type="iconic" dimension="0"/></oo>
+<ic><par name="Low" base_type="ctrl" dimension="0"/></ic>
+<oc>
+<par name="ContractVersion" base_type="ctrl" dimension="0"/>
+<par name="Areas" base_type="ctrl" dimension="0"/>
+<par name="Rows" base_type="ctrl" dimension="0"/>
+<par name="Columns" base_type="ctrl" dimension="0"/>
+</oc>
+</interface>
+<body>
+<l>ContractVersion := 1</l>
+<l>Areas := []</l>
+<l>Rows := []</l>
+<l>Columns := []</l>
+<l>threshold (Image, Region, Low, 255)</l>
+<l>connection (Region, Components)</l>
+<l>select_shape (Components, Selected, 'area', 'and', 2, 10)</l>
+<l>count_obj (Selected, Count)</l>
+<l>if (Count &gt; 0)</l>
+<l>    area_center (Selected, Areas, Rows, Columns)</l>
+<l>endif</l>
+</body>
+</procedure>
+</hdevelop>

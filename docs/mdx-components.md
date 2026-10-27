@@ -85,6 +85,8 @@ Mermaid 图形仅在客户端生成；静态搜索索引包含图注与源码，
 
 ## 扩展与审核
 
+工业上位机总览使用 `<IndustrialLearningRoadmap />` 呈现十二步分支路线。它是固定课程内容的 SVG 组件，阶段链接指向真实章节锚点；文字随页面服务端输出，大图使用原生 dialog，可用关闭按钮或 Escape 返回正文，窄屏局部滚动。图中文字适配站点主题，隐藏的大图副本不重复进入搜索索引。更新课程标题时需同时核对图中的阶段摘要与链接；`mdx.test.tsx` 检查十二个阶段能否对应到章节标题。
+
 新增组件时分别定义数据契约、服务端/客户端边界、键盘语义、静态索引范围与降级内容，再加入组件映射。不要使用 eval 或把未审核 AI 字符串编译成组件。Phase 8 已注册 Quiz / FlashCard / Stepper，契约与例子见 [学习组件指南](interactive-components.md)。使用 JSX 的文章采用 `.mdx` 扩展名。
 
 维护检查：`npm run lint`、`npm run typecheck`、`npm run test:content`、`npm run build`。浏览器另验真实文章、多个组件实例、图表失败/主题、手机局部滚动。参考 [Mermaid API](https://mermaid.js.org/config/usage) 与 [W3C Tabs 键盘约定](https://www.w3.org/WAI/ARIA/apg/patterns/tabs/)。

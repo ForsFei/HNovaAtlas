@@ -1,0 +1,165 @@
+---
+id: industrial-csharp-halcon-ncc
+title: C#实践：HALCON NCC模型创建、查找、结果与释放
+description: 固定24.11.3官方接口编译真实NCC链，生成原创纹理夹具，解释CreateNccModel/FindNccModel参数、四元组结果及模型所有权，35项托管检查与原生执行分开记录。
+tags: [工业自动化, C#, HALCON, NCC, 资源管理]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 50
+prerequisite: [industrial-halcon-ncc-matching, industrial-csharp-halcon-segmentation]
+related: [industrial-csharp-inspection-pipeline, industrial-csharp-wpf-vision-viewer]
+---
+
+## 本批验证到了哪里
+
+沿用`examples/industrial-halcon/`，仍固定MVTec.HalconDotNet 24113.0.0、.NET10/x64及锁文件。新代码调用真正的NCC模型与查找API，不在托管侧实现相关搜索，也不把缺库回退成空匹配。
+
+| 检查 | 本轮结果 |
+| --- | --- |
+| 真实API Release编译 | 零警告零错误 |
+| 新增夹具/输出契约 | 35项纯托管检查通过 |
+| 既有输出/分割参数回归 | 34＋27项纯托管检查通过 |
+| NCC原生test | 未通过，DllNotFoundException，退出3 |
+| 四组匹配预期/模型释放实测 | 尚未原生验证 |
+| 旋转、数据集精度/性能、生产集成 | 未验收 |
+
+DLL加载失败不说明许可一定错误。本批没有安装原生库、修改PATH/注册表/许可或读取许可文件，也不提交厂商DLL。
+
+## 1. 文件与入口
+
+| 文件 | 作用 |
+| --- | --- |
+| NccFixture.cs | 生成原创64×64图像数值，只做像素布局，不做匹配 |
+| NccDemo.cs | 原生图像生成、模型创建、四组查找入口与生命周期 |
+| NccReadback.cs | 四个数值数组到只读NccReport，不返回原生模型 |
+| NccChecks.cs | 合成数组与夹具检查，不调用HALCON |
+
+```powershell
+dotnet restore examples/industrial-halcon/IndustrialHalcon.csproj --locked-mode
+dotnet build examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-restore
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --ncc-contract-test
+```
+
+在匹配24.11.3原生运行库、x64与合法许可的厂商环境中，再运行：
+
+```powershell
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --ncc-native-demo
+dotnet run --project examples/industrial-halcon/IndustrialHalcon.csproj -c Release --no-build -- --ncc-native-test
+```
+
+demo只打印默认平移场景；test复用同一模型检查四个场景。0为所选路径完成，1为托管检查失败，2为CLI用法错误，3为原生路径未通过。当前没有四组原生匹配成功记录。
+
+## 2. 常用对象与方法查用表
+
+| 对象/接口 | 用途 | 本批范围 |
+| --- | --- | --- |
+| HObject | 模板图、搜索图与domain包装 | 实际代码使用 |
+| HTuple model | CreateNccModel返回的模型句柄 | 不是图标对象、不是序号 |
+| HNCCModel | NCC专用面向对象包装 | 查用对照，主链不混用 |
+| CreateNccModel | 从模板domain建模 | 实际编译调用 |
+| SetNccModelOrigin | 设置相对domain重心的原点偏移 | 本例明确设(0,0) |
+| FindNccModel | 使用已有模型搜索并返回四个元组 | 实际编译调用 |
+| GetNccModelParams / GetNccModelOrigin | 查询已建模型的参数与原点 | API导读，未在主链执行 |
+| WriteNccModel / ReadNccModel | 保存/读入模型文件 | API导读，不写文件 |
+| ClearNccModel | 显式使模型失效 | API导读，本例不强制Clear |
+| Dispose | 归还本调用拥有的包装器/句柄引用 | finally统一处理 |
+
+这些是方法，不要自行假设有ModelID.IsConnected或NccModel.Score这类属性。分数属于每次查找结果，不属于一个随时自动更新的模型属性。HOperatorSet与HNCCModel两种风格都可以，但要统一所有权。[创建接口](https://www.mvtec.com/doc/halcon/2411/en/create_ncc_model.html)、[模型参数查询](https://www.mvtec.com/doc/halcon/2411/en/get_ncc_model_params.html)
+
+## 3. 输入：原创像素，不借外部照片掩盖约束
+
+NccFixture.Pixels生成64×64、背景16的整数数组。行12..35、列10..41放24×32灰度纹理，公式使用局部行列计算，值在32..223内；平移版将完全相同的纹理移动到行30..53、列24..55。
+
+纯C#检查验证每图4096个值、768个非背景像素、端点和一一平移关系。这些检查不计算相关系数、更没有调用FindNccModel。不会因为“图案确实搬过去了”就声称HALCON已经找到了它。
+
+原生入口用GenImageConst创建新的byte图，再一次性用SetGrayval写入这4096个像素；写完才创建domain别名与模型。SetGrayval会修改已有图像及可能共享矩阵的别名，因此只对刚创建、独占的新图使用。该方法仅为很小的教学夹具，不推荐作为生产相机的逐像素搬运方案。[SetGrayval注意事项](https://www.mvtec.com/doc/halcon/2411/en/set_grayval.html)
+
+本例不读取任意文件、不做RGB/uint2转换、不采集相机，也不接收未知尺寸输入。换成真实相机时，应先按前面视觉章节建立完整图像与帧身份契约。
+
+## 4. 创建模型与设置原点
+
+以下为NccDemo.Run中的片段，输出变量在函数外层声明并在finally归还：
+
+```csharp
+PixelRoi r = NccFixture.TemplateRoi;
+HOperatorSet.GenRectangle1(out modelRoi,
+    r.Row1, r.Column1, r.Row2, r.Column2);
+HOperatorSet.ReduceDomain(template, modelRoi, out reducedTemplate);
+HOperatorSet.CreateNccModel(reducedTemplate,
+    1, 0, 0, 0.05, "use_polarity", out model);
+HOperatorSet.SetNccModelOrigin(model, 0, 0);
+```
+
+| 参数 | 本例值 | 含义 |
+| --- | --- | --- |
+| NumLevels | 1 | 固定一层，简化夹具对照，不是通用最优值 |
+| AngleStart / AngleExtent | 0 / 0 | 只做零旋转平移 |
+| AngleStep | 0.05弧度 | 建模角度步长，不自动扩大范围 |
+| Metric | use_polarity | 保持对比度方向 |
+| ModelID | out model | 新模型句柄，由本调用拥有 |
+
+模板重心是(23.5,25.5)，SetNccModelOrigin(0,0)表示不偏移，不是把原点设到原图左上角。该方法会修改模型，本例在首次查找前、没有其他调用者时执行。[原点接口](https://www.mvtec.com/doc/halcon/2411/en/set_ncc_model_origin.html)
+
+## 5. 查找参数：逐个读懂再调整
+
+```csharp
+HOperatorSet.FindNccModel(reduced, model,
+    0, 0, 0.99, 2, 0.5, "false", 1,
+    out rows, out columns, out angles, out scores);
+```
+
+这里依次是角度起始、角度范围、最小分数、最多返回数、最大重叠、亚像素模式、金字塔层数。NCC的SubPixel本例用字符串`"false"`，不是随便塞入形状匹配的`least_squares`等设置。固定一层与关闭亚像素只服务于本批夹具，不代表现场优化建议。[查找接口与参数](https://www.mvtec.com/doc/halcon/2411/en/find_ncc_model.html)
+
+查找前用GenRectangle1/ReduceDomain限定参考点搜索位置。Find函数每次创建自己的ROI与reduced包装，结束即释放；模型仍归外层Run拥有，不能在Find结束时顺手销毁共享的输入model。
+
+NumMatches=2而不是1，是为了避免在教学上暗示“返回最好一个就是唯一”。当前夹具预期一个候选，不实现跨候选业务选择；真实图出现两项时全部交给后续明确规则，不在适配层偷偷选第一项。
+
+## 6. 四元组输出，不用CountObj统计匹配数
+
+FindNccModel返回rows、columns、angles、scores四个HTuple，同一个索引属于同一个候选。没有输出候选HObject，因此不能拿输入图像CountObj当匹配数量。
+
+```csharp
+return NccReadback.FromArrays(0.99, 2,
+    Numbers(rows), Numbers(columns), Numbers(angles), Numbers(scores));
+```
+
+Numbers沿用TupleReal→按Length复制DArr有效前缀的处理；FromArrays要求四组长度相同、不超过请求上限，保存只读数值副本。四个空数组才是本例成功执行后的NoMatch；有坐标但分数为空属于输出错误，不生成一个默认(0,0)。
+
+NccCandidate包含RawRowPixels、RawColumnPixels、AngleRadians、Score。这里的Raw标明HALCON原始匹配位姿，而不是已按像素坐标约定计算的准确点或机械位置；[理论篇](/knowledge/industrial/host-computer/halcon/ncc-matching-models-origins-and-search/)说明旋转时的变换区别。
+
+输出适配器仅支持本夹具：64×64、原点零偏移、零旋转、坐标0..63、分数不低于指定门槛且不超过1，角度绝对值不超过1e-8。角度容差只防浮点表示误差，不开放旋转。一般HALCON原点可在别处，旋转原始位姿也有特殊约定，不能把这组范围当所有模型的合法性规则。
+
+## 7. 未找到、找到候选、执行失败
+
+| 分支 | 本例行为 |
+| --- | --- |
+| 原生查找正常返回四个空元组 | NoMatch，候选列表为空 |
+| 原生查找正常返回合格四元组 | Candidates，保留全部返回项 |
+| 缺库、许可、建模/查找异常、输出违反契约 | 原生入口失败退出3，不回退 |
+
+NoMatch没有携带“图中绝无目标”的保证；可能只是搜索范围排除了目标。Candidates也不是产品合格。当前状态不是业务报警系统，没有自动补拍、重复触发、PLC写入或机械动作。
+
+## 8. 模型释放：一个所有者，一条清理路径
+
+外层Run创建一次模型，按需完成多次Find，最后finally先归还model，再归还图像/domain包装。固定接口包的HTuple.Dispose说明会处理元组内存储的句柄，因此本例使用model.Dispose，不再另调ClearNccModel；纯数值输出元组与模型句柄的语义不要混为一谈。
+
+ClearNccModel是显式使模型失效的接口，不是“关闭一次查找结果”。若模型被缓存或有其他别名/线程使用，清除会影响它们；需先结束使用并统一管理生命周期。不要不分所有权地“Clear一遍、Dispose一遍”，也不要在每次Find的finally清掉借来的模型。[ClearNccModel说明](https://www.mvtec.com/doc/halcon/2411/en/clear_ncc_model.html)
+
+本例没有模型别名、缓存、并发查找或换型。释放代码已编译，但因为原生加载第一步失败，还没有原生资源释放、长时内存稳定或异常中途清理的实际验收记录。
+
+## 9. 文件保存与读取怎么用
+
+需要持久化时，静态风格调用WriteNccModel(model, path)，下一次用ReadNccModel(path, out model)获得本次进程的新句柄。默认模型文件后缀ncm，路径应选应用拥有的位置；创建/读取结果的生命周期仍要管理。[写入接口](https://www.mvtec.com/doc/halcon/2411/en/write_ncc_model.html)、[读取接口](https://www.mvtec.com/doc/halcon/2411/en/read_ncc_model.html)
+
+本批只作方法导读，不执行保存/加载。模型文件还应配套记录模板来源、原点、配方版本和适用工况；不把句柄转成int写入JSON，再尝试在下次程序启动后复用。读取失败也不能悄悄用上一型号模型继续检测。
+
+## 10. 35项托管检查与四组原生预期
+
+35项检查覆盖四元组空/长度/上限、只读快照、多候选顺序、分数与有限值、固定平移坐标/角度策略，以及像素数、纹理范围、包含端点、平移一致性和越界拒绝。不计算NCC，不加载原生库，不验证许可。
+
+原生test计划依次检查：平移图的大ROI、模板原图、小于模板的参考点ROI、排除目标的角落ROI。前三组要求一个候选、位置与预期各坐标相差不超过0.75像素，后者要求NoMatch；所有返回还必须满足零角度与score≥0.99。这些为教学断言，不是厂商精度指标或真实工艺验收。
+
+这轮实际执行仍在原生库加载处失败，因此四组断言尚未通过。后续具备环境后先核对这些预期，再扩展亮度变化、相似目标、旋转、遮挡与边界样本，不为了让断言通过而直接放宽到没有区分度。
+
+下一批已接续为[形状匹配与旋转后的ROI跟随](/knowledge/industrial/host-computer/halcon/shape-matching-rotation-and-roi-following/)及 [C#形状模型、两套矩阵与区域统计](/knowledge/industrial/host-computer/halcon/csharp-shape-model-and-roi-following/)，再进入边缘/尺寸测量。本轮NCC示例不增加交互面板、WPF叠加、标定变换或设备控制；先把模型、搜索与输出语义讲明白。

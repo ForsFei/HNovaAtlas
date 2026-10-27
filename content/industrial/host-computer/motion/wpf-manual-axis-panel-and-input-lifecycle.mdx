@@ -1,0 +1,174 @@
+---
+id: industrial-wpf-manual-axis-panel
+title: WPF 单轴模拟面板：鼠标点动、失焦停止与故障交接
+description: 用纯内存轴与小型手动会话演示WPF鼠标捕获、旧事件隔离、普通停止、报警复位与关窗流程，保留编译和人工验证边界。
+tags: [工业自动化, WPF, C#, 运动控制, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-20"
+order: 80
+prerequisite: [industrial-e3032-manual-jog-recovery]
+related: [industrial-csharp-single-axis-simulation, industrial-csharp-e3032-motion-observation, wpf-ui-thread-and-async]
+---
+
+## 本轮能运行什么
+
+本轮沿用 `examples/industrial-motion/` 的理想内存轴，新增 `ManualAxisSession`、43项手动会话断言，以及 `Wpf/` 子项目。窗口只包含必要的操作和状态，不接原生DLL、不访问网络，也没有切换到真实硬件的选项。
+
+**已验证**：手动会话43项离线检查，WPF Release编译零警告零错误。**未验证**：人工窗口操作、实际鼠标/触摸事件时序、真实SDK或机械动作。编译成功和核心测试通过不能冒充这些验收已完成。
+
+```powershell
+# 从仓库根目录执行；这两项不弹出窗口。
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --manual-test
+dotnet run --project examples/industrial-motion/IndustrialMotion.csproj -c Release -- --manual-demo
+
+# Windows上的纯模拟窗口；本轮只编译，未人工操作验收。
+dotnet build examples/industrial-motion/Wpf/IndustrialMotion.Wpf.csproj -c Release
+dotnet run --project examples/industrial-motion/Wpf/IndustrialMotion.Wpf.csproj -c Release
+```
+
+保留原有 `--self-test/--demo` 和 `--observation-test/--observation-demo`，各组检查范围不互相替代。
+
+## 1. 面板操作顺序
+
+1. 打开模拟会话：只让内存模型进入Disabled。
+2. 模拟使能：仍未建立参考。
+3. 简化回零：从初始1 mm向零点搜索，完成后建立模拟参考。
+4. 鼠标左键按住“+”或“-”，以固定0.5 mm/s模拟点动。
+5. 松开或撤销操作条件，观察Stopping，再观察Stopped。
+6. 勾选模拟报警，取消勾选后显式复位；复位后不会自动使能或回零。
+
+面板中的手动模式、互锁和报警都是教学输入，不是安全输入或现场信号。点动只支持鼠标，不实现键盘、触摸、手柄或维护模式；没有用按钮Click冒充按住输入。
+
+### 为什么有“重建内存轴”
+
+旧模型的回零只支持从正侧向零点单阶段搜索，不支持从零位/负侧退出开关再复寻。若故障后当前恰好在零位或负侧，不能伪装为完整回零实现。
+
+“重建内存轴（1 mm）”只在模型不忙时可用：销毁旧内存对象、创建初始位置1 mm的新模型，再由用户重新打开、使能、回零。它不是卡复位、位置清零或移动真实机构的做法。
+
+## 2. 文件和责任
+
+| 文件 | 责任 |
+| --- | --- |
+| `SimAxis.cs / MotionMath.cs` | 既有理想轴状态与曲线模型 |
+| `ManualAxisSession.cs` | 串行拥有内存轴、操作条件、点动持有、停止和显式恢复 |
+| `ManualChecks.cs` | 无窗口的43项检查及命令行演示 |
+| `Wpf/MainWindow.xaml` | 必要按钮、教学输入与只读状态 |
+| `Wpf/MainWindow.xaml.cs` | 鼠标事件、窗口生命周期、模拟时钟和显示 |
+| `Wpf/IndustrialMotion.Wpf.csproj` | .NET10 Windows WPF，链接三个纯C#模型源文件 |
+
+控制台项目排除Wpf目录的C#文件，避免将窗口或其生成代码编入跨平台控制台项目。WPF不引用控制台入口，也没有额外安装运动控制包。
+
+这里有意只用一个窗口和简单会话，不为小型教学面板引入插件框架。未来真实SDK的线程所有权、异步调用和调度限制必须另行设计，不能照搬“在UI线程调用内存轴”的实现。
+
+## 3. ManualAxisSession的属性与方法
+
+| 成员 | 含义与限制 |
+| --- | --- |
+| `Snapshot` | 读取模拟状态、数据有效性、使能、参考、位置与结果 |
+| `AuthorityAvailable` | 窗口激活、手动模式、模拟互锁成立；不是安全许可 |
+| `Armed` | 还要求全部松开已观察到、无持有、轴空闲/使能/有参考/数据有效 |
+| `Held` | 当前点动持有的可空身份 |
+| `LastStopCause` | 最近本地撤销/停止原因，不是卡的停止原因寄存器 |
+| `SetContext` | 更新操作条件；条件丢失会撤销持有并请求模拟停止 |
+| `ObserveAllReleased` | 交付“输入已全部松开”；仍有持有时先撤销 |
+| `Press / Renew / Release` | 接受新按下、为同一持有续期、释放同一持有 |
+| `Stop` | 先撤销持有，再请求普通模拟停止，不立即宣称停止完成 |
+| `Open / Enable / Home / Disable / Close` | 分开的模型操作，不合并成自动启动/清理流程 |
+| `InjectInputs / ResetFault` | 只改教学输入、显式复位，不自动续跑 |
+| `Tick` | 推进模拟时间，不是EtherCAT周期 |
+
+### 本地持有身份为什么多一层
+
+`JogHandle`包含会话实例Guid、本地持有序号、模拟命令Key。相同模型内的新按下使用新序号；重建模型后即便命令编号又从相同值开始，实例Guid也不同。
+
+这样旧MouseUp或旧续期不会作用于新持有。它只是应用内事件隔离，不是原生卡事务身份，不解决多进程所有权，也不提供跨进程持久化恢复。
+
+下面可在控制台项目内使用，不涉及WPF或真实SDK：
+
+```csharp
+using var session = new ManualAxisSession();
+session.SetContext(active: true, manual: true, interlocks: true);
+session.Open();
+session.Enable();
+session.Home();
+while (session.Snapshot.Busy) session.Tick(.01);
+
+session.ObserveAllReleased();
+JogHandle handle = session.Press(1, .5);
+session.Tick(.1);
+session.Release(handle); // 此刻通常只是Stopping。
+while (session.Snapshot.Busy) session.Tick(.01);
+Console.WriteLine(session.Snapshot.Result); // Stopped，不是目标定位Completed。
+session.Disable();
+session.Close();
+```
+
+实际UI必须根据真实输入事件交付松开，不能为了通过条件而主动假造 `ObserveAllReleased()`。上方只是固定的离线演示。
+
+## 4. 鼠标捕获和撤销顺序
+
+面板在 `PreviewMouseLeftButtonDown` 检查窗口、输入类型和已有持有，成功捕获鼠标后才尝试新点动。捕获失败就不启动；按下被拒绝则释放捕获。
+
+撤销时先清除本地持有并请求停止，再释放鼠标捕获。因为释放捕获本身会触发更多事件，若顺序相反，重入回调容易再次操作已过期的状态。
+
+```csharp
+// MainWindow中的实际处理形态；只作用于内存模型。
+Button? button = _heldButton;
+_heldButton = null;
+_handle = null;
+_session.Stop(cause);
+if (button?.IsMouseCaptured == true)
+    button.ReleaseMouseCapture();
+```
+
+`LostMouseCapture`会冒泡，因此还检查事件来源是否为当前按钮，并核对该按钮当前确实不再持有捕获；普通MouseUp也必须来自当前持有按钮。窗口Deactivated、模式/互锁变化则直接撤销当前操作意图。原始WPF事件不携带业务JogHandle，核心的旧句柄隔离不等于所有系统事件时序均已验证；原始事件的快速切换仍保留在人工验收清单中。
+
+参见Microsoft的[CaptureMouse](https://learn.microsoft.com/en-us/dotnet/api/system.windows.uielement.capturemouse?view=windowsdesktop-10.0)、[LostMouseCapture](https://learn.microsoft.com/en-us/dotnet/api/system.windows.uielement.lostmousecapture?view=windowsdesktop-10.0)和[Deactivated](https://learn.microsoft.com/en-us/dotnet/api/system.windows.window.deactivated?view=windowsdesktop-10.0)说明。捕获不是安全屏障；应用卡住或崩溃时，不能保证这些处理器继续运行。
+
+## 5. 定时刷新到底做了什么
+
+窗口使用 `DispatcherTimer` 请求约20ms刷新，通过 `Stopwatch` 观察本地经过时间。UI恢复运行时若发现间隔超过0.1秒，会撤销持有并请求停止当前模拟动作，不继续续期旧点动。
+
+每次最多补进0.05秒模拟时间，拆成不超过5个0.01秒步骤，避免暂停调试后一次推进很大距离。有效输入仍持续按住且捕获未丢时，只为当前持有续期，不每帧重发一次点动启动。
+
+这些数字均为教学配置，不是机械参数建议。丢帧后请求停止也依赖UI线程恢复运行；模拟租约只有Tick推进才会过期。UI卡住期间没有一个独立的安全定时器在控制真实卡。
+
+[DispatcherTimer](https://learn.microsoft.com/en-us/dotnet/api/system.windows.threading.dispatchertimer?view=windowsdesktop-10.0)受Dispatcher调度影响，不保证精确执行时刻。它适合这里的UI和内存演示，不提供实时运动控制能力。
+
+## 6. 报警与恢复的演示
+
+勾选模拟报警会撤销持有、将模型置故障并使参考失效。取消勾选只恢复输入，不会自动清故障。显式复位后只进入Disabled，保留旧动作失败结果。
+
+之后再由用户决定是否使能和恢复参考；即使重新满足所有条件，也只接受新的按下，不恢复旧持有。若遇到简化回零模型的初始位置限制，可静止后重建内存轴重新演示。
+
+模型中的故障冻结不是机械停止预测；本地 `ResetFault()` 也不是厂商 `nmc_clear_axis_errcode` 的等价实现。真实驱动的诊断/复位/使能顺序见[上一章](/knowledge/industrial/host-computer/motion/e3032-manual-jog-interlocks-and-recovery/)，不能把这个按钮直接连到任意清警IO。
+
+## 7. 关窗为什么不是直接Dispose
+
+窗口首次请求关闭时撤销持有并请求模拟停止。若模型还忙，取消这次关窗，让计时器继续推进；观察到不忙后再允许关闭，停止计时器并释放模型。
+
+若未在3秒关闭预算内观察到停止，则阻止本次关闭并提示核对，不把超时当成功。这是纯模型流程：故障状态“不忙”也不证明真实机械已静止。强制结束进程仍可能跳过这套处理；真实设备退出需要可信状态、失联策略和安全设计，不由此窗口承诺。
+
+释放模型时若它仍在活动，既有SimAxis将结果标为Uncertain，而不是伪造停止成功。关闭、失能与停止的差别仍保持。
+
+## 8. 检查覆盖与人工验收清单
+
+43项核心检查覆盖：手动条件、参考与新松开、单持有、禁止竞争/反向排队、续期/重复释放、停止中拒绝关闭或失能、旧事件隔离、失焦/模式/互锁恢复、模拟租约、故障源未解除时拒绝复位、显式恢复、失联未知、重建模型身份隔离和异常释放。
+
+人工窗口操作尚未执行，下面保留为待验收，不勾选：
+
+| 操作 | 预期观察 |
+| --- | --- |
+| 按住后拖出按钮并松开 | 当前持有撤销、进入Stopping，最后模拟Stopped |
+| 点动时切换窗口 | 撤销持有；返回后即使鼠标仍按下也不续跑 |
+| 模式或互锁条件撤销 | 当前模拟动作请求停止，新点动被拒绝 |
+| 快速松开再按、捕获被其他控件获取 | 不出现旧释放影响新动作或旧续期复活 |
+| 报警勾选/解除/显式复位 | 输入恢复不自动复位；复位不自动使能或回零 |
+| 暂停调试后恢复 | 观察缺口触发撤销，不一次性补进大量模拟位移 |
+| 运动中关窗 | 等待模拟停止再退出，非直接关闭资源 |
+| 零位/负侧重复回零 | 不假装支持完整方法，明确提示模型限制 |
+
+本轮只编译窗口，没有完成这些人工验收，更没有真实鼠标设备、控制卡、伺服、安全输入、制动器或长期运行验收。
+
+继续读[脉冲卡方向、卡侧回零与反馈对照](/knowledge/industrial/host-computer/motion/dmc3000-pulse-direction-homing-and-feedback/)和 [C#脉冲IO/计数契约](/knowledge/industrial/host-computer/motion/csharp-dmc3000-pulse-io-and-position-contracts/)。该分支只做理论与纯数值检查，本WPF面板不切换到脉冲硬件；随后回到E3032多轴/IO主线，实际SDK接入与硬件验收仍单独保留。

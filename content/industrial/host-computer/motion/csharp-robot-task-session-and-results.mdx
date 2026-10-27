@@ -1,0 +1,181 @@
+---
+id: industrial-csharp-robot-task-session
+title: C# 机械臂任务会话：一次发布、结果确认与只读对账
+description: 用纯C#的PC侧单任务会话区分发布、接受、运行、OK/NG终态与确认，检查旧身份、结果冲突、期限和晚到结果不自动解锁。
+tags: [工业自动化, C#, 机械臂, 握手, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 240
+prerequisite: [industrial-robot-task-handshake]
+related: [industrial-csharp-robot-frames-context, industrial-csharp-plc-motion-handoff, industrial-csharp-recovery-review]
+---
+
+## 代码边界：PC观察器，不是机器人控制器
+
+本批沿用`examples/industrial-robotics/`，新增`RobotTaskSession.cs`和`RobotTaskChecks.cs`。仍是.NET 10、无包、无网络或原生库。输入是人工构造的机器人邮箱快照，输出是供外层处理的一次性发布/确认意图，不执行任何IO。
+
+先读[任务握手与异常对账](/knowledge/industrial/host-computer/motion/robot-job-handshake-results-and-reconciliation/)。本实现只检查PC侧行为，没有机器人侧去重邮箱、TP/SPEL+程序、SDK适配、实际报文或物理动作。`Qualified=true`由测试直接声明，不是网络原子性已验证。
+
+## 1. 运行与对象地图
+
+```powershell
+dotnet build examples/industrial-robotics/IndustrialRobotics.csproj -c Release
+dotnet run --project examples/industrial-robotics/IndustrialRobotics.csproj -c Release -- --task-test
+dotnet run --project examples/industrial-robotics/IndustrialRobotics.csproj -c Release -- --task-demo
+```
+
+新增66项任务检查；既有`--self-test`仍是58项坐标/普通上下文检查，两组分别记录，不计作机器人实机验收。
+
+| 对象 | 重要字段 | 责任 |
+| --- | --- | --- |
+| RobotTaskKey | PcSession、Number | 本地业务请求身份 |
+| RobotTaskRequest | Key、Workpiece、JobId、RecipeRevision、Binding | 冻结本次完整载荷 |
+| RobotTaskResult | Revision、Code、Verdict | 保留结果版本、代码与OK/NG |
+| RobotMailboxFrame | Context、Phase、Job、Result、Qualified | 外部归一化状态摘要 |
+| RobotTaskView | Request、Stage、Result、TransportAcknowledged、AckTaken | 当前本地记录 |
+| RobotSessionView | ReconciliationRequired、HadUncertainty、Current、LastReleased | 读历史和锁定状态 |
+
+这些是本项目类型，不是厂商库对象。没有Open/Connect/Write/Close、启动或停止方法；后续确定型号后，才按实际SDK/通信契约补对应层，不能把TakePublish的返回当成调用过品牌接口。
+
+## 2. 会话如何建立
+
+```csharp
+RobotBinding binding = new(
+    Guid.Parse("47b63c07-f544-4645-a86f-51450e5f126a"),
+    Revision: 1, ToolId: 2, WorkFrameId: 3);
+
+RobotTaskSession session = new(
+    binding, approvedJobId: 10, approvedRecipeRevision: 3,
+    startupReconciled: true);
+```
+
+上面全部是离线夹具。`startupReconciled`默认false，默认会话锁定，不能因为读到空邮箱就自动开始。传true只是调用者声明已做启动对账，代码不验证工件、日志、机械、操作者资质或安全系统；不要把这段构造复制进开机自动恢复路径。
+
+每个对象生成新的PcSession，序号从0开始分配，不跨重启持久化。构造时只允许一个固定JobId和配方版本；绑定中包含控制器代、上下文版本、工具/工件系，实际定义和校准是否正确仍需外部确认。
+
+默认maxAge为0.25秒、taskBudget为5秒，都是教学策略，不是机器人通信或工艺保证。方法必须由单一调用者串行执行，没有线程安全、多个发布者仲裁或独立看门狗。
+
+## 3. Observe先读什么
+
+```csharp
+RobotContextSample context = new(
+    binding, SampledAt: 0,
+    Mode: RobotMode.Automatic, Valid: true, RemoteSelected: true,
+    ProgramIdle: true, NoFaultObserved: true, ProcessPermit: true);
+
+session.Observe(new RobotMailboxFrame(
+    context, RobotRemotePhase.Empty, Qualified: true), now: 0);
+```
+
+质量与Qualified默认false。时间需有限、非负、不在未来、未过期，并严格新于上一份被采纳摘要；时间属于同一PC单调时钟域，不直接比较设备墙上时钟。
+
+还会检查前一份观察是否已过期，即使本轮新数据本身足够新，也不能掩盖中间许可覆盖缺口。多源摘要需由外层保守维护质量和时间；模型没有多寄存器原子读取、校验版本或快照发布器。
+
+空槽必须没有Job和Result。活动槽必须有非零请求身份且没有终态结果。终态还要有有效结果版本、代码和合适判定。Context与Phase是两层信息：本任务Running时ProgramIdle可以为false；但准备新任务时必须看到空槽且程序空闲。
+
+普通Mode、RemoteSelected、NoFaultObserved或ProcessPermit不满足时，锁定写意图；它们不是安全信号。若同一执行域仍可读取合格匹配结果，可记录历史，不因此允许写入。
+
+## 4. Prepare与TakePublish分别做什么
+
+```csharp
+RobotTaskRequest? request = session.Prepare("part-A", now: .01);
+RobotTaskRequest? publishIntent = session.TakePublish(now: .02);
+// 再调用TakePublish不会得到第二份发布意图。
+```
+
+`Prepare`要求未锁定、当前没有保留任务、有效空槽、程序空闲及普通上下文满足。它分配本地序号并冻结完整请求，状态为Prepared，没有发布。重复点击不会覆盖第一件。
+
+`TakePublish`再次检查当前时效和条件，只取一次，状态变PublishTaken。这是本地尝试边界，不证明字节已发送，也不证明设备执行一次。真实发布者必须记录意图身份和实际尝试结果，不能在每次UI刷新中重新写它。
+
+序号耗尽时锁定，不回绕。新会话重新从空历史开始，不提供持久化exactly-once；不同请求号携带同一工件仍可发生，返工/重复生产规则不在这个类里。
+
+## 5. RecordPublish记录通信证据，不生成业务成功
+
+| 证据 | 本地变化 | 约束 |
+| --- | --- | --- |
+| NotAttempted | NotPublished并锁定复核 | 只声明该发布者未尝试，不证明机械停止 |
+| Acknowledged | AwaitingAcceptance、保存通信确认 | 不等于Accepted/Running/Completed |
+| Unknown | Unknown、锁定、记HadUncertainty | 只查询原请求，不重放 |
+
+```csharp
+if (publishIntent is not null)
+{
+    // 脚本化应答丢失，不是实际网络故障注入。
+    session.RecordPublish(publishIntent.Key, RobotPublishEvidence.Unknown, now: .03);
+}
+```
+
+方法只接受当前Key、正确阶段的一次记录。错误身份、重复回执不能改写任务；未定义枚举会锁定未决发布。
+
+若外层未尝试写入，应明确报告NotAttempted。仅“没有收到回执”不能归为未尝试；Dispose连接也不证明撤回了已被控制器看到的内容。
+
+## 6. 接受、运行与带判定的终态怎样进入
+
+正常路径可以依次输入Accepted、Running和Completed。模型要求快照中的整个Job与本地请求相同，不只比较Number。错误工件、配方、绑定或PC会话都会锁定，不能给新件套旧Done。
+
+Completed必须有Ok或Ng；Rejected/Failed要求Unspecified判定及明确代码。运行中出现Rejected会被拒绝，因为它不能再作为“未进入执行”的普通拒绝。观察到的Running进度在进入Unknown后仍保留约束，不因失联而忘掉先前已经执行。
+
+同一终态/相同完整结果可以反复读取。结果版本、代码或判定变更，或终态退回活动阶段，会锁定并保留原终态，不静默覆盖已有结果。
+
+本模型允许未采到Running就直接读到匹配保留Completed，但只在已经取过发布意图的任务上成立；未发布的Prepared任务突然在远端出现属于矛盾。结果可靠性仍依赖外层Qualified契约及机器人程序正确发布，不从原始Busy/Done位推导。
+
+## 7. 晚到结果如何对账而不恢复写入
+
+这是demo的核心路径：
+
+```csharp
+RobotTaskResult ng = new(1, "inspection-complete", RobotVerdict.Ng);
+RobotContextSample later = context with { SampledAt = .04 };
+
+if (request is not null)
+{
+    session.Observe(new RobotMailboxFrame(
+        later, RobotRemotePhase.Completed, request, ng, Qualified: true), now: .04);
+}
+
+RobotSessionView view = session.Read(.04);
+// Current.Stage == Completed，Current.Result.Verdict == Ng
+// ReconciliationRequired == true，HadUncertainty == true
+// TakeResultAck(.04)仍返回null。
+```
+
+只有同一绑定、同一完整原请求且新鲜合格的保留结果，才补充这条历史。连接恢复、匿名Done、另一个任务的结果、控制器已重启的快照都不足以满足。
+
+Completed表示原任务新获得了明确结果，HadUncertainty保留曾经的发布/观察不确定性；这两者并不矛盾。锁定没有被清除，不能自动确认结果或启动新件。本模型没有解锁/恢复方法，真实恢复必须走外部审核与对账，不以直接new对象冒充处理完旧任务。
+
+## 8. 正常路径怎样确认和释放结果
+
+在没有失联/锁定的正常路径，调用者读到并按业务要求消费Completed或Rejected后，可调用`TakeResultAck(now)`。它返回包含原Key和完整Result的一次确认意图，不做网络写入。
+
+Result的Revision/Code/Verdict都被关联，不能用一个无身份清除位替代。取出确认后本地仍保留任务，直到后续合格观察显示空槽，才把它放入LastReleased并释放Current。不会自动Prepare或TakePublish下一件。
+
+这个“空槽说明确认已处理”的推断建立在外部协议约束上：同一执行域中，对端只按匹配确认清本槽，不会被其他写者/自动超时/程序切换随意清除。模型没有证明对端实现了此约束。
+
+演示可以跳过确认的通信回执，只输入确认后的空槽，说明在同一未中断会话中仍能观察释放；没有实际发送或丢弃网络包。若确认后失联、缺口或清槽等待超预算，模型保留原完成历史并锁定，不自动重发确认。
+
+LastReleased只是最后一条内存历史，会被下一次正常释放替换，不是审计日志。代码不校验结果已持久化；实际数据库记录、幂等和“入库后再确认”必须由外层实现。
+
+## 9. Held、Failed、期限与关闭
+
+Held保留暂停任务并锁定，不发Continue。其后新的Running报告也不能被本模型解释成自动续跑；Failed保留执行故障，不能走普通Completed结果消费路径。
+
+`Read/Observe/Take...`等方法执行时检查单调时间；任务总预算从发布意图取出起算，结果确认等待另有同长度预算。持续新鲜的通信快照也不能使任务无限等待。超时只停止产生新意图/标记未知，不停止机器人，方法不被调用时也没有后台期限执行。
+
+`Invalidate()`用于外层宣告关闭/失效，锁定并保留历史，不做IO、停止或清零。本类本身没有连接资源，也没有Dispose。未来真正适配层应独占连接、等待在途IO结束并明确报告结果边界；这些生命周期行为没有在本批验证。
+
+## 10. 新进程和断线不能靠new对象接着跑
+
+新对象有新PcSession，但没有旧任务日志。即使显式传`startupReconciled:true`，读到另一个会话的保留任务也会锁定，不接管、不重发。
+
+默认false只是保守入口，不是完整恢复系统。若外层先清空机器人记录再new对象，本模型无法发现已经丢失的历史。真实系统需要可靠任务日志、机器人保留信息、工件和现场证据共同对账；它们不是跨设备原子事务。
+
+本课也没有机器人侧高水位或持久化去重。因此“PC本地意图取一次”绝不能宣传成“机器人掉电重启后物理动作绝对只执行一次”。
+
+## 11. 66项任务检查与未完成项
+
+检查覆盖：默认启动阻止、单任务/单发布、通信确认分层、完整载荷/旧PC会话、OK/NG终态、拒绝/故障/暂停、结果版本与冲突、匹配确认/空槽释放、晚到终态仍锁定、模式/质量/代/时效缺口、总预算、结果确认等待、新实例不接管和不自动续跑。
+
+全部快照和网络结果由测试构造，没有机器人程序、真实SDK、报文编解码、实际丢包或机械运动。不能把旧PLC邮箱的网络验证算作本机械臂协议验证。
+
+通用运动与机械臂集成基础到这里已形成阅读主线；原生和现场扩展继续保留未完成。接着读[视觉基础](/knowledge/industrial/host-computer/vision/imaging-exposure-pixels-and-acquisition/)和 [C#离线图像/缓冲示例](/knowledge/industrial/host-computer/vision/csharp-mono8-replay-and-buffer-lifetime/)，后续再把工件/任务、触发和图像关联起来，不提前假装已经接上相机。

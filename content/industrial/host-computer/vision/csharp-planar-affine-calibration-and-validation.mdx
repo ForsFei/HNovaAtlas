@@ -1,0 +1,188 @@
+---
+id: industrial-csharp-planar-calibration
+title: C# 平面标定基础：三点仿射、ROI还原与独立误差报告
+description: 以纯.NET数值示例恢复六个仿射参数，校验坐标绑定和三角形范围，计算毫米距离、逆变换及独立检查点RMS，提供72项离线检查。
+tags: [工业自动化, C#, 机器视觉, 标定, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 70
+prerequisite: [industrial-vision-planar-calibration]
+related: [industrial-csharp-mono8-buffer-lifetime, industrial-csharp-inspection-pipeline, industrial-csharp-robot-frames-context]
+---
+
+## 这批实现什么、不实现什么
+
+在`examples/industrial-vision/`新增PlanarCalibration.cs与CalibrationChecks.cs。纯.NET 10，无新包、相机SDK、原生库、网络或UI。手工定义合成点对应，验证坐标模型与误差计算；不是从图像检测了标定板，也不是相机/镜头的实际标定。
+
+原有8×6合成图仍不是标定板。本批只借用相同的图像尺寸建立数值夹具，物理参考点人为按已知公式生成，检查偏移也人为加入。请先读[坐标域、模型与误差原理](/knowledge/industrial/host-computer/vision/image-coordinates-planar-calibration-and-errors/)，不要把demo输出当实测精度。
+
+## 1. 编译和运行
+
+```powershell
+dotnet build examples/industrial-vision/IndustrialVision.csproj -c Release
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --calibration-test
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --calibration-demo
+```
+
+新增72项纯数值检查。既有`--self-test`63项图像/缓冲、`--capture-test`73项单拍和`--pipeline-test`71项处理检查保持独立；不是将各组重新包装为本轮新增。
+
+demo输出：像素(Column=2,Row=1)映射为(10.220,19.820)mm；三个检查点RMS约0.045092mm、最大0.060000mm；图像内的(7,5)在拟合三角形外，因此拒绝，几何版本变化也拒绝。
+
+## 2. 对象、属性和方法
+
+| 类型/成员 | 作用 |
+| --- | --- |
+| ImagePoint(Column, Row) | 原图零基像素中心坐标，允许亚像素 |
+| PlanePoint(Xmm, Ymm) | 目标平面毫米坐标，不含Z或姿态 |
+| CalibrationBinding | SetupId、GeometryRevision、PixelSpace、PlaneFrame及图像尺寸 |
+| CalibrationPair | 唯一名称、像素点、对应平面参考点 |
+| PlanarAffineCalibration.FitThree | 从恰好三组非退化对应点建立模型 |
+| Binding / Coefficients | 固定坐标绑定与六个仿射系数 |
+| ImageTriangleShape / PlaneTriangleShape | 两个三角形的数值形状指标，不是标定分数 |
+| TryMap / TryUnmap | 正向/反向换算，配置或范围不符返回false |
+| MeasureDistance | 两个支持范围内像素点转毫米后求距离 |
+| PixelPerturbationBound | 固定线性模型对二维像素扰动的保守放大界 |
+| Evaluate | 只计算独立检查残差，不重新拟合或自动判合格 |
+| ImageCoordinates.RestoreFromCrop | 仅裁剪场景逐级还原父图偏移 |
+
+全部是本项目自定义类型，不是HALCON/OpenCvSharp的对象。没有CalibrateCamera、FindChessboardCorners或CalibrateHandEye的实现，也没有运动目标生成接口。
+
+## 3. 先固定坐标绑定
+
+```csharp
+CalibrationBinding binding = new(
+    SetupId: "synthetic-fixed-camera",
+    GeometryRevision: 1,
+    PixelSpace: "synthetic-mono8-centers",
+    PlaneFrame: "fixture-plane-mm",
+    Width: 8, Height: 6);
+```
+
+SetupId指本例的成像装置标识，GeometryRevision表示外部维护的几何配置版本；它不同于一次连接会话号，也不自动记录焦距、工作高度或相机位置。PixelSpace是明确的像素域标签，例如真实项目可能区分原始图和某种去畸变输出，但改标签不会执行去畸变。
+
+PlaneFrame指目标平面，不是任意字符串写成robot-base就已经完成了机器人坐标转换。Width/Height绑定点坐标所在的完整图像尺寸，受项目1,048,576像素教学上限约束。
+
+TryMap中的current必须按值等于Binding。代码允许同字段的新record，拒绝改版本/尺寸/域/目标平面；这些检查只防应用上下文错配，不证明现实几何未变化。
+
+## 4. 三组对应点与已知答案
+
+本例预先定义真实公式，便于手算与回归：
+
+```text
+Xmm = 10 + 0.1 × Column + 0.02 × Row
+Ymm = 20 + 0.01 × Column - 0.2 × Row
+```
+
+由此构造输入：
+
+```csharp
+CalibrationPair[] fit =
+[
+    new("fit-A", new ImagePoint(0, 0), new PlanePoint(10, 20)),
+    new("fit-B", new ImagePoint(7, 0), new PlanePoint(10.7, 20.07)),
+    new("fit-C", new ImagePoint(0, 5), new PlanePoint(10.1, 19))
+];
+PlanarAffineCalibration model = PlanarAffineCalibration.FitThree(binding, fit);
+```
+
+名称、点位顺序和参考值必须一一对应。可以整组重排，但不能只把像素数组排序而不重排参考数组。FitThree复制输入数组，之后修改调用者数组不会修改已建立模型。
+
+输入限定恰好三组。传入第四组直接拒绝，不偷偷截断，也不声称已完成多点最小二乘。真实生产的多点、噪声、异常匹配与鲁棒估计，后续结合成熟库展开；当前的目的在于把模型和验证边界讲清楚。
+
+## 5. 内部怎样求解
+
+以第一组点为锚点，把另两组像素差向量作为二维基底。对任意输入点，求出它在这两个基底上的系数，再用同样系数组合两个平面差向量。
+
+```text
+pixel = pixelA + alpha × (pixelB-pixelA) + beta × (pixelC-pixelA)
+plane = planeA + alpha × (planeB-planeA) + beta × (planeC-planeA)
+```
+
+当alpha≥0、beta≥0、alpha+beta≤1时，点在拟合三角形中。实现用尺度归一化后的2×2行列式求系数，内部计算保留锚点形式；Coefficients提供等价的全局六参数便于学习，并不是通过把所有坐标写入Matrix求通用最小二乘。
+
+源图与目标平面分别检查：
+
+- 不能重复、共线或过于细长；形状指标为绝对叉积除以最长边平方，低于1e-4拒绝。
+- 源图最短边至少1像素；目标平面最短边至少1e-6mm。
+- 图像点有限且在0..Width-1、0..Height-1；平面坐标有限且每轴绝对值不超过1e6mm。
+
+这些阈值均是教学数值策略，不是相机规格、长度精度或行业标准。实际工程还要根据数据尺度和库的数值方法评估条件性；不能把1e-6mm最短边解释为实现了纳米级标定。
+
+## 6. 正向、反向与拒绝分支
+
+```csharp
+ImagePoint pixel = new(Column: 2, Row: 1);
+if (model.TryMap(pixel, binding, out PlanePoint plane))
+{
+    Console.WriteLine($"{plane.Xmm:F3}, {plane.Ymm:F3} mm");
+    if (model.TryUnmap(plane, binding, out ImagePoint back))
+        Console.WriteLine($"inverse pixel={back}");
+}
+
+bool outside = model.TryMap(new ImagePoint(7, 5), binding, out _); // false
+bool changed = model.TryMap(pixel, binding with { GeometryRevision = 2 }, out _); // false
+```
+
+注意只在TryMap成功后使用plane，逆变换同样先检查返回值再使用back；失败时out参数为默认值，(0,0)不是有效测量结果或回零指令。
+
+TryUnmap也拒绝目标三角形外的点，不把超出工作域的世界点“夹回”图像边缘。浮点三角形比较容差为1e-10，仅用于数值边界；图像边界检查不自动clamp，极少量边界舍入也可能导致逆变换返回false，调用者应明确处理而不是强行使用。
+
+数值可逆只能证明这份合成数学关系能往返，不能证明实际镜头、平面或机械坐标正确。
+
+## 7. ROI局部点还原
+
+```csharp
+ImagePoint local = new(Column: 1.5, Row: 0.5);
+ImagePoint original = ImageCoordinates.RestoreFromCrop(
+    local, sourceRegion: new PixelRoi(2, 1, 4, 3),
+    fullWidth: 8, fullHeight: 6);
+// original = (Column=3.5, Row=1.5)
+```
+
+方法验证ROI与局部点边界，再加SourceRegion.X/Y。使用上一批Mono8Image.Crop时，SourceRegion只相对直接父图；多级裁剪需要按逆序逐级还原。
+
+仅软件裁剪、未重采样时适用。硬件ROI的原点语义、binning、resize、镜像、旋转、去畸变和WPF显示都没有在这里实现；不能把缩小一半的显示点直接送入该方法。
+
+## 8. 长度换算与扰动上界
+
+```csharp
+double distanceMm = model.MeasureDistance(
+    new ImagePoint(1, 1), new ImagePoint(3, 2), binding);
+double linearErrorBoundMm = model.PixelPerturbationBound(radiusPixels: 0.2);
+```
+
+两端点映射后的差为(0.22,-0.18)mm，因此长度为sqrt(0.22²+0.18²)≈0.284253mm。没有把像素欧氏距离乘某一个横向比例尺。
+
+PixelPerturbationBound用线性部分四系数平方和的平方根，乘输入二维扰动半径。radiusPixels限定0..1000且有限，返回的是该固定模型的线性放大上界；不含拟合误差或设备误差，也不是95%概率界。
+
+若需要每轴误差、协方差传播或总测量不确定度，需要额外的模型与可追溯数据，本批不把一种简单上界包装成完整质量体系。
+
+## 9. 独立检查点与误差报告
+
+```csharp
+CalibrationPair[] checks =
+[
+    new("check-1", new ImagePoint(1, 1), new PlanePoint(10.15, 19.85)),
+    new("check-2", new ImagePoint(2, 1), new PlanePoint(10.22, 19.82)),
+    new("check-3", new ImagePoint(1, 2), new PlanePoint(10.08, 19.61))
+];
+CalibrationErrorReport report = model.Evaluate(checks, binding);
+Console.WriteLine($"RMS={report.RmsMm:F6} mm, max={report.MaxMm:F6} mm");
+foreach (CalibrationResidual item in report.Points)
+    Console.WriteLine($"{item.Name}: dx={item.ErrorXmm}, dy={item.ErrorYmm}");
+```
+
+参考值刻意相对模型加偏移，让计算结果可手算。三点残差依次为(-0.03,-0.04)、(0,0)、(0.06,0)mm，径向误差0.05、0、0.06mm；RMS=sqrt((0.05²+0.06²)/3)，不是三项径向误差的算术平均。
+
+报告还保留MeanErrorXmm≈0.01、MeanErrorYmm≈-0.013333。它不含Pass或MotionAllowed字段，也不自动扣除平均偏差；Evaluate不会修改模型来迎合检查点。
+
+最多64个检查点，不能空、重用训练名称/像素位置、重复检查名称/位置或跨出拟合三角形。输出逐点集合只读。代码不能证明参考值来自独立测量，也不能识别有人用模型生成了“完美检查点”。
+
+## 10. 72项检查与未覆盖内容
+
+已检查已知系数/平移、亚像素、行列互换、三角形边界和外推拒绝、绑定错配、逆变换、两点距离、扰动界、ROI与嵌套裁剪、独立残差/RMS/最大值、有符号平均误差及只读输出。异常输入覆盖点数、退化/近共线、最短边、尺寸与非有限数值等。
+
+其中一项补充回归在36个固定三角形内部样本上对照解析答案和正反往返；72为断言数，不是72套实机标定，也不是精度统计。所有几何参考均为合成，不读取真实标定板或提取角点。
+
+没有多点拟合、畸变模型、透视变换、手眼/3D、姿态/高度估计、文件持久化、硬件几何复核、WPF点击定位或运动指令。下一批补显示与图像/结果身份一致的叠加，具体视觉库能力在HALCON/OpenCvSharp章节逐步接入。

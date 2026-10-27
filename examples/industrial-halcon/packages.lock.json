@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "MVTec.HalconDotNet": {
+        "type": "Direct",
+        "requested": "[24113.0.0, 24113.0.0]",
+        "resolved": "24113.0.0",
+        "contentHash": "ywqpjHOLO96X+HIL9tzT33TJ1Jrbji/cZdEiGPwpHWXOwavL/OlpIWUPO7xiwTvLxQEUeU0j/780QQT1hxh8tA=="
+      }
+    }
+  }
+}

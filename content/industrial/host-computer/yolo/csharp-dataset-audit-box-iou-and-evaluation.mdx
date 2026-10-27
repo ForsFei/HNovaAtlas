@@ -1,0 +1,197 @@
+---
+id: industrial-csharp-yolo-evaluation
+title: C#实践：数据分组审计、框IoU与误检漏检评估
+description: 用独立.NET10无第三方依赖项目读取手写框JSON，校验类别与分组、严格坐标，按固定阈值一对一匹配，记录TP/FP/FN和69项契约检查。
+tags: [工业自动化, C#, YOLO, 检测评估, 数据契约]
+difficulty: intermediate
+status: published
+updated: "2026-10-26"
+order: 10
+prerequisite: [industrial-yolo-foundations]
+related: [industrial-csharp-opencvsharp-bounded-pipeline, industrial-opencvsharp-stripe-measurement]
+---
+
+## 运行、文件与边界
+
+新项目examples/industrial-yolo/面向net10.0，Nullable和TreatWarningsAsErrors开启，没有NuGet包，不引用HALCON/OpenCvSharp/WPF/ONNX Runtime。只读本地手写JSON，不打开图片、网络或相机，不训练/下载权重、不输出推理耗时。
+
+```powershell
+dotnet build examples/industrial-yolo/IndustrialYolo.csproj -c Release
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --evaluate-fixture
+```
+
+Release零警告零错误；69项手写数据/契约检查通过。成功退出0，数据/文件/检查失败1，用法错误2。默认夹具从AppContext.BaseDirectory下的fixtures/handwritten-boxes.json读取，也可显式指定本地JSON路径：
+
+```powershell
+dotnet run --project examples/industrial-yolo/IndustrialYolo.csproj -c Release --no-build -- --evaluate-fixture examples/industrial-yolo/fixtures/handwritten-boxes.json
+```
+
+文件分工：DetectionEvaluation.cs放不可变记录、JSON入口、审计和匹配；Checks.cs放69项检查；Program.cs提供两个入口。fixtureKind必须是handwritten-evaluation，屏幕显式提示没有模型或推理；这不是用数据替身通过后宣称原生推理成功。
+
+## 1. 先认识常用对象与成员
+
+| 对象 | 属性/方法 | 本批用途 |
+| --- | --- | --- |
+| EvaluationFixture | FixtureKind、Labels、Images、Predictions、两个阈值 | 未审计的数据入口 |
+| DatasetImage | Id、Group、Split、Width、Height、Truth | 单张图的元数据与真值 |
+| Truth / Prediction | ClassId、Box；预测另有ImageId/Score | 区分标注和候选输出 |
+| Box | X1、Y1、X2、Y2 | 原图连续面积边界，不是YOLO标签行 |
+| FixtureJson | Read(path)、Parse(json)、Audit(fixture) | 读文件、严格反序列化、结构/分组审计 |
+| AuditedDataset | Labels、Images、Predictions、ScoreThreshold、IouThreshold | 审计后的分离只读快照 |
+| BoxMath | Validate、IoU | 拒绝非法框、计算连续框交并比 |
+| DetectionEvaluator | Evaluate(dataset) | 每张测试图内按类别一对一匹配 |
+| EvaluationReport | TruePositive、FalsePositive、FalseNegative、Filtered、Precision、Recall、Decisions | 计数、可空比率和预测决策明细 |
+| PredictionDecision | PredictionIndex、ImageId、Decision、TruthIndex、MatchedIou | 追溯哪个输入预测匹配了哪个真值 |
+
+这些主要是本项目教学类型，不是某个YOLO SDK自带的接口。后续实际ONNX Runtime常用InferenceSession/OrtValue等对象将单独固定版本、编译和验证，不能把本批Read/Evaluate说成加载模型/执行推理。实际运行时可先了解[官方C#入门](https://onnxruntime.ai/docs/tutorials/csharp/basic_csharp.html)，本批不调用其中接口。
+
+## 2. 标签顺序与坐标首先固定
+
+夹具标签顺序：0=scratch，1=dent；图像100×100，框使用原图xyxy面积边界。下面只是一张测试图的条目，不是完整JSON文件：
+
+```json
+{
+  "id": "test-a",
+  "group": "batch-test-a",
+  "split": "test",
+  "width": 100,
+  "height": 100,
+  "truth": [
+    {"classId": 0, "box": {"x1": 10, "y1": 10, "x2": 30, "y2": 30}},
+    {"classId": 1, "box": {"x1": 60, "y1": 50, "x2": 80, "y2": 70}}
+  ]
+}
+```
+
+边界X2可以等于图像宽100，不是只能到像素索引99；宽度用X2−X1，不加1。这里的ClassId不携带类别名，标签顺序换了，框即使原样也变了含义。因此模型文件、标签顺序、阈值与坐标契约要共同管理。
+
+此JSON不能直接当Ultralytics数据标签，也不能作为ONNX输入。我们还没有写归一化标签导入、原始输出解码或图像预处理，不能用简单改文件扩展名来替代这些步骤。
+
+## 3. 严格JSON：缺失字段不能悄悄变成0
+
+核心配置：
+
+```csharp
+private static readonly JsonSerializerOptions Options = new()
+{
+    PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+    RespectRequiredConstructorParameters = true,
+    MaxDepth = 16,
+    Converters = { new JsonStringEnumConverter<DatasetSplit>(JsonNamingPolicy.CamelCase, false) }
+};
+```
+
+RespectRequiredConstructorParameters让无默认值的构造参数成为必需项；本例使用位置record，漏掉Box.X1应抛JsonException，而不是默认成0后被当合法左边界。显式null与越界仍需要后面的语义审计。[微软必需属性/构造参数说明](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/required-properties)
+
+UnmappedMemberHandling.Disallow拒绝拼错或未知属性；枚举只接收train/validation/test等约定字符串，不接收整数替代；标准JSON不接收NaN字面值。文件长度限定1..1,048,576字节，MaxDepth限定16层，避免教学工具读任意大嵌套文档。该限制不是完整的不可信文件安全方案。
+
+```csharp
+using FileStream input = new(path, FileMode.Open, FileAccess.Read, FileShare.Read);
+return Audit(JsonSerializer.Deserialize<EvaluationFixture>(input, Options));
+```
+
+完整代码在反序列化前还检查Length。using负责正常或异常时关闭文件；Read返回的对象不持有文件句柄。没有后台线程、会话池或必须在调用方Dispose的原生对象。
+
+## 4. Audit检查哪些事实
+
+先检查FixtureKind、标签、阈值和数量，再检查图像/真值，最后检查预测：
+
+- 标签1..64个，名称非空、已Trim、无控制字符、长度不超过64，按Ordinal唯一；索引必须落在标签表内。
+- 图像1..256张，Id唯一；Group非空，同一Group不能跨Split。本教学清单要求train/validation/test三者均出现，不是所有评估工具的通用要求。
+- 图像宽高1..8192，总像素不超过16,777,216；真值每图最多128个，允许空数组表示已确认负样本。
+- 预测最多4096个、每图最多256个，只允许引用已知测试图；不把训练图预测静默混进测试统计。
+- Score及ScoreThreshold有限且在0..1；IouThreshold有限且在(0,1]。
+- 框有限、面积为正、在对应图像边界内；拒绝倒置、负坐标、零面积、NaN/无穷大与面积下溢。
+
+这些上限是本例资源/复杂度边界，不是YOLO标准。真实模型可能先产生很多候选，需要按固定输出契约解码、阈值与必要后处理，不能将它们直接塞进本例后宣称支持全部输出。
+
+Audit并不能证明标注正确、组名对应真实工件，或模型标签和JSON标签一致。当前没有图像内容、哈希去重、重复标注自动修复与业务OK/NG逻辑；数量和结构通过也不是数据质量通过。
+
+## 5. 审计后分离输入集合
+
+record属性不可重新赋值，不意味着record里面的List不会被外部修改。本例在审计后复制Labels/Images/Predictions，并逐图复制Truth，再用Array.AsReadOnly对外提供集合。
+
+Box/Truth/Prediction记录内部没有可变集合；图像记录的Truth已被替换为独立只读数组。检查中清空调用方原始四个集合，审计结果仍保持原数据和统计；通过IList强制修改只读结果会抛异常。
+
+这是单线程调用边界的快照策略，不支持调用方在Audit执行过程中并发改List。构建/审计/评估期间都应遵守输入所有权，不把“用了record”当并发安全证明。
+
+## 6. IoU计算没有像素索引的+1
+
+```csharp
+double width = Math.Max(0, Math.Min(first.X2, second.X2) - Math.Max(first.X1, second.X1));
+double height = Math.Max(0, Math.Min(first.Y2, second.Y2) - Math.Max(first.Y1, second.Y1));
+double intersection = width * height;
+return Math.Clamp(intersection / (Area(first) + Area(second) - intersection), 0, 1);
+```
+
+Validate先保证合法且正面积，不能通过Clamp把非法输入变成合法结果。Clamp只约束合法输入下的数值范围。20×20的A=(10,10,30,30)，B=(11,11,31,31)：交集19×19=361，并集400+400−361=439，IoU=361/439≈0.8223。
+
+相邻边界框接触时交集面积0。测试还覆盖相同框、包含一半、平移与对称；这些是几何正确性检查，不是模型定位精度检查。
+
+## 7. 匹配规则逐步看
+
+Evaluate只遍历测试图，选出属于该ImageId的预测，按分数降序；分数相同按原始输入索引。每个预测寻找同类别、未使用真值中IoU最大的一项，相同IoU选择真值数组中靠前者。
+
+```csharp
+if (best >= 0 && bestIou >= dataset.IouThreshold)
+{
+    used[best] = true;
+    tp++;
+    decisions.Add(new(index, image.Id, Decision.TruePositive, best, bestIou));
+}
+else
+{
+    fp++;
+    decisions.Add(new(index, image.Id, Decision.FalsePositive, null, null));
+}
+```
+
+进入这段前已过滤Score低于阈值的预测，结束本图后，未使用真值数量加入FN。Score和IoU恰好等于阈值都接收。使用贪心策略而非全局最优匹配，不处理COCO的crowd/ignore/多IoU等规则；不要声称与任何标准评价器完全等价。
+
+PredictionIndex是原始预测数组索引，决策输出顺序则按图和分数排序，两者不能混为一谈。TruthIndex是该图真值数组索引，不是工件号；MatchedIou只在成功匹配时有值，FP的null并不表示它与所有真值IoU都为0，重复框也可能高度重叠。
+
+## 8. 手写夹具的逐项结果
+
+夹具有train/validation各一张、test两张。test-a有scratch和dent各一个真值，test-b没有真值。ScoreThreshold=0.5，IouThreshold=0.5：
+
+| 原始预测索引 | 图/类别/分数 | 发生什么 | 计数 |
+| --- | --- | --- | --- |
+| 0 | test-a / scratch / 0.90 | 与scratch真值完全重合 | TP |
+| 1 | test-a / scratch / 0.80 | 与已被占用的真值IoU≈0.8223 | FP，重复框 |
+| 2 | test-a / dent / 0.40 | 虽然位置准确，但先被分数过滤 | Filtered，dent真值仍FN |
+| 3 | test-a / dent / 0.70 | 位于不重合的背景位置 | FP |
+| 4 | test-b / scratch / 0.95 | 负样本上的预测 | FP |
+
+实际命令输出摘要：
+
+```text
+HANDWRITTEN boxes only. No model loaded, no inference, no production-quality claim.
+Labels: scratch, dent; test images: 2
+TP=1 FP=3 FN=1 Filtered=1
+Precision=0.25 Recall=0.5; NOT AP/mAP.
+```
+
+将分数阈值降低到0.4时，索引2参与匹配，TP=2、FP=3、FN=0，Precision=0.4、Recall=1。提高到0.85时，只保留索引0和4，TP=1、FP=1、FN=1，Precision=0.5、Recall=0.5。这些结果已在检查中验证，目的仅是理解工作点变化，不是建议现场阈值。
+
+## 9. 可空指标与正确的空样本语义
+
+```csharp
+public double? Precision => TruePositive + FalsePositive == 0 ? null :
+    (double)TruePositive / (TruePositive + FalsePositive);
+public double? Recall => TruePositive + FalseNegative == 0 ? null :
+    (double)TruePositive / (TruePositive + FalseNegative);
+```
+
+全部没有预测而存在真值：Precision未定义，Recall=0；全部没有真值但有误报：Precision=0，Recall未定义；两者都没有时两个指标都未定义。UI/导出报表也应保留这种区别，不能习惯性用??1补成满分。
+
+本例也不输出AP/mAP、TN/Accuracy、耗时/FPS、模型预测概率校准或产品合格率。它们需要另外定义数据与评价流程。
+
+## 10. 69项检查证明什么，以及下一步
+
+检查覆盖实际夹具读取与计数、连续IoU、非法值、分数/IoU阈值相等、类别/图像隔离、分数排序、重复与一对一匹配、真值并列、空分母、必需字段/未知字段/枚举、分组泄漏、索引/尺寸/数量限制和输入快照。
+
+它们没有执行图像解码、letterbox、张量填充、ONNX Runtime、NMS、GPU或WPF，也没有真实相机和工件。不会因为这69项通过而在路线中标记“YOLO部署已完成”。
+
+第二批继续读[颜色通道、NCHW、缩放填充与坐标空间](/knowledge/industrial/host-computer/yolo/image-channels-nchw-letterbox-and-coordinate-spaces/)及 [C#自有BGR缓冲、输入数组与框还原](/knowledge/industrial/host-computer/yolo/csharp-bgr-nchw-letterbox-and-box-restoration/)。模型版本、真实推理和现场质量仍分别验收。

@@ -1,0 +1,115 @@
+---
+id: industrial-opencvsharp-regions-foundations
+title: OpenCvSharp区域与轮廓：连通域、面积、孔洞和层级
+description: 从二值掩膜提取连通域与轮廓，区分背景标签、4/8邻域、像素面积/轮廓面积/外接框、像素质心、树层级、检索模式和ROI坐标。
+tags: [工业自动化, OpenCvSharp, 连通域, 轮廓, 机器视觉]
+difficulty: intermediate
+status: published
+updated: "2026-10-23"
+order: 40
+prerequisite: [industrial-opencvsharp-segmentation-foundations, industrial-csharp-opencvsharp-segmentation]
+related: [industrial-csharp-opencvsharp-regions, industrial-vision-planar-calibration]
+---
+
+## 前景掩膜不等于对象列表
+
+上一批得到三份二值掩膜及前景像素数。现在进一步回答：有几个连通区域、每个区域多大、边界在哪、是否包含孔，以及ROI里的坐标怎样回到原图。
+
+本批新增18项纯托管配方/父关系检查与24项真实原生检查，继续固定OpenCvSharp 4.13.0.20260627。不增加交互界面，不引入跟踪、亚像素尺寸或产品判定。
+
+## 1. 连通域和轮廓解决不同问题
+
+| 方法 | 核心结果 | 更适合回答 |
+| --- | --- | --- |
+| ConnectedComponentsWithStats | 每个像素的标签、各标签统计和质心 | 几个连通区域、各有多少前景像素 |
+| FindContours | 边界点序列和轮廓层级 | 形状、边界、多边形面积、外边界与内孔关系 |
+| CountNonZero | 非零像素总数 | 整张掩膜有多少前景像素 |
+
+一个带孔目标可以是一个前景连通域，却对应外轮廓和孔轮廓两条边界。不能把轮廓条数当作工件数，也不能把前景112像素理解成112个目标。
+
+本例连通域和轮廓分别计算，没有建立“标签i必对应轮廓i”的映射。两组索引是不同输出中的局部身份，不是统一产品编号。
+
+## 2. 返回N包含背景标签0
+
+ConnectedComponentsWithStats返回总标签数N，标签范围0..N−1，其中0表示背景。stats和centroids也包含背景行；本例只将标签1..N−1转换成前景对象。[连通域接口](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+因此“返回4”可能表示3个前景连通区域，而不是4件工件。全黑图仍有背景标签，前景列表为空；全白图中背景可能没有有效像素，不能无条件使用它的质心。本批跳过背景统计，并验证了全黑/全白场景。
+
+标签不是稳定的跟踪ID。图像、连通算法或执行条件变化后，标签顺序未必符合业务顺序；不要把Label1长期当左侧工件或固定工位。本例按面积和位置核对结果，不固定某个标签数字代表哪件物体。
+
+## 3. 4邻域与8邻域
+
+4邻域只通过上下左右相连，8邻域还允许对角相连。两像素只在对角接触时，4邻域得到2个前景区域，8邻域得到1个，本批已实际验证。
+
+选择依据应是物理任务和像素化后允许的连接关系，不是哪个结果看起来更少。斜细线、阈值毛刺和细桥都可能影响分组。
+
+FindContours没有本例连通域接口那样的4/8参数。不要将连通域Connectivity=4当作同时改变了轮廓检索规则，更不要对任意图承诺根轮廓数量等于4邻域组件数量。
+
+## 4. stats、质心和外接框
+
+stats每个标签一行，列表示Left、Top、Width、Height、Area，使用整数读取；centroids为浮点x/y，x在第0列、y在第1列。像素质心按区域实际包含的像素计算，孔洞不会被计入。[标签统计与质心布局](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+外接框是覆盖区域的轴对齐矩形，不是实际区域。Width×Height可能包括背景、孔洞和凹陷；矩形中心也不必等于像素质心。
+
+Rect用x/y/width/height，右下边界不包含端点。x=3,width=10表示像素列3..12，右边界是13；不要用13−3再误写成9像素宽。
+
+## 5. 本例为什么同时出现91、100、81和14
+
+32×24掩膜包含：10×10白矩形、其中3×3黑孔、另一个5×4白矩形和一个白孤点。大目标实际前景100−9=91，总前景91+20+1=112。
+
+| 数值 | 定义 | 本轮原生结果 |
+| --- | --- | --- |
+| 大目标像素面积 | 标签覆盖的白像素数 | 91 |
+| 大目标外接框面积 | 10×10矩形覆盖范围 | 100 |
+| 大目标外轮廓面积 | 像素中心边界形成的多边形面积 | 81 |
+| 孔轮廓面积 | 内边界多边形面积 | 14，不是9个黑像素 |
+
+矩形列3..12的边界像素中心跨度是9，外轮廓多边形面积为9×9=81。孔轮廓沿孔周围的前景边界形成，不能拿其面积14当黑孔像素数9。
+
+ContourArea计算多边形几何面积，与填充后计像素通常不同；自交轮廓还可能不符合预期。即使按层级做外减内，81−14得到的是这套边界多边形定义下的67，也不会变成区域像素面积91。[ContourArea与像素计数的区别](https://docs.opencv.org/4.13.0/d3/dc0/group__imgproc__shape.html)
+
+单个白像素也可以有像素面积1，而轮廓面积0；它不是“没有被提取到”。把面积0当作除数会出错，使用轮廓矩求中心时尤其需要保护退化情况。
+
+## 6. 轮廓周长、点数和方向
+
+ArcLength(contour,true)按闭合折线累计长度；返回的是像素坐标下的几何长度，不是边界点数量。大矩形外轮廓周长本轮为36，孔轮廓约13.65685；并非外接框周长40或孔的像素数9。
+
+ApproxSimple压缩水平/竖直/对角等连续段的中间点，ApproxNone保留更多边界点；更多点不等于更多目标，也不自动提高真实测量精度。本批两种模式实际对照了轮廓数量与点数。[轮廓特征教程](https://docs.opencv.org/4.13.0/dd/d49/tutorial_py_contour_features.html)
+
+ContourArea的oriented=true返回有符号面积，反向排列点会翻转符号。方向约定不应用来替代父子层级或工件身份，本文主结果保存非负面积，层级另存。
+
+## 7. 四个层级字段
+
+| 字段 | 意义 | 不存在时 |
+| --- | --- | --- |
+| Next / Previous | 同一层的后/前兄弟轮廓 | −1 |
+| Child | 第一个直接子轮廓，不是子轮廓数量 | −1 |
+| Parent | 直接父轮廓，不一定是最外层 | −1 |
+
+这些数字索引contours数组，不是连通域标签。要遍历全部孩子，需沿子层的兄弟关系或按Parent筛选；只读Child一次可能漏掉其他孔。[层级说明](https://docs.opencv.org/4.13.0/d9/d8b/tutorial_py_contours_hierarchy.html)
+
+本批用Parent链计算深度，检查索引、缺失标记和循环，避免错误元数据导致无限遍历。它不是对任意不可信轮廓图的完整拓扑证明，Next/Previous/Child只作范围校验。
+
+## 8. Tree、External、List、CComp
+
+External只取最外层边界；List列出轮廓但不建立完整嵌套关系；Tree保留完整父子树；CComp组织成两层，内孔里的前景岛可能被提升为顶层。
+
+本例3个前景组件，Tree得到4条轮廓：3个根和1个孔；External得到3条，孔边界被省略。另一个嵌套夹具为外白框→黑孔→白岛，Tree深度0/1/2，CComp则有2个根、1个孔边界。
+
+因此有Parent的轮廓不一定都是孔：在白前景、黑背景及正常二值树关系下，深度1是孔边界，深度2又是前景岛边界。任务若需要孔，不能简单筛选Parent!=−1后全部当缺孔。本批实际执行Tree/External/CComp，List仅作概念导读。
+
+## 9. ROI坐标和触边状态
+
+裁剪ROI中的坐标默认属于ROI本身。FindContours的offset可将点平移回原图；连通域统计没有相同的offset参数，本例手工给外接框和质心加OriginX/Y，统一两套输出坐标。
+
+偏移只加一次；它不改变面积，不把像素变成毫米，也不证明ROI中的目标完整。物体被ROI截断时，外接框触边是重要线索，但不触边也不是完整性或正确身份的全部证明。
+
+本例保留TouchesImageBorder，按需RejectBorder筛选；这里的边界指当前输入掩膜边界，可能就是ROI边界。没有自动补齐裁掉的目标。
+
+## 10. 筛选和原始证据分开
+
+本例以像素面积2..1000筛选，去掉孤点，保留91和20两个候选。不默认取最大区域或第一个轮廓当产品；两个候选仍明确保留为两个。
+
+Report中的Contours始终来自原始输入掩膜，Components也保留全部前景区域；Selected只表示统计筛选结果。筛掉一个组件，不表示该组件对应轮廓已从Contours消失。若需对筛选后掩膜重新提轮廓，要显式重建并再执行，本批未实现。
+
+继续读[旋转框、几何特征和形状筛选](/knowledge/industrial/host-computer/opencvsharp/geometric-features-rotated-boxes-and-shape-selection/)，进一步区分描述性特征与产品标准。先读[C#标签统计、轮廓层级、坐标与释放](/knowledge/industrial/host-computer/opencvsharp/csharp-components-contours-hierarchy-and-readback/)。

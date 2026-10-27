@@ -1,0 +1,190 @@
+---
+id: industrial-csharp-wpf-vision-viewer
+title: C# WPF离线视觉查看器：Gray8、点击换算与迟到结果隔离
+description: 构建只有下一帧、处理和清空的WPF窗口，真实绘制Mono8及同帧ROI，验证54项几何/身份检查与22项离屏WPF检查，关闭时排空处理。
+tags: [工业自动化, C#, WPF, 机器视觉, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-22"
+order: 90
+prerequisite: [industrial-vision-wpf-display-foundations, industrial-csharp-inspection-pipeline]
+related: [industrial-csharp-planar-calibration, industrial-csharp-mono8-buffer-lifetime]
+---
+
+## 先说明离线边界
+
+本批新增`examples/industrial-vision/Wpf/`，Windows/.NET 10 WPF，无NuGet视觉库、相机驱动、PLC或运动连接。沿用项目原创8×6 P2合成图，另在内存中逐像素取255-value得到第二张图；不是实际相机照片或算法数据集。
+
+显示层输入的请求、设备代、触发与质量字段由离线演示人工构造。它没有通过SingleCaptureSession证明真实采集关联，也不实现软触发/硬触发。时间填0只是离线占位，不能复制成现场时间/新鲜度策略。
+
+目标是演示图像所有权、实际绘图、显示换算和同帧结果隔离。先读[显示坐标与线程契约](/knowledge/industrial/host-computer/vision/wpf-image-display-coordinates-and-frame-consistency/)，不要将本窗口当通用相机SDK封装。
+
+## 1. 编译、运行与检查
+
+在仓库根目录执行：
+
+```powershell
+dotnet build examples/industrial-vision/IndustrialVision.csproj -c Release
+dotnet run --project examples/industrial-vision/IndustrialVision.csproj -c Release -- --display-test
+
+dotnet build examples/industrial-vision/Wpf/IndustrialVision.Wpf.csproj -c Release
+dotnet run --project examples/industrial-vision/Wpf/IndustrialVision.Wpf.csproj -c Release
+```
+
+最后一条才打开交互窗口。没有自动打开相机、写设备参数或驱动机械动作。
+
+执行WPF离屏检查，不显示窗口：
+
+```powershell
+dotnet examples/industrial-vision/Wpf/bin/Release/net10.0-windows/IndustrialVision.Wpf.dll --self-test
+```
+
+本轮54项纯几何/身份检查、22项WPF离屏检查分别记录。离屏检查会在上述输出目录的verification子目录生成带随机前缀的PNG，不覆盖已有文件；它们属于被忽略的构建产物，不是网站内容或采集存档。
+
+## 2. 窗口只保留必要交互
+
+| 操作 | 行为 | 不会做什么 |
+| --- | --- | --- |
+| 下一帧（离线） | 读取下一张夹具，复制自有图，清除旧叠加 | 不触发真实曝光 |
+| 处理当前帧 | 提交固定ROI统计，等待同帧结果 | 不判产品OK/NG、不控制PLC |
+| 清空显示 | 清图、清结果、清ROI | 不取消已接收任务 |
+| 点击图像 | 查看原图整数Column/Row与灰度 | 不标定、不产生毫米/运动目标 |
+
+处理期间禁用再次处理，但仍可切帧/清空。首次夹具固定ROI(1,1,2,2)均值220，第二张反相夹具均值35；青色框只表示本帧预设ROI的统计已匹配，没有目标定位或缺陷检测。
+
+处理函数故意等待400ms以便观察“处理A时切到B”。这不是性能基准，也不是生产节拍或超时配置。当前不支持滚轮缩放、拖动、ROI编辑、连续采集或全屏标注。
+
+## 3. 文件怎样分工
+
+| 文件 | 责任 |
+| --- | --- |
+| ImageDisplay.cs | 不依赖WPF的等比布局、像素选取、ROI边界及帧/结果匹配 |
+| DisplayChecks.cs | 54项纯核心检查 |
+| Wpf/Mono8Viewer.cs | Mono8Bitmap创建/冻结；自定义FrameworkElement画图、画框和点击取值 |
+| Wpf/MainWindow.xaml | 三个按钮、帧/结果/状态文本和一个查看器 |
+| Wpf/MainWindow.xaml.cs | 离线源、单在途处理、UI更新和关闭排空 |
+| Wpf/WpfChecks.cs | 22项STA/Dispatcher、位图、实际离屏绘图及XAML事件检查 |
+
+WPF项目按已有示例方式链接必要核心源码，控制台项目排除Wpf子目录，避免把Windows代码编进跨平台核心。PlainPgm补显式System.IO引用，兼容两个项目不同的隐式using集合。
+
+本窗口使用少量code-behind管理演示生命周期，几何与身份规则仍放在可独立测试的核心类，不引入额外MVVM包或插件框架。正式应用可以沿既有WPF课程拆ViewModel，但不能在拆层时丢失相同的所有权和关闭顺序。
+
+## 4. 常用对象和方法
+
+| 成员 | 作用 |
+| --- | --- |
+| UniformImageViewport.TryCreate | 从源尺寸与控件尺寸计算居中等比布局；布局无效返回false |
+| Scale / ImageBounds | 比例及实际图像显示矩形，包含留白偏移 |
+| TryToDisplay | 像素中心/亚像素点转显示点，使用+0.5 |
+| TryPickPixel | 检查显示矩形，选取原图整数像素单元 |
+| TryRoiBounds | 将整像素ROI面积转换为显示边界，不加0.5 |
+| FrameDisplayState.Show | 接受显示输入并清旧结果 |
+| TryAttach / OverlayRegion | 校验同请求、同图、同触发、同配方，只有成功测量开放ROI |
+| Clear | 清除当前显示引用，不操作工作器 |
+| Mono8Bitmap.Create | 自有字节生成冻结的Gray8 BitmapSource |
+| Mono8Viewer.Present / TryPick | UI线程更新绘图快照，或查询原图像素 |
+| Pipeline.Complete / Completion | 禁止新接收并等待工作器结束，仍非相机关闭 |
+
+## 5. 把Mono8交给BitmapSource
+
+实际代码使用：
+
+```csharp
+BitmapSource bitmap = BitmapSource.Create(
+    image.Width, image.Height, 96, 96,
+    PixelFormats.Gray8, null,
+    image.CopyPixels(), image.Width);
+bitmap.Freeze();
+```
+
+image是Mono8Image，字节为紧凑自有副本，所以Gray8的stride为Width。原SDK结果若含padding/非Mono8，需要前面已经验证的转换与逐行复制；不能改成PixelFormats.Gray8就宣称完成Bayer或Packed解码。
+
+本例换图才创建新BitmapSource，叠加结果变化时复用现有位图。Freeze后不能再修改它；控件仍属于UI线程，冻结位图并不意味着可以从后台直接改Viewer。大量/高帧率图像的分配、复制与渲染开销尚未验收。
+
+## 6. 一套几何同时服务绘图和点击
+
+```csharp
+if (UniformImageViewport.TryCreate(
+    width: 8, height: 6,
+    viewportWidth: 1000, viewportHeight: 600,
+    out UniformImageViewport viewport))
+{
+    bool hasCenter = viewport.TryToDisplay(new ImagePoint(0, 0), out DisplayPoint center);
+    // center=(150,50)：左右各100留白，像素格宽100。
+    bool hasPixel = viewport.TryPickPixel(center, out PixelHit pixel);
+    // pixel=(Column=0,Row=0)，这里只演示上述有效输入。
+}
+```
+
+实际事件使用e.GetPosition(Viewer)与Viewer的ActualWidth/Height。绘图也使用同一个viewport的ImageBounds，因此不出现图片按Uniform、Canvas却按Stretch计算的两套比例。
+
+TryPickPixel选的是单元，不返回鼠标的连续亚像素位置。读取值来自原图GetPixel；即使显示插值改变了屏幕观感，也不应该用插值后的屏幕色替代原像素。本小图设置NearestNeighbor便于看清格子，不是所有照片/任务都必须选最近邻。
+
+窗口尺寸变化时重新按当前尺寸计算；0尺寸、非有限数值、超过1e6显示单位或图像资源上限不建立有效映射。上限为教学策略，不是WPF/相机能力声明。
+
+## 7. 先更新状态，再决定能否画框
+
+```csharp
+FrameDisplayState display = new(owner, pipeline.Session, recipe);
+if (!display.Show(capture))
+    throw new InvalidOperationException("显示输入不符合基础契约");
+viewer.Present(display); // 此时原结果/原ROI已经清除。
+
+InspectionResult result = await submitted.Result!;
+bool matched = display.TryAttach(result);
+viewer.Present(display); // matched=false时不把旧结果画到当前图。
+```
+
+owner、pipeline、recipe、capture与submitted来自完整示例的初始化/Accepted分支，这段不是独立采集程序。CaptureResult及InspectionResult仍是普通应用record，元数据核对不是像素哈希、设备真实性或鉴权证明。
+
+TryAttach匹配完整请求、FrameStamp、CameraEpoch、原触发、流水线代和完整配方；Completed必须有一致ROI/计数与有限均值且无ErrorCode，Failed不得带成功测量。中间状态不绘制，冲突终态不覆盖原终态。
+
+显示器不负责采集新鲜度、镜头标定或业务发布。Show只是换图，不宣称图来自此刻的真实曝光；这也是离线浏览器与现场采集控制必须分开的原因。
+
+## 8. await后的UI更新与结果确认
+
+按钮事件在UI线程调用ProcessCurrentAsync，await结果后回到WPF上下文，再VerifyAccess更新显示；工作器的400ms等待使用ConfigureAwait(false)，不占用UI线程。
+
+```csharp
+InspectionResult result = await submitted.Result!;
+Dispatcher.VerifyAccess();
+if (!closing)
+{
+    bool attached = display.TryAttach(result);
+    // attached=false也要按原请求交代结果，不能标成当前帧处理失败。
+    viewer.Present(display);
+}
+if (!pipeline.Acknowledge(result))
+    throw new InvalidOperationException("原结果收据交接失败");
+```
+
+这里确认仅表示本地演示已消费/报告结果，不是数据库提交或PLC匹配应答。关闭中不再更新图像，但仍等待已接收任务并处理其本地收据。异常会停止新处理，不隐藏重试或重拍。
+
+这个窗口最多一个在途处理Task、一个当前显示图/结果快照，不建历史图片List，也不每帧投一个Dispatcher.BeginInvoke。连续采集的最新槽与刷新节流是另一层，当前没有实现连续UI预览循环。
+
+## 9. 为什么Closing要先Cancel一次
+
+普通Closing事件不是自动等待异步资源退出。这里第一次设置e.Cancel=true，标记closing并禁用按钮，Complete停止新接收；随后await当前处理Task和pipeline.Completion，再释放源、清显示、允许第二次真正Close。
+
+重复关闭不会启动第二个排空过程；没有在UI线程调用Wait或Result。FrameDisplayState.Clear不能代替流水线Complete，离线源Dispose也不能代替等待工作器不再使用其自有图像。
+
+本例后台函数最终会返回，因此可以正常排空。没有硬关闭期限或强制取消；真实SDK/原生算法长期不返回时，需要按具体库设计中断/进程隔离。不能先释放它正在用的资源再说“窗口已关闭”。
+
+## 10. 自动检查到底做了什么
+
+54项核心检查覆盖：Uniform布局、两种留白、缩小、半像素中心、ROI边缘、非法点击，以及错工件/帧会话/设备代/触发/配方、清空、迟到、失败和冲突终态。一项补充回归包含全部48个源像素中心的往返选取。
+
+22项WPF检查在STA Dispatcher运行：验证BitmapSource字节、Freeze后的跨线程读取和await InvokeAsync；RenderTargetBitmap检查实际亮块、青色ROI与切帧后旧框消失；程序触发真实XAML按钮的处理/切帧/清空和Closing事件，确认迟到结果隔离及排空。
+
+已查看生成的匹配/切帧图与完整窗口内容渲染，核对布局与显示结果。但没有显示可交互桌面窗口，也没有人工鼠标/键盘、多DPI、多屏、长期内存、现场采集或产品算法验收。
+
+## 11. 手动复查建议
+
+1. 打开窗口，第一帧不应有ROI或上一件测量值。
+2. 处理当前帧，等待后应显示均值220与预设ROI；这不是产品OK。
+3. 切下一帧，旧框/旧值立即消失；处理后反相图均值应为35。
+4. 提交处理后立刻切帧或清空，旧结果返回后不应叠到新图/空画面。
+5. 调整窗口宽高，点击留白不产生像素；图像点击返回正确列行和源灰度。
+6. 处理中关闭窗口，应先停止新操作、排空，再退出，不遗留工作器。
+
+这些是提供给读者的人工步骤，不冒充已完成的人工验收。第8步通用教学主线已交付；真实相机、实际标定、性能与现场仍未完成。下一阶段进入HALCON的图像/区域/轮廓、元组/句柄和C#资源生命周期，不在这里添加空的HALCON窗口。

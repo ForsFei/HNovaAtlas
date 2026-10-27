@@ -1,0 +1,140 @@
+---
+id: industrial-opencvsharp-mat-foundations
+title: OpenCvSharp基础：Mat、像素类型、stride与ROI所有权
+description: 从图像矩阵理解Rows/Cols、深度/通道、BGR、连续性和行步长，区分C#引用、ROI共享与Clone，并说明外部缓冲与原生资源的生命周期。
+tags: [工业自动化, C#, OpenCvSharp, Mat, 机器视觉]
+difficulty: beginner
+status: published
+updated: "2026-10-23"
+order: 0
+prerequisite: [industrial-vision-imaging-foundations, industrial-csharp-halcon-wpf]
+related: [industrial-csharp-opencvsharp-mat, industrial-csharp-mono8-buffer-lifetime]
+---
+
+## 第10步从图像容器开始
+
+HALCON基础教学已覆盖分割、匹配、测量和WPF桥接。现在进入OpenCvSharp：先把图像是什么、占多少字节、谁拥有内存讲清楚，再分批做处理、检测和显示。不把HALCON的对象元组或domain概念直接套到Mat上。
+
+本批固定OpenCvSharp4与OpenCvSharp4.runtime.win均为4.13.0.20260627，独立.NET10/x64示例，原生实际报告OpenCV 4.13.0。20项托管布局检查、26项真实原生Mat检查通过；没有相机、检测质量或长期内存验收。[固定托管包](https://www.nuget.org/packages/OpenCvSharp4/4.13.0.20260627)、[固定Windows原生包](https://www.nuget.org/packages/OpenCvSharp4.runtime.win/4.13.0.20260627)
+
+## 1. OpenCV、OpenCvSharp与原生运行库
+
+OpenCV提供原生视觉库，OpenCvSharp提供.NET包装。C#程序里写Cv2.ImRead，并不意味着读图完全由托管代码实现；运行还需要对应平台的原生绑定和依赖。
+
+本例只新增项目局部NuGet依赖，不改现有HALCON包、系统PATH或注册表，不安装系统级运行组件。两种库的环境与验收独立：OpenCV能运行，不代表HALCON原生也已就绪。[项目说明](https://github.com/shimat/opencvsharp)
+
+## 2. Mat不是一个托管byte数组
+
+Mat是多维稠密数组的包装，视觉入门主要使用二维图像。它包含尺寸、类型、步长等描述以及像素数据的访问关系；像素通常位于原生内存。一个Mat变量不等于一块永远独占的像素存储。[OpenCV图像容器教程](https://docs.opencv.org/4.13.0/d6/d6d/tutorial_mat_the_basic_image_container.html)
+
+```csharp
+using Mat empty = new();
+using Mat black = new(6, 8, MatType.CV_8UC1, Scalar.All(0));
+```
+
+empty没有有效图像数据；black是6行8列的黑图，二者不同。只指定尺寸/类型而不初始化像素时，也不能假定内容全为0；需明确填充或完整写入后再使用。
+
+Mat实现IDisposable，应为自己拥有的包装确定释放范围。GC是否回收托管包装、原生存储何时归还、是否还有其他视图引用它，是不同层次的问题。
+
+## 3. Rows、Cols与坐标参数
+
+| 项目 | 含义 | 本例 |
+| --- | --- | --- |
+| Rows / Height | 行数/高度 | 6 |
+| Cols / Width | 列数/宽度 | 8 |
+| At或Set的索引 | row, column | At&lt;byte&gt;(1,1) |
+| Point | x, y，即column,row | Point(1,1) |
+| Rect | x,y,width,height | Rect(1,1,2,2) |
+
+构造Mat(6,8,…)先行后列；Size(8,6)先宽后高。正方形图可能掩盖写反，本批特意使用非正方形8×6夹具。
+
+Rect(1,1,2,2)覆盖x=1、2与y=1、2，右下边界按不包含端点理解。它不是HALCON Rectangle1的两对包含端点坐标；不要把同一组四个数字直接互传。
+
+## 4. 深度、通道和类型
+
+| 类型 | 每通道表示 | 通道数 | 每像素字节 |
+| --- | --- | --- | --- |
+| CV_8UC1 | 无符号8位 | 1 | 1 |
+| CV_8UC3 | 无符号8位 | 3 | 3 |
+| CV_8UC4 | 无符号8位 | 4 | 4 |
+| CV_16UC1 | 无符号16位 | 1 | 2 |
+| CV_32FC1 | 32位浮点 | 1 | 4 |
+
+8U/16U/32F描述每通道数值类型，C1/C3描述每像素通道数。灰度不等于8位，三通道也不自动意味着RGB；类型没有保存“来自哪台相机、采用哪种颜色语义”的全部信息。
+
+Type()返回组合类型，Channels()返回通道数；ElemSize()是每像素总字节，ElemSize1()是每通道字节。二维Mat的Total()计像素元素数量，不额外乘通道数。1×1 CV_8UC3的Total=1、ElemSize=3。[固定版本Mat接口源码](https://github.com/shimat/opencvsharp/blob/4.13.0.20260627/src/OpenCvSharp/Modules/core/Mat/Mat.cs)
+
+## 5. BGR、RGB和灰度转换
+
+常规OpenCV彩色解码通常采用BGR顺序。本例Scalar(10,20,30)写入CV_8UC3后，以Vec3b读取，三个分量对应本例B=10、G=20、R=30。接入相机RGB/Bayer或神经网络RGB时，必须依据来源约定转换，不能只看三通道就猜颜色顺序。
+
+Cv2.CvtColor指定BGR2GRAY才是在做颜色转换；高位深灰度的数值缩放则是另一件事。ConvertTo改变数值深度/比例，不代替BGR↔RGB的通道重排，也不把三通道自动变一通道。
+
+本批实际验证BGR(10,20,30)转8位灰度得到22；这只是该已知输入的颜色转换结果，不是相机响应/颜色标定证据。
+
+## 6. 16位图转8位为什么会全白
+
+16位灰度值1000超出8位0..255范围。直接ConvertTo到CV_8U会发生相应数值转换/饱和，不会自动理解为“1000是这个工件的正常亮度，所以显示在中间”。
+
+本例实测1000不带缩放转8位得到255；alpha=0.1时得到100。这个比例只是教学算术，不是12位或16位相机通用曝光/显示配方。
+
+真实场景应明确有效位数、黑电平、显示窗口和处理所需动态范围。为了预览做的归一化图，也不应无说明地替换用于测量的原始图。后续处理章节再展开归一化、阈值及噪声影响。
+
+## 7. Step与连续性
+
+二维图像按行组织时，Step()表示相邻两行起始位置的字节距离。每行有效像素字节是Cols×ElemSize()，两者可能相同，也可能因ROI或外部缓冲填充不同。
+
+以正步长Mono8为例，访问位置可理解为：
+
+```text
+当前行起点 = Data + row × Step
+像素地址 = 当前行起点 + column
+```
+
+三通道8位要把column偏移乘3；16位单通道要乘2。不能把这个Mono8公式不加区分地复用到所有类型。
+
+IsContinuous()用于判断有效数据是否连续。窄ROI常保留父图行距，因而多行之间夹着不属于ROI的父图像素；也有一行ROI或整行ROI仍连续，不能简单规定“所有ROI都不连续”。[Mat布局与连续性](https://docs.opencv.org/4.13.0/d3/d63/classcv_1_1Mat.html)
+
+本例父图每行8字节，2×2 ROI每行只需2字节，Step仍为8。直接从ROI.Data连续拷4字节可能跨进父图的其他列；本批实际逐行Ptr(row)拷贝，得到四个220。
+
+## 8. 引用、视图与深复制
+
+| C#操作 | 包装对象 | 像素关系 |
+| --- | --- | --- |
+| Mat b = a | 同一个C#对象引用 | 没有建立新所有者 |
+| new Mat(a, rect) | 新ROI包装/头部 | 共享父图底层存储 |
+| a.Clone() | 新包装 | 深复制到独立存储 |
+| a.CopyTo(dst) | 写入目标 | 要看目标是否已与源共享，不宜一概而论 |
+
+尤其注意C++的cv::Mat赋值说明不能直接照搬为C#赋值：Mat b=a在C#中只是引用别名。给a、b各写一个using不等于建立两份独立图像，释放一个后不能假定另一个还能使用。
+
+本批实际将ROI首像素改成42，父图对应像素随之改变，而此前Clone保留220。CopyTo测试使用空目标，验证本例得到独立数据；没有声称所有别名/重叠目标的CopyTo都自动安全。
+
+ROI局部坐标从自身(0,0)开始。要回到原图，需要加Rect的x/y偏移；ROI不是原图上的定义域限制。后续轮廓/测量结果应保留这个坐标来源。
+
+## 9. 父图释放、外部缓冲与线程
+
+对OpenCV自己分配、由其引用计数管理的数据，本批实际验证了保留ROI包装后释放父Mat头部，ROI仍可读。它不意味着所有图像指针都自动安全。
+
+如果Mat仅包装相机SDK或用户分配的缓冲，外部所有者可能已归还、复用或释放内存，Mat头部仍在也无法阻止。只有地址、尺寸和Step都正确，仍不足以证明这块外部缓冲此刻有效；需要来源契约和借用期限。本例没有直接包装相机指针。
+
+引用计数也不解决并发写入。后台与UI共享一张可写Mat时，即使没有Dispose，也可能读到正在变化的内容。先明确单一所有者、不可变借用或复制边界，再做性能优化。
+
+## 10. 读图、编码和错误结果
+
+ImRead是文件解码，ImDecode是内存压缩格式解码；它们的输入不是同一种原始像素缓冲。ImEncode得到PNG/JPEG等编码字节，不等于Mat.Data的原始行数据。ImWrite用于文件编码保存，本批只作接口导读，不写文件。[图像编解码参考](https://docs.opencv.org/4.13.0/d4/da8/group__imgcodecs.html)
+
+解码后应检查Empty、尺寸和类型，不把new Mat包装存在当作读图成功。生产图像还应限制来源和资源开销，不能把本例已知小夹具读取当任意外部文件安全解码器。
+
+本批真实验证PGM读取与PNG内存编码/解码往返，没有JPEG有损对照、文件写入、相机读取、WPF显示或检测算法。OpenCV环境失败仍应明确报错，不用托管样本冒充原生结果。
+
+## 11. 复习与面试追问
+
+1. Mat b=a后释放a，b为什么不能当独立图使用？二者是同一个C#包装对象。
+2. 为什么ROI的Step可能大于每行有效字节？它保留父图行距，并没有自动重新打包。
+3. CV_8UC3的Total是不是像素数乘3？不是，通道与元素数量分开。
+4. ConvertTo能否把BGR图变RGB？不能用它代替颜色转换/通道重排。
+5. ROI释放父图后可读，是否说明相机缓冲也安全？不是，两种存储所有权不同。
+6. PNG字节能直接当Mono8传给Mat吗？不能，编码文件字节与原始像素布局不同。
+
+接着读[C# Mat创建、读回、ROI复制与释放](/knowledge/industrial/host-computer/opencvsharp/csharp-mat-creation-pixel-access-roi-and-lifetime/)。继续学习[滤波、阈值与形态学](/knowledge/industrial/host-computer/opencvsharp/smoothing-thresholds-and-morphology/)，不增加交互实验控件。

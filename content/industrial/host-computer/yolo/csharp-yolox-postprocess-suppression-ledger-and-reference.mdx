@@ -1,0 +1,182 @@
+---
+id: industrial-csharp-yolox-postprocessing
+title: C#实践：YOLOX解码、NMS抑制记录与完整参考对照
+description: 沿用固定ONNX项目实现三尺度grid解码、单类别乘积分数、跨类加1 NMS和r=1源图裁剪，新增66项手写与12项真实CPU检查，并对照完整NumPy后处理结果。
+tags: [工业自动化, C#, YOLOX, NMS, 检测后处理]
+difficulty: intermediate
+status: published
+updated: "2026-10-27"
+order: 70
+prerequisite: [industrial-yolox-postprocessing]
+related: [industrial-csharp-yolo-onnx-session, industrial-csharp-yolo-evaluation]
+---
+
+## 运行与文件
+
+沿用examples/industrial-yolo-onnx/及固定ONNX Runtime1.27.0/模型，不增加依赖或下载。新增YoloXPostprocessor.cs、PostprocessChecks.cs、PostprocessReference.cs和reference_postprocess.py，Program.cs增加独立入口：
+
+```powershell
+dotnet restore examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj --locked-mode
+dotnet build examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-restore
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --postprocess-test
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --postprocess-native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --postprocess-demo examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+Release零警告零错误，新增66项手写后处理检查、12项实际CPU后处理检查通过。原有self-test/native-test保留其各自范围，新入口不覆盖旧命令。
+
+成功退出0，托管检查失败1，用法错误2，真实模型/参考入口失败3；没有原生失败回退、自动联网补模型或手填检测替身。没有下载过模型的环境先按[第三批命令](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)显式取得固定产物。
+
+## 1. 常用对象、属性与方法
+
+| 对象 | 主要成员 | 用途 |
+| --- | --- | --- |
+| PostprocessSettings | ScoreThreshold、NmsThreshold | 默认0.1/0.45，两个语义分开 |
+| YoloXPostprocessor | GridAt(row)、Process(raw,input,settings) | 网格映射及实际输出后处理 |
+| YoloXPostprocessor | ProcessValues(span,sourceHeight,settings) | 明确手写/离线原始数组检查入口 |
+| DecodedYoloXRow | RowIndex、Grid、NetworkBox、Objectness、ClassId、ClassProbability、Score | 解码与选择证据 |
+| PostprocessReport | Rows、Candidates、Detections、Suppressions、Filtered、Visible | 阶段快照与数量核对 |
+| YoloXSuppression | RowIndex、KeptRowIndex、Overlap | 谁被哪个保留框抑制 |
+| YoloXDetection | Candidate、Source | NMS保留候选及源图映射 |
+| NoResizeSourceBox | Original、WasClipped | 可空源图框与裁剪标记 |
+| YoloXPostprocessor | UpstreamInclusiveNmsIou、ClipNoResize | 明确+1 NMS口径与r=1裁剪 |
+| PostprocessReference | CompareFile(report,inputSha,path) | 完整JSON数值/顺序参考对照 |
+
+这些是本项目自有教学类型，不是ONNX Runtime包自带的YOLO解析器。行为按固定[上游解码/NMS参考](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/yolox/utils/demo_utils.py)核对，并明确本地稳定并列、double NMS与裁剪等策略。
+
+## 2. 串起实际模型与后处理
+
+```csharp
+using YoloXNanoSession session = new(modelPath);
+YoloXInput input = YoloXInput.PrepareNoResize(YoloXInput.CreateFixture());
+YoloXRawOutput raw = session.Run(input);
+PostprocessSettings settings = new(ScoreThreshold: .01f, NmsThreshold: .45);
+PostprocessReport report = YoloXPostprocessor.Process(raw, input, settings);
+```
+
+0.01仅让自有渐变夹具产生非空数值案例，不是推荐现场参数。默认0.1时这张图没有候选，同样是合法报告；运行失败与空结果不能混淆。
+
+调用者负责保持raw与input属于同一次图像意图。当前类型没有物理帧/工件身份，传同模型的另一次结果和错误SourceHeight也不会自动被认证；后续WPF/流水线需要另外保留关联，不能以尺寸相同代替同帧。
+
+## 3. 先检查边界，再遍历每行
+
+ProcessValues限定3549×85个float，SourceHeight1..416；分数和NMS阈值均有限且在0..1。每行所有值先检查有限，概率列必须0..1，再做解码，不把NaN或错误logit悄悄按低分过滤。
+
+解码框要求端点有序、正面积、可表示且坐标绝对值不超过1,000,000。指数溢出/下溢、宽高变零或运算后退化明确失败。这是教学算术边界，不是训练模型的标准坐标范围。
+
+原始行数固定使候选最多3549个；本例没有暗中TopK、截断最大目标数或后处理时间限制。保留全部行用于解释会创建托管对象，最坏情况下NMS比较数量仍可接近平方级，不声称这是优化过的高帧率实现。
+
+## 4. GridAt和float32解码
+
+GridAt先按行索引选定52/26/13网格，再减层起点。核心计算：
+
+```csharp
+float cx = (values[0] + grid.X) * grid.Stride;
+float cy = (values[1] + grid.Y) * grid.Stride;
+float width = MathF.Exp(values[2]) * grid.Stride;
+float height = MathF.Exp(values[3]) * grid.Stride;
+Box box = new(cx - width / 2f, cy - height / 2f,
+              cx + width / 2f, cy + height / 2f);
+```
+
+MathF.Exp与float表达式保留模型这一阶段的float32数值路径，再装入Box的double字段。不要把raw前四项直接当Box，也不对所有YOLO导出重复执行此公式。
+
+检查覆盖行0/53/2703/2704/3379/3380/3548等跨层边界，并用行53独立黄金框(4,0,20,24)核对。只看最后数量是3549不能证明网格顺序正确。
+
+## 5. 类别选择、乘积与严格阈值
+
+```csharp
+float score = -1;
+int bestClass = 0;
+for (int classId = 0; classId < 80; classId++)
+{
+    float product = values[4] * values[5 + classId];
+    if (product > score) { score = product; bestClass = classId; }
+}
+```
+
+只在严格更大时更新，因此相等取第一个类别；Objectness、ClassProbability和最终Score分别保留。不重复sigmoid，不把最大类别概率或objectness单独当最终分数。
+
+Candidates按Score>ScoreThreshold从Rows筛选，保留原始行顺序；Detections是NMS处理后的分数顺序，二者的索引位置不同，所以要保留RowIndex，不能拿列表位置当原始候选号或工件号。
+
+本批每个原始行最多一个类别，class-agnostic NMS还可能跨类抑制；多标签/按类NMS需要另一套明确策略，不是改个显示标签就得到。
+
+## 6. 抑制记录怎样产生
+
+按Score降序、RowIndex升序处理候选，与已保留项比较：
+
+```csharp
+double overlap = UpstreamInclusiveNmsIou(candidate.NetworkBox, earlier.NetworkBox);
+if (overlap > settings.NmsThreshold)
+{
+    rejection = new(candidate.RowIndex, earlier.RowIndex, overlap);
+    break;
+}
+```
+
+遇到第一个足以抑制的保留框就记录，不搜索“最像真值”的框；没有真值参与。Suppression保留两个行号与重叠率，方便解释为什么高于分数阈值的候选仍没进最终列表。
+
+UpstreamInclusiveNmsIou单独实现+1面积公式，不调用第一批连续面积BoxMath.IoU。两者在触边小框上分别为1/3与0，已有独立检查。这里只是所选路线的命名策略，不把“加1”偷偷推广到所有面积/宽度计算。
+
+候选同分优先小行号，NMS几何使用double，这是本例显式数值策略；与NumPy参考也统一这些条件。不宣称它与上游默认排序或float32几何在所有临界值上位级一致。
+
+## 7. NMS后才做源图裁剪
+
+```csharp
+YoloXDetection[] detections = kept.Select(row =>
+    new YoloXDetection(row, ClipNoResize(row.NetworkBox, sourceHeight))).ToArray();
+```
+
+ClipNoResize只处理当前r=1适配，求交边界是0..416和0..SourceHeight。没有居中padding、缩放或ROI偏移，因此这一步不是一般Letterbox逆变换。
+
+与内容无正面积交集返回Original=null；部分交集返回裁剪框并标记WasClipped。原NMS保留项仍记录在Detections，Visible才是具有可显示源图框的数量。
+
+示例：(-10,200,20,220)在高208的源图上变为(0,200,20,208)，裁剪标记true；(0,208,10,220)仅碰边，没有源图框。极小源图面积下溢也会失败，不制造零面积结果。
+
+以下数量关系在本例成立：
+
+```text
+Rows.Count = Filtered + Candidates.Count
+Candidates.Count = Detections.Count + Suppressions.Count
+Visible <= Detections.Count
+```
+
+不要用Visible代替工件数量，重叠目标/错误候选和业务判定尚未解决。
+
+## 8. 完整NumPy参考怎样运行
+
+先取得第三批reference_yolox_nano.py生成的raw参考文件，再运行下面命令。输出JSON必须是新文件，已有则拒绝覆盖；重复生成换一个未使用路径，不替用户覆盖旧证据。
+
+```powershell
+python examples/industrial-yolo-onnx/reference_postprocess.py examples/industrial-yolo-onnx/.local/reference-python127.f32 examples/industrial-yolo-onnx/.local/postprocess-python-v1.json
+dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c Release --no-build -- --compare-postprocess examples/industrial-yolo-onnx/.local/yolox_nano.onnx examples/industrial-yolo-onnx/.local/postprocess-python-v1.json
+```
+
+脚本只使用已有NumPy，不安装包、不联网。它独立实现同一解码/乘积、稳定并列、double +1 NMS和r=1裁剪；原始输入由第三批已验证模型和夹具提供，不是另外造一组模型预测。
+
+CompareFile限定JSON大小2MiB、深度16，拒绝缺失构造参数和未知属性，再核对模型/输入哈希、SourceHeight、阈值。逐项比较全部3549行xyxy/类别/分数、候选行号、保留顺序、源图框与裁剪标记。参考里的来源字段用于记录，不是可信签名或现场质量证明。
+
+坐标容忍为absError≤1e-4+2e-5×abs(reference)，分数容忍≤1e-5+1e-4×abs(reference)；类别与候选/保留行号必须一致。本机最大坐标差6.10351562E-05像素，不把float数值差误报成模型定位精度。
+
+## 9. 实际demo结果
+
+```text
+Rows=3549 Filtered=3513 Candidates=36 Suppressed=33 Kept=3 Visible=3
+row=3453 classId=25 score=0.0733450353
+row=3436 classId=33 score=0.0504781045
+row=3041 classId=33 score=0.016533196
+NumPy comparison: rows=3549,candidates=36,kept=3
+maxCoordinateError=6.10351562E-05
+```
+
+第一项源图框约(76.6601,4.1368,415.7808,207.9835)，三项均不需裁剪。这里没有真实目标标注，这些框只是渐变输入的网络响应；demo打印ClassId，不把它们命名为工业缺陷或输出OK/NG。
+
+## 10. 生命周期、检查范围与下一批
+
+处理不改写YoloXRawOutput或YoloXInput；返回的Rows/Candidates/Detections/Suppressions为分离只读集合、元素为不可变记录。检查在会话Dispose后仍可读取托管检测结果。没有返回原生Span或增加需要Dispose的新资源，但长期保留这些报告仍会占内存。
+
+调用方不能在ProcessValues读取时并发改原始数组。当前也没有真实帧关联、有界后台队列或关闭硬期限，不能把这个同步方法直接当完整连续采集服务。
+
+66项手写检查不执行模型，验证解码/排序/抑制/裁剪与错误值；12项真实CPU检查运行既有固定模型，验证默认空结果、低阈值36候选/33抑制/3保留、输入和原始结果未改写、源图范围和释放后快照。全量NumPy比较另外记录，不把数组元素数当测试案例数。
+
+下一批加入一般图片读取、模型专属缩放填充与参考对照，再接WPF显示。真实标注/质量、相机/工件、GPU与长期性能仍未验收。

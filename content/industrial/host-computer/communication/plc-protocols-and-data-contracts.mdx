@@ -1,0 +1,114 @@
+---
+id: industrial-plc-protocols-data-contracts
+title: PLC 通信入门：S7、三菱 MC、Modbus 与 OPC UA 的接入选择
+description: 区分 PLC 型号、协议、数据区与 C# 库，整理 S7/MC/Modbus/OPC UA 的地址与前置条件，建立读写权限、数据有效性和命令握手契约。
+tags: [工业自动化, PLC, C#, S7, 三菱MC, OPC UA]
+difficulty: beginner
+status: published
+updated: "2026-10-19"
+order: 90
+prerequisite: [industrial-communication-data-contracts, industrial-modbus-addresses-functions-frames]
+related: [industrial-s7netplus-db-read-write, industrial-modbus-value-decoding-wpf-monitor, industrial-host-computer-chapter-map]
+---
+
+## PLC 通信不是再学一种 TcpClient
+
+之前已经学过串口、TCP/UDP 与 Modbus。进入 PLC 时，不是把 IP 换成控制器地址就结束，而要先确认：**这台 CPU 或通信模块对外提供什么服务，允许访问哪些数据，用哪种寻址和权限**。
+
+PLC 是设备类别，S7、MC/SLMP、Modbus、OPC UA 是不同协议或服务体系；同一台控制器可能支持多种方式，也可能需要特定模块、固件、工程配置或授权。C# 库只是接入其中一条路径，不能凭品牌名替你决定全部条件。
+
+本专题分步推进：本轮先整理接入条件，并完成 [S7.NET+ 的对象与本机读写](/knowledge/industrial/host-computer/communication/csharp-s7netplus-db-read-write/)；后续单独交付 OPC UA 的安全连接/读写/订阅，以及三菱 MC/SLMP。这里不会把尚未实现的协议标为完成。
+
+## 四条常见接入路线
+
+| 路线 | 主要访问模型 | C# 入口 | 接入前核对 |
+| --- | --- | --- | --- |
+| 西门子经典 S7 数据访问 | 数据区、DB、字节/位偏移和类型 | 本课程使用 S7.NET+ 的 `Plc` | CPU/固件、机架槽位、访问权限、可用 DB 布局 |
+| 三菱 MC / SLMP | 软元件类型与编号、帧型、数据编码 | 对应协议库或经验证的实现；具体库在专题固定 | CPU/模块支持、3E/4E等帧型、Binary/ASCII、网络/站号与端口 |
+| Modbus RTU/TCP | 四区、功能码、偏移与寄存器 | 已交付 NModbus | 是否支持、Unit ID、点表、字/字节顺序与权限 |
+| OPC UA | 节点、属性、服务与订阅 | OPC Foundation .NET SDK 作为计划主线 | Server 可用性、端点/安全策略、证书、用户身份及节点授权 |
+
+S7.NET+ 是特定 S7 访问路径，不是 TIA Portal，也不等于 Siemens 官方工程 SDK。[S7.NET+ 项目](https://github.com/S7NetPlus/s7netplus)
+
+MC 与 SLMP 有相关帧格式和适用设备范围，不能把“SLMP”“MC”“有三菱网口”三个词直接当成全部兼容。帧型与 Binary/ASCII 选错，即使 TCP 连接成功也无法正常读写。[三菱 SLMP 官方参考手册](https://www.mitsubishielectric.com/dl/fa/document/manual/plc/sh080956eng/sh080956engl.pdf)
+
+OPC UA 不只是“另一种寄存器读取”：节点同时带类型、访问属性，读到的 DataValue 还包括状态码和时间戳，订阅有自己的生命周期。[OPC Foundation DataValue 定义](https://reference.opcfoundation.org/specs/OPC-10000-4/7.11)
+
+## 不要在地址记号之间直接替换
+
+| 地址示例 | 表达什么 | 不能据此推断什么 |
+| --- | --- | --- |
+| `DB1.DBX14.1` | S7 DB1 的第14字节、bit1 | 不是 Modbus 第14号线圈 |
+| `DB1.DBW12` | S7 DB1 从字节12起的2字节宽度 | 不自动声明它是 INT、WORD 或目标温度 |
+| `D100` | 三菱某类软元件及编号 | 不能直接转成 S7 字节偏移100或 Modbus 地址100 |
+| `40001` | 可能是传统 Modbus 保持寄存器首点参考号 | 不一定应直接传40001，也不是所有手册统一约定 |
+| `ns=2;s=Station.Temperature` | 一种 OPC UA NodeId 文本表达 | NamespaceIndex 2 不保证跨服务器/重启永远不变 |
+
+三菱的软元件编号进制可能因类型、型号和工具表示而不同，不把所有 D/X/Y/W 编号一律按十进制解释。OPC UA 应结合服务器命名空间表理解节点，后续会用 Namespace URI 与固定标识来整理数据契约，而不是把界面显示名当永久地址。
+
+S7 普通字节偏移、PLC 符号变量名、OPC UA BrowseName 和界面中文标签也是不同概念。设计点位表时分别保存，避免后续用一个 string 混装全部含义。
+
+## 连通之前先做一张核对表
+
+至少向 PLC 工程或设备资料确认以下信息：
+
+1. CPU/通信模块的完整型号、固件和工程版本，服务是否真实可用。
+2. IP、子网、网卡/路由、协议端口以及允许访问的网络范围。
+3. 协议所需参数：S7 rack/slot 或 TSAP，MC 帧型与路由字段，Modbus Unit ID，UA endpoint/安全策略等。
+4. 专用通信区、结构布局、类型、单位、读写权限与无效值。
+5. 写入条件、谁拥有该字段，以及请求接受/完成/失败的反馈方式。
+6. 测试窗口、停止条件、原值记录和现场负责人；本课程例子只在本机运行。
+
+S7 常见传统绝对地址访问还涉及 CPU 访问控制与 DB 布局，优化 DB 不应被当成随时稳定的公开字节数组。是否需要允许对应 PUT/GET 访问，要按具体 CPU/固件与工程路径核对，由授权工程人员评估；不要为了连通而关闭全部保护或随意改运行中的 DB。[Siemens：GET/PUT 与访问限制](https://docs.tia.siemens.cloud/r/simatic_s7_1200_manual_collection_enus_20/communication/s7-communication/get-and-put-read-and-write-from-a-remote-cpu)
+
+OPC UA 则要区分应用证书信任与用户身份/节点权限。不能通过“自动接受所有证书”把连接问题隐藏起来，也不能假定支持 UA 的 CPU 已启用所有节点、写权限和所需授权。具体安全连接会在对应专题固定 SDK 版本后实现。
+
+## C# 对象生命周期仍然重要
+
+虽然对象名不同，主线仍然是：
+
+```text
+固定协议与点位 → 创建连接/会话对象 → 建立并验证
+             → 读取或受约束写入 → 检查响应与业务状态
+             → 停止新请求 → 等在途任务结束 → 关闭与释放
+```
+
+但不能把库的行为想象成完全一样：
+
+- NModbus 的固定版本 Async 包装与取消方式，已经在前文单独说明。
+- S7.NET+ 本轮使用带令牌的所选异步 API，按实际目标框架资产核对，不照抄旧例子的返回错误码。
+- OPC UA 有 Session、Subscription、MonitoredItem 等不同层级，后续需要分别创建、恢复和释放。
+- 厂商 SDK 还可能依赖本地 DLL、进程位数、许可、错误码和句柄；new 一个 C# 包装对象不表示初始化成功。
+
+同一个设备连接不应被多个定时器和按钮同时随意读写。先建立单一所有者，再考虑合并读取、有界队列、刷新频率和恢复规则。
+
+## PLC 扫描、通信和 UI 刷新不是同一个周期
+
+PLC 程序可能在自己的周期内更新状态，通信模块按另一种节奏响应，PC 再以更慢的速度轮询和刷新界面。一个只持续一次扫描的脉冲，完全可能被 PC 漏读。
+
+因此需要可靠交接时，应使用设备保持的状态、计数/请求编号或明确握手，而不是要求 UI 恰好在某个瞬间看见一个 bool。一次批量读也不自动等于设备程序同一时刻的原子快照。
+
+读数至少记录值、类型/单位、质量/有效性和时间。经典 S7 原始字节本身不自带 OPC UA 那样的 DataValue 语义，需要应用自己补齐来源、时间和失效处理。
+
+## 命令请求、接受和完成要分开
+
+为动作建立通信区时，可以先讨论以下职责，而不是直接写一个输出位：
+
+| 字段职责 | 典型写入者 | 意义 |
+| --- | --- | --- |
+| RequestId / 参数 / 请求有效标志 | PC | 提交某次业务请求 |
+| AcceptedId / 拒绝原因 | PLC | 说明是否接受这次请求 |
+| Busy / CompletedId / Result / Fault | PLC | 说明执行中、完成或失败 |
+| 确认/复位规则 | 按契约分工 | 何时允许清状态、再发下一次请求 |
+
+这只是讨论模板，不是某个 PLC 必须采用的标准结构。最终需定义字段更新顺序、参数版本、去重、超时、断线恢复和重启后的请求编号规则。
+
+写入返回、读回一致、PLC 接受和机械动作完成是不同证据。网络超时之后结果可能未知，不能靠自动重写启动位来“保证成功”。不要对 PLC 正在维护的状态字做 PC 端读改写，覆盖其他字段或竞争扫描逻辑。
+
+## 本轮交付与后续
+
+本轮的 [S7.NET+ 示例](/knowledge/industrial/host-computer/communication/csharp-s7netplus-db-read-write/)使用本机 Snap7 服务端，完成连接、DB 原始/类型/多变量读取、目标/位写入和关闭。只注册测试 DB，不模拟现场输出、扫描程序、安全状态或 Siemens 权限配置。
+
+OPC UA 已补[节点、质量、时间戳与证书](/knowledge/industrial/host-computer/communication/opcua-nodes-quality-and-security/)和 [C# 安全连接、读写与订阅](/knowledge/industrial/host-computer/communication/opcua-csharp-secure-read-write-subscribe/)。MC/SLMP 已补[设备地址与3E报文](/knowledge/industrial/host-computer/communication/mc-slmp-frames-and-device-addresses/)和 [C# McpX 字/位读写](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)，各自通过真实回环服务验证。动作交接继续读[握手与去重契约](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)和 [C#命令邮箱](/knowledge/industrial/host-computer/communication/csharp-command-mailbox-and-recovery/)。选定实机时，依据型号重新验证，不把本机测试写成“所有 PLC 都支持”。
+
+自测：为什么有网口不等于支持某个协议？为什么 DBW12 不能直接转成 D12？为什么 PLC 单扫描脉冲可能被 PC 漏掉？写入正常返回后，离动作完成还缺哪些证据？

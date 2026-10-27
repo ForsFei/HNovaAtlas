@@ -1,0 +1,231 @@
+---
+id: industrial-s7netplus-db-read-write
+title: C# S7.NET+ 入门：Plc 属性方法、DB 类型读写与关闭
+description: 固定 S7netplus 版本讲解 Plc 连接参数、异步读写、DB 字节/位地址与类型区别，用本机 Snap7 验证原始/类型/多变量读取、目标与位写入和取消关闭。
+tags: [工业自动化, PLC, C#, S7, S7.NET+, 西门子]
+difficulty: intermediate
+status: published
+updated: "2026-10-19"
+order: 100
+prerequisite: [industrial-plc-protocols-data-contracts]
+related: [industrial-modbus-value-decoding-wpf-monitor, industrial-tcp-session-heartbeat-recovery, industrial-host-computer-chapter-map]
+---
+
+## 本篇范围与复现基线
+
+本篇采用 S7netplus 0.20.0，C# 命名空间为 `S7.Net`，运行目标 .NET 10。这是固定复现版本，不保证以后仍是最新版本；不是把 NModbus 的 API 换个命名空间，也不依赖 TIA Portal 来完成本机测试。
+
+```xml
+<PackageReference Include="S7netplus" Version="0.20.0" />
+```
+
+配套项目位于 `examples/industrial-s7/`。客户端使用实际 NuGet 包，核对其记录的源码提交 `f1ae0ea084e712b59e414de6aaee7d196244a239`；本机对端采用该项目测试树中的 Snap7 服务端组件。[包版本](https://www.nuget.org/packages/S7netplus/0.20.0)、[固定源码](https://github.com/S7NetPlus/s7netplus/tree/f1ae0ea084e712b59e414de6aaee7d196244a239)
+
+**只读写自己启动的 127.0.0.1 测试服务，没有连接真实 PLC、修改工程、启用 PUT/GET 或关闭保护。** CPU 类型参数仅是演示配置，不能据此声称已经验收 S7-1200 实机。
+
+## 建立连接之前要准备什么
+
+`Plc` 至少需要 CPU 类型、IP、端口、rack、slot。传统 S7 数据访问常见端口是 102，但本机服务使用临时端口；rack/slot 要按硬件与访问路径确定，不能把一组数字复制到所有 CPU 或 CP 模块。
+
+```csharp
+using S7.Net;
+
+using var plc = new Plc(CpuType.S71200, "127.0.0.1", testPort, 0, 1)
+{
+    ReadTimeout = 1000,
+    WriteTimeout = 1000,
+};
+```
+
+构造对象还没建立通信。`CpuType` 也不是自动发现控制器型号的结果；这里 rack0/slot1 只用于自己的测试端点。实机前置条件见[PLC 接入核对表](/knowledge/industrial/host-computer/communication/plc-protocols-and-data-contracts/)。
+
+## Plc 常用属性
+
+| 成员 | 含义 | 注意 |
+| --- | --- | --- |
+| `IP` / `Port` | 配置的目标端点 | 不是设备身份认证 |
+| `CPU` | 构造时选择的 CpuType | 不代表已校验真实固件型号 |
+| `Rack` / `Slot` | 机架/槽位参数 | 按设备与路径核对，不是寄存器地址 |
+| `IsConnected` | 底层最近 I/O 相关连接状态 | 不保证下一次读写成功，也不是业务在线证明 |
+| `MaxPDUSize` | 会话协商的数据单元能力 | 不是一条 DB 的总大小，也不代表所有业务能一次读完 |
+| `ReadTimeout` / `WriteTimeout` | 同步读取/写入等待配置 | 不替代整批异步工作的总期限 |
+
+固定版本的连接状态仍存在“检查后网络立即变化”的窗口，所以读写本身必须处理异常，不采用 `if IsConnected 就一定成功` 的假设。[Plc 固定版本实现](https://github.com/S7NetPlus/s7netplus/blob/f1ae0ea084e712b59e414de6aaee7d196244a239/S7.Net/PLC.cs)
+
+## 常用方法：连接、读取、写入与关闭
+
+| 方法 | 用途 |
+| --- | --- |
+| `Open()` / `OpenAsync(token)` | 建立连接并完成协议建立过程，不只是创建 TcpClient |
+| `ReadBytes` / `ReadBytesAsync(area, db, start, count, token)` | 按字节偏移取原始数据，count 是字节数量 |
+| `Read` / `ReadAsync(address, token)` | 按地址字符串取值，返回 object?，要检查实际类型 |
+| `ReadAsync(area, db, start, VarType, count, ..., token)` | 显式指定解释类型；count 是该接口的变量数量 |
+| `ReadMultipleVarsAsync(items, token)` | 按 DataItem 列表读取多个描述项 |
+| `Write` / `WriteAsync(address, value, token)` | 按传入值的实际类型序列化写入 |
+| `WriteBytesAsync` | 写原始字节，调用方必须确保范围和数据契约 |
+| `WriteBitAsync` / 位地址 `WriteAsync` | 写指定 bit，不能当作业务动作握手 |
+| `Close()` / `Dispose()` | 关闭对象管理的连接；先等在途操作退出 |
+
+本篇只使用已编译并检查过的重载，不照抄其他分支/旧版本的返回错误码写法。部分 XML 文档还残留 LastErrorCode/LastErrorString 提示，不把它们当本例实际使用的接口。
+
+## 先固定一张 DB1 布局
+
+测试端注册一个64字节的 DB1，以下字段没有重叠：
+
+| 地址 | 字节范围 | 业务类型与初值 |
+| --- | --- | --- |
+| `DB1.DBX0.0` | byte0 的 bit0 | Ready=true |
+| `DB1.DBB1` | byte1 | BYTE 模式=2 |
+| `DB1.DBW2` | byte2～3 | INT=-123，单位0.1，得 -12.3 |
+| `DB1.DBD4` | byte4～7 | DINT=123456 |
+| `DB1.DBD8` | byte8～11 | REAL=25.5 |
+| `DB1.DBW12` | byte12～13 | INT 模拟目标=250 |
+| `DB1.DBX14.0` | byte14 的 bit0 | 模拟请求标志=false |
+| `DB1.DBX14.1` | byte14 的 bit1 | 无关标志=true，写 bit0 时应保留 |
+| `DB1.DBB16` 起 | byte16～25 | STRING[8]，含长度头与 ATLAS01 |
+
+`DBX14.1` 的14是字节偏移、1是字节内位号；`DBW12` 表示从字节12起两字节，不是“第12个 Word”，因此它占12和13，不是24和25。
+
+这种布局仅代表我们的通信契约。实机优化 DB、符号布局、结构对齐与工程修改可能使简单偏移不适用，不能假定所有 DB 都是稳定的公开字节数组。
+
+## 读取方式一：原始字节再解码
+
+```csharp
+byte[] bytes = await plc.ReadBytesAsync(
+    DataType.DataBlock, 1, 0, 26, token);
+DbSnapshot sample = S7Examples.Decode(bytes);
+```
+
+这里 DB=1、start=0、count=26。范围一次覆盖状态、数值和字符串，但不是 PLC 扫描周期的原子一致性承诺。
+
+Decode 在检查长度后调用库的类型辅助函数：
+
+```csharp
+short raw = S7.Net.Types.Int.FromByteArray(bytes.AsSpan(2, 2).ToArray());
+int count = S7.Net.Types.DInt.FromByteArray(bytes.AsSpan(4, 4).ToArray());
+float real = S7.Net.Types.Real.FromByteArray(bytes.AsSpan(8, 4).ToArray());
+decimal temperature = raw / 10m;
+```
+
+REAL 仍要检查 NaN/Infinity 等无效测量；本例 S7 STRING 则检查最大长度8、当前长度不超界及 ASCII 契约。STRING 的前两字节是长度头，不是正文，不能把整个区域直接 Encoding.ASCII.GetString 当成正确名称。
+
+## 读取方式二：地址宽度与解释类型分开
+
+```csharp
+object? word = await plc.ReadAsync("DB1.DBW2", token);
+// 本例得到 ushort 0xFF85，DBW 本身不等于有符号 INT。
+
+object? signed = await plc.ReadAsync(DataType.DataBlock, 1, 2,
+    VarType.Int, 1, cancellationToken: token);
+if (signed is not short raw)
+    throw new FormatException("期待 Int16 温度原始值。");
+decimal celsius = raw / 10m;
+
+object? measurement = await plc.ReadAsync(DataType.DataBlock, 1, 8,
+    VarType.Real, 1, cancellationToken: token);
+if (measurement is not float value || !float.IsFinite(value))
+    throw new FormatException("期待有限 REAL。");
+```
+
+同理，`DBD8` 的宽度是四字节，但仅靠字符串不会自动决定它是 DINT、DWORD 或 REAL。显式类型或固定字节解码，比“尝试强制转换到 float 看看”可靠。
+
+## 多变量读取的 DataItem
+
+```csharp
+var items = new List<S7.Net.Types.DataItem>
+{
+    new() { DataType = DataType.DataBlock, DB = 1, StartByteAdr = 2,
+            VarType = VarType.Int, Count = 1 },
+    new() { DataType = DataType.DataBlock, DB = 1, StartByteAdr = 8,
+            VarType = VarType.Real, Count = 1 },
+};
+await plc.ReadMultipleVarsAsync(items, token);
+```
+
+主要属性还有 `BitAdr`、`Value`；操作后检查各项 Value 的类型。`DataItem.FromAddress` 可以解析地址，但不要猜它替你完成所有 Count/业务类型推断。
+
+多变量 API 不意味着无限项或无限长度，仍受协议、协商 PDU、库和设备限制；具体分组策略要核对，不用固定“每次能读多少”数字覆盖所有 CPU。
+
+## 写入：最容易忽略的是 CLR 类型
+
+目标地址是一个 INT，应该明确传 Int16：
+
+```csharp
+short targetRaw = 300;
+await plc.WriteAsync("DB1.DBW12", targetRaw, token);
+```
+
+不要因为地址写着 DBW，就认定库会把所有 value 都截成两字节：未显式标型的 C# 整数字面量 `300` 是 Int32，该版本写方法按值的运行时类型序列化，可能写出四字节并覆盖相邻字段。本例只执行正确的 short 写入，离线检查同时对比 Int 与 DInt 的序列化长度。[固定版本 WriteAsync 实现](https://github.com/S7NetPlus/s7netplus/blob/f1ae0ea084e712b59e414de6aaee7d196244a239/S7.Net/PlcAsynchronous.cs)
+
+配套 `WriteDemoTargetAsync` 限制回环对象、固定 DBW12 和原始值0～1000，不开放任意现场 IP/地址。目标值写入后再读回，检查250变成300；这不是动作完成证明。
+
+### 位写入不要覆盖同字节其他标志
+
+```csharp
+await plc.WriteAsync("DB1.DBX14.0", true, token);
+```
+
+初值 byte14 是 `00000010`，写 bit0 后应为 `00000011`，再关闭 bit0 恢复为 `00000010`。检查验证 bit1 始终保留，而不是用整字节写入1把 bit1 清掉。
+
+即使一个位能单独写，也不代表 PC 和 PLC 可以无约束地同时维护同一业务状态。现场要明确字段所有者和请求/接受/完成握手，不能把这个模拟标志接到真实启动输出上。
+
+## 完整生命周期与取消
+
+项目主线只有一个异步所有者：
+
+```csharp
+using var device = new Snap7TestDevice();
+using Plc plc = S7Examples.CreateDemoPlc(device.Port);
+using var budget = CancellationTokenSource.CreateLinkedTokenSource(stop);
+budget.CancelAfter(TimeSpan.FromSeconds(5));
+try
+{
+    await plc.OpenAsync(budget.Token);
+    byte[] initial = await plc.ReadBytesAsync(DataType.DataBlock, 1, 0, 26, budget.Token);
+    await S7Examples.WriteDemoTargetAsync(plc, (short)300, budget.Token);
+    await plc.WriteAsync("DB1.DBX14.0", true, budget.Token);
+    byte[] readBack = await plc.ReadBytesAsync(DataType.DataBlock, 1, 0, 26, budget.Token);
+}
+finally
+{
+    plc.Close();
+}
+```
+
+完整方法还区分用户取消与预算到期、解码并显示结果。所有任务都 await 后再 Close/Dispose；失败或取消后放弃旧对象，不立刻往可能残留半帧的会话再发请求，也不自动重发写入。
+
+在本示例 .NET 10 选择的包内 net7.0 资产中，OpenAsync 的编译分支把令牌传给 TcpClient.ConnectAsync，所用异步读写也接收令牌。不要仅凭旧 XML 注释或其他目标框架推断所有平台行为相同；固定源码和实际运行目标必须一起看。取消是协作机制，不是实时退出保证。
+
+## 异常不能只捕获一种类型
+
+连接、协议、地址、类型解释和取消可能产生不同异常。该版本部分协议错误甚至是普通 Exception，不是全部包装成 PlcException；本机读未注册 DB2 的检查会实际观察到这种情况。
+
+应用边界应记录真实异常类型、说明、当前阶段和点位。不要只捕获 PlcException 后把其他失败吞掉，也不要用英文异常文本建立通用业务错误码映射。例子里的文本断言只针对固定包与固定模拟场景。
+
+OpenAsync 成功只说明本次协议建立完成，IsConnected 也不保证下一次操作成功。写入超时仍可能已经生效，保持“结果未知、不自动重发”的边界。
+
+## 运行与验证
+
+不需要本机网络依赖的检查：
+
+```powershell
+dotnet run --project examples/industrial-s7/IndustrialS7.csproj -- --offline-check
+```
+
+Windows x64 按本机脚本策略运行一次准备脚本，再构建并运行：
+
+```powershell
+./examples/industrial-s7/prepare-native.ps1
+dotnet run --project examples/industrial-s7/IndustrialS7.csproj -- --self-test
+dotnet run --project examples/industrial-s7/IndustrialS7.csproj -- --demo
+```
+
+Snap7 是可选的**测试端**原生依赖，不是 S7.NET+ 客户端必需的 Siemens 安装包。脚本从固定测试源码目录下载 DLL，校验 SHA256，放在忽略目录；程序加载前再次核对。许可信息与源码入口见项目 THIRD-PARTY-NOTICES，不能把 Snap7 的 LGPL 当作客户端库的许可。
+
+测试服务只绑定回环和临时端口，不扫描、不占用102、不停止已有服务。原生 API 要求明确端口，临时端口交接若发生占用就报错，不冒充无竞态分配。客户端先关闭，原生服务停止/销毁后才释放它使用的固定内存和模块。
+
+当前自动检查分为11项离线、16项本机网络：配置、布局/字符串/地址、读写类型长度、协议建立、原始/类型/多变量读取、目标/位写、无关位保留、非法 DB、取消与关闭；额外用不回复握手的本机 TCP 端点检查等待中的取消。
+
+这不是 TIA PLCSIM，不模拟扫描程序、真实 I/O、固件权限或安全系统；本轮没有 S7 实机和 WPF PLC 界面验收。继续阅读 [OPC UA 节点、质量与证书](/knowledge/industrial/host-computer/communication/opcua-nodes-quality-and-security/)和 [C# 安全读写与订阅](/knowledge/industrial/host-computer/communication/opcua-csharp-secure-read-write-subscribe/)，或进入三菱 [MC/SLMP地址与报文](/knowledge/industrial/host-computer/communication/mc-slmp-frames-and-device-addresses/)与 [C# McpX读写](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)，再结合[动作握手与断线去重](/knowledge/industrial/host-computer/communication/device-command-handshake-and-idempotency/)理解业务请求的完整生命周期。
+
+复习：DBW12 实际覆盖哪两字节？ReadAsync 的 Word 与 INT 为什么不同？为什么写 short 与 int 必须分开？位写入保留其他位为什么仍不等于完成业务互锁？
