@@ -41,12 +41,14 @@ const pythonStageIds: string[][] = [
 
 const csStages: Omit<RoadmapStage, "items">[] = [
   { title: "计算机组成", description: "从厨房类比开始，看懂 CPU、内存、总线和开机接力。" },
+  { title: "操作系统", description: "大管家如何管理进程、内存、文件，以及与它对话的 Shell。" },
   { title: "数据结构", description: "数步数的直觉 + 六大结构的摆法与选型。" },
   { title: "计算机网络", description: "从网线到浏览器，打通一次网页请求的全过程。" },
 ];
 
 const csStageIds: string[][] = [
   ["co-overview", "co-binary", "co-cpu", "co-memory", "co-io-bus", "co-boot", "co-gpu", "co-multitask"],
+  ["os-what", "os-process", "os-memory", "os-filesystem", "os-shell"],
   ["ds-intro", "ds-array", "ds-stack-queue", "ds-hashmap", "ds-tree", "ds-graph", "ds-summary"],
   ["net-intro", "net-ip-dns", "net-layers", "net-home-network", "net-tcp-udp", "tcp-handshake", "net-http", "net-https", "net-web-journey"],
 ];
