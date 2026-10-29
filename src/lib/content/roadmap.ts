@@ -72,6 +72,16 @@ function resolveStage(meta: Omit<RoadmapStage, "items">, ids: string[]): Roadmap
   return { ...meta, items };
 }
 
+const toolStages: Omit<RoadmapStage, "items">[] = [
+  { title: "Git 版本控制", description: "给项目装上时光机：快照、分支、远程协作。" },
+  { title: "VS Code 开发环境", description: "把编辑器调成趁手的兵器：扩展、调试与效率习惯。" },
+];
+
+const toolStageIds: string[][] = [
+  ["tool-git-why", "tool-git-daily", "tool-git-branch", "tool-git-remote"],
+  ["tool-vscode"],
+];
+
 export function buildRoadmap(): RoadmapTrack[] {
   return [
     {
@@ -81,8 +91,13 @@ export function buildRoadmap(): RoadmapTrack[] {
     },
     {
       title: "计算机基础之路",
-      description: "计算机组成、数据结构与计算机网络，用生活类比讲清硬件、组织与网络的底层逻辑。",
+      description: "计算机组成、操作系统、数据结构与计算机网络，用生活类比讲清硬件与底层逻辑。",
       stages: csStages.map((stage, index) => resolveStage(stage, csStageIds[index])),
+    },
+    {
+      title: "开发工具之路",
+      description: "Git 与 VS Code——学会用专业工具管理代码、大胆重构、参与协作。",
+      stages: toolStages.map((stage, index) => resolveStage(stage, toolStageIds[index])),
     },
   ];
 }

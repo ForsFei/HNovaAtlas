@@ -1,0 +1,101 @@
+---
+id: tool-git-daily
+title: Git 日常操作
+description: init、add、commit、status、log——五个命令走完版本控制的完整日常。
+tags: [Git, commit, 日常操作]
+difficulty: beginner
+status: published
+updated: "2026-10-29"
+order: 20
+prerequisite: [tool-git-why]
+related: [tool-git-branch, tool-vscode]
+---
+
+## 五个命令走天下
+
+Git 有上百个命令，但日常 90% 的时间只在这五个里打转：
+
+| 命令 | 干什么 |
+|------|--------|
+| `git init` | 把一个文件夹变成 Git 仓库 |
+| `git status` | 看现在什么情况（最常用！） |
+| `git add` | 把改动放进暂存区 |
+| `git commit` | 拍快照，写入历史 |
+| `git log` | 翻看历史 |
+
+## 第一次使用：自报家门
+
+Git 的每个提交都记录"谁改的"，所以先做一次性配置：
+
+```bash filename="命令行"
+git config --global user.name "你的名字"
+git config --global user.email "you@example.com"
+```
+
+## 建仓库与第一次提交
+
+```bash filename="第一次提交"
+cd my-project
+git init                      # ① 把当前文件夹变成 Git 仓库
+git status                    # ② 查看状态：一堆红色的"未跟踪"文件
+git add .                     # ③ 把所有改动放进暂存区（. 表示全部）
+git status                    # ④ 变绿色了：已在暂存区
+git commit -m "第一次提交：项目骨架"   # ⑤ 拍快照，-m 后面是说明
+```
+
+`git commit -m` 的 `-m` 后面跟**提交说明**——用一句话说清"这次改了什么、为什么"。写好提交说明是职业素养的起点：半年后的你和同事都要靠它读懂历史。
+
+<Callout type="tip" title="status 是你的仪表盘">
+
+任何时候不知道该干什么，先敲 `git status`。它会告诉你：哪些文件改了没暂存（红）、哪些已暂存待提交（绿）、当前在哪个分支。把"改完就 status 看一眼"变成肌肉记忆，Git 就再也不会吓到你。
+
+</Callout>
+
+## 日常循环：改 → 查 → 加 → 存
+
+```bash filename="日常循环"
+git status        # 看看改了什么
+git add index.py  # 这次只提交 index.py 的改动
+git commit -m "修复：文件名含空格时崩溃"
+git log --oneline # 看历史（一行一条，清爽）
+```
+
+```text
+a1b2c3d 修复：文件名含空格时崩溃
+8e4f5g6 新增：批量重命名功能
+1h2i3j4 第一次提交：项目骨架
+```
+
+每条记录前的乱码是**提交哈希**（快照的唯一编号）——回退、对比都靠它指名道姓。
+
+## 后悔药实战
+
+改坏了想回到上一个提交的状态：
+
+```bash filename="后悔药"
+git checkout -- index.py     # 丢弃工作区里 index.py 的未提交修改
+git restore index.py         # 新版写法，效果相同
+```
+
+已提交的坏快照也不怕：`git log` 找到好的快照哈希，随时可以回去。**只要你 commit 过，就丢不了**。
+
+<Callout type="warning" title="一个必须早知道的概念：.gitignore">
+
+有些文件不该进历史：`node_modules/`（几百 MB 的依赖）、密码配置、临时文件。在项目根目录建一个 `.gitignore` 文件，一行一个规则，Git 就会永久无视它们。忘了它，仓库会被垃圾撑爆，删都删不干净。
+
+</Callout>
+
+<FlashCard front="git add 和 git commit 的分工是什么？" back="add 把选中的改动放进暂存区，commit 把暂存区整体拍成快照写入历史。先挑后存，让每次提交只包含一件完整的事。" />
+
+## 动手试一试
+
+1. 给一个真实文件夹 `git init`，完成第一次提交，用 `git log --oneline` 确认历史。
+2. 改一个文件，依次跑 `git status` → `git add` → `git status` → `git commit`，观察每步 status 的变化。
+3. 故意改坏一个文件后用 `git restore` 恢复，亲身体验后悔药。
+
+<Quiz
+  question="git status 显示某文件是红色的'已修改未暂存'，此时直接 git commit 会怎样？"
+  options={["红文件也会被提交", "红文件的改动不在暂存区，不会被包含在这次提交里", "报错，必须先 add", "自动帮你 add"]}
+  answer={1}
+  explanation="commit 只打包暂存区的内容。红色 = 改动还在工作区，没进购物车。所以提交前先看 status，确认绿色清单正是你想存的。"
+/>

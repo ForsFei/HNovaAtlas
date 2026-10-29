@@ -1,0 +1,96 @@
+---
+id: tool-git-remote
+title: 远程仓库与 GitHub
+description: 把时光机搬到云端——clone、push、pull，以及多人协作的第一课。
+tags: [Git, GitHub, 远程仓库]
+difficulty: beginner
+status: published
+updated: "2026-10-29"
+order: 40
+prerequisite: [tool-git-branch]
+related: [tool-vscode, python-venv-projects]
+---
+
+## 本地时光机的两个隐患
+
+到目前为主，Git 仓库都在你电脑里。两个隐患：
+
+1. **硬盘坏了 = 历史全毁**
+2. **团队没法协作**——历史只在你的机器上
+
+解法：把仓库**同步到云端**。托管 Git 仓库的网站最著名的是 **GitHub**（还有 GitLab、Gitee 等），它们存的是完整仓库的副本，让"备份"与"协作"一步到位。
+
+> 注意区分：**Git** 是版本控制工具，**GitHub** 是托管 Git 仓库的网站——像"Photoshop"与"图片云"的关系。
+
+## 三个核心动词
+
+```bash filename="remote-basics"
+git clone https://github.com/user/repo.git   # 克隆：云端仓库 → 本地（含全部历史）
+git push                                     # 推送：本地新提交 → 云端
+git pull                                     # 拉取：云端新提交 → 本地
+```
+
+日常节奏简单到像呼吸：
+
+```text
+早上开工：git pull（拉取同事昨晚的更新）
+白天干活：改 → add → commit（照旧）
+下班收工：git push（推上云端）
+```
+
+<Callout type="info" title="origin 是什么？">
+
+第一次 push 时会看到 `git push origin main`。**origin** 是远程仓库的默认别名（克隆时自动配置），`main` 是要推送的分支。`git remote -v` 可以查看你的仓库连接着哪些远程。
+
+</Callout>
+
+## 推送被拒绝？先拉再推
+
+多人协作最常见的报错：
+
+```text
+! [rejected] main -> main (fetch first)
+```
+
+含义：云端有同事推的新提交，而你本地没拉取——Git 拒绝覆盖别人的工作。解法是**先拉后推**：
+
+```bash filename="rejected"
+git pull          # 把云端新提交拉下来并合并（有冲突就解决冲突）
+git push          # 现在可以推了
+```
+
+这其实就是在远程仓库层面执行了分支合并——第三篇学的冲突解决在这里同样适用。
+
+## 参与一个开源项目的完整路径
+
+```bash filename="join-opensource"
+git clone https://github.com/python/cpython.git   # 1. 克隆 Python 官方仓库
+cd cpython
+git switch -c my-fix                              # 2. 开分支修一个小问题
+# ……改代码、add、commit……
+git push origin my-fix                            # 3. 推自己的分支
+# 4. 在 GitHub 网页上发起 Pull Request（请求对方合并你的分支）
+```
+
+第四步的 **Pull Request（PR）** 是开源世界的协作仪式：维护者审阅你的改动、提意见、最终合并。**全世界的开发者就是这样协作写出 Linux、Python 和你看的每个开源软件**。
+
+<Callout type="warning" title="push 之前过一遍脑子">
+
+推送到公共仓库 = 公之于众（历史很难抹掉）。push 前确认：没有密码和密钥等敏感信息、`.gitignore` 配置妥当、提交说明体面。本地搞砸可以改历史，推出去就覆水难收。
+
+</Callout>
+
+<FlashCard front="clone、push、pull 分别是哪个方向的数据流？" back="clone：云端 → 本地（首次获取完整仓库）；push：本地 → 云端（分享你的新提交）；pull：云端 → 本地（获取别人的新提交）。被拒绝时先 pull 再 push。" />
+
+## 动手试一试
+
+1. 注册 GitHub，创建自己的第一个仓库，把之前练习的本地项目 push 上去。
+2. 在 GitHub 网页上直接编辑一个文件并提交，本地 `git pull` 把它拉回来——体会双向同步。
+3. 克隆一个感兴趣的开源项目（比如本站），在历史里找一条提交记录，看看专业的提交说明长什么样。
+
+<Quiz
+  question="git push 被拒绝提示 fetch first，正确的处理是？"
+  options={["再试几次总会成功", "先 git pull 合并云端改动，再 push", "删除远程仓库重新建", "换一个分支推"]}
+  answer={1}
+  explanation="拒绝意味着云端有你没有的提交，直接推会丢失别人的工作。先 pull 把云端改动合并进本地（必要时解决冲突），历史理顺后再 push。"
+/>

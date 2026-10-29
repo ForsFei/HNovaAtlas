@@ -1,0 +1,104 @@
+---
+id: tool-git-branch
+title: 分支与合并
+description: 平行宇宙——同时开发多个版本互不干扰，做完了再合回来。
+tags: [Git, 分支, 合并]
+difficulty: beginner
+status: published
+updated: "2026-10-29"
+order: 30
+prerequisite: [tool-git-daily]
+related: [tool-git-remote, co-multitask]
+---
+
+## 一个真实困境
+
+网站上线了，你正开发"购物车"大功能，进度过半。突然线上出了个紧急 bug 要立刻修——但你的代码改了一半，根本没法直接上线。
+
+没有分支的世界只能祈祷。有分支的世界：
+
+1. 从"线上正常版"拉一条**分支**出来修 bug
+2. 修好，合并回主线，发布
+3. 回到"购物车"分支继续开发，丝毫未受影响
+
+**分支 = 让代码拥有平行宇宙**：从任意历史快照分叉出去，各自演化，互不干扰。
+
+## 分支的基本操作
+
+```bash filename="branch-basics"
+git branch                    # 查看所有分支（* 标记当前所在）
+git branch cart               # 创建分支 cart（只是造出分叉点，人没过去）
+git switch cart               # 切换到 cart 分支——之后的提交都记在 cart 上
+git switch main               # 切回主分支，cart 上的改动"消失"（其实都在 cart 上）
+git switch -c feature-search  # 创建并立即切换（一步到位）
+```
+
+约定俗成：主分支叫 **main**（或旧的 master），永远保持"随时可发布"的状态；新功能都开分支做。
+
+```text
+main:    A ── B ──────── F ── G（修复 bug 后）
+                 \       /
+cart:             C ── D ── E（购物车开发中）
+```
+
+## 合并：把平行宇宙接回来
+
+购物车做完了，把 cart 的成果合并进 main：
+
+```bash filename="merge"
+git switch main
+git merge cart        # 把 cart 的改动合并进当前分支
+```
+
+- **无冲突**：两边改的是不同文件/不同位置，Git 自动接好（快进或自动合并）
+- **有冲突**：两边改了**同一处**，Git 不敢替你做主，把冲突标记在文件里：
+
+```text
+<<<<<<< HEAD
+当前分支的内容
+=======
+cart 分支的内容
+>>>>>>> cart
+```
+
+手动编辑保留想要的版本、删掉标记，然后 `git add` + `git commit` 完成合并。**冲突不可怕，它只是 Git 在问："这里你想留哪个？"**
+
+<Callout type="warning" title="合并前先干净">
+
+切换分支前把当前工作提交或暂存，否则未提交的改动会跟着你"穿越"，容易搞混。养成"切分支前先 status 检查"的习惯。
+
+</Callout>
+
+## 删掉已合并的分支
+
+```bash filename="cleanup"
+git branch -d cart      # cart 已合并进 main，安全删除
+```
+
+分支只是"一个指向某次提交的名字"，删分支不删提交历史——已合并的成果都在 main 上。
+
+## 团队协作的标准节奏
+
+个人项目就值得用分支，团队项目更是铁律：
+
+```text
+main：永远可发布
+feature/xxx：每个功能一条分支，做完合并，用完即删
+```
+
+这样任何时刻 main 都是干净的，实验性代码永远隔离在自己的宇宙里。远程协作（下篇）会在这个节奏上再加一层"大家各自 push 自己的分支"。
+
+<FlashCard front="分支解决什么问题？" back="让多条开发线并行推进互不干扰：main 保持随时可发布，功能开发和 bug 修复各自开分支，完成后合并回主线。合并冲突时 Git 会标记冲突位置，由人决定保留哪个版本。" />
+
+## 动手试一试
+
+1. 建仓库开两条分支，各改不同文件，合并回 main——体验无冲突合并。
+2. 两条分支改**同一个文件的同一行**，合并一次，阅读冲突标记并手动解决。
+3. 思考：为什么"直接在 main 上开发"是团队协作的大忌？（提示：main 一坏，所有人都被卡住）
+
+<Quiz
+  question="在 cart 分支提交了三个改动后 switch 回 main，刚才的改动去哪了？"
+  options={["丢了", "被删除了", "好好地保存在 cart 分支上，main 看不到", "自动合并进了 main"]}
+  answer={2}
+  explanation="每个分支都是独立的平行宇宙，提交跟着创建它时所在的分支走。切回 main 只是换了个宇宙，想看到那些改动就合并 cart。"
+/>
