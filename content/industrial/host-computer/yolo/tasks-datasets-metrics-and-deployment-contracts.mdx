@@ -154,9 +154,18 @@ AP概括规定类别/匹配条件下的Precision-Recall曲线；mAP再对规定�
 1. 本批：任务、数据、指标和手写框C#契约检查，先建立可核对的评价口径。
 2. 第二批已交付：[颜色/张量/缩放填充与坐标空间](/knowledge/industrial/host-computer/yolo/image-channels-nchw-letterbox-and-coordinate-spaces/)和 [C#输入数组与框还原](/knowledge/industrial/host-computer/yolo/csharp-bgr-nchw-letterbox-and-box-restoration/)，用自有小图和76项检查验证明确教学策略，尚未与真实模型参考张量对照。
 3. 第三批已交付：[固定YOLOX-Nano产物与CPU契约](/knowledge/industrial/host-computer/yolo/yolox-nano-model-contract-and-cpu-runtime/)和 [C# ONNX Runtime会话/OrtValue](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)。31项托管与17项真实CPU检查，全量原始数值与Python参考对照；尚无框解码/NMS或质量评价。
-4. 第四批已交付：[网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)和 [C#后处理与完整参考](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)，66项手写/12项实际CPU检查；仍限r=1自有渐变输入，一般图片、真实离线标注与质量评价待补，不声称通用解析所有模型。
+4. 第四批已交付：[网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)和 [C#后处理与完整参考](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)，66项手写/12项实际CPU检查，建立r=1基线。
+5. 第五批已交付：[一般图片、模型缩放与原图NMS](/knowledge/industrial/host-computer/yolo/image-decoding-model-letterbox-and-source-space-nms/)和 [C#离线图片推理](/knowledge/industrial/host-computer/yolo/csharp-opencv-image-files-resize-and-yolox-inference/)，新增35项几何/30项真实OpenCV与CPU检查，完整输入/原始输出/后处理参考通过。后续WPF与真实标注质量评价，不声称通用解析所有模型。
 5. 与WPF/有界处理连接，测量预热、端到端耗时和资源，分别记录CPU/GPU、人工UI、相机与现场质量验收。
 
 本批验收只要求：能解释任务差别与数据泄漏，手算IoU/误检漏检，并复现下一篇手写案例。69项C#检查不能证明模型准确率、推理速度或现场NG识别能力。
 
 继续阅读[C#手写数据审计、IoU与检测评估](/knowledge/industrial/host-computer/yolo/csharp-dataset-audit-box-iou-and-evaluation/)。
+
+第六批已交付：[WPF显示与同图结果](/knowledge/industrial/host-computer/yolo/wpf-original-image-overlay-and-result-identity/)及 [C#离线查看器](/knowledge/industrial/host-computer/yolo/csharp-wpf-yolox-viewer-session-and-overlay/)。后续长寿命会话/有界处理与真实样本评价，人工UI和现场质量继续分别验收。
+
+第七批已交付：[长寿命会话与有界准入](/knowledge/industrial/host-computer/yolo/long-lived-session-bounded-admission-and-terminal-receipts/)及 [C#账本与排空](/knowledge/industrial/host-computer/yolo/csharp-yolox-worker-channel-ledger-and-drain/)。原始模型/参考与离线入口保留，下一步真实样本/标注接入和评价。
+
+第八批已交付：[本地标注与误检漏检](/knowledge/industrial/host-computer/yolo/local-dataset-label-contracts-and-operating-point-review/)及 [C#评价报告](/knowledge/industrial/host-computer/yolo/csharp-local-label-import-inference-and-review-report/)。支持实际本地文件清单与固定工作点，合成检查不当真实质量；下一步部署/环境及产物检查。
+
+第九批已交付：[部署与原生库诊断](/knowledge/industrial/host-computer/yolo/deployment-contract-runtime-and-native-library-diagnostics/)及 [C#发布清单和CPU探针](/knowledge/industrial/host-computer/yolo/csharp-release-inventory-publish-and-cpu-probe/)。第11步基础主线已交付，下一阶段综合工位离线流程；真实质量、目标机与现场验收继续单列。

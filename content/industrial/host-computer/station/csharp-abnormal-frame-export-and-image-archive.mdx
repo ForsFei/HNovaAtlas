@@ -1,0 +1,92 @@
+---
+id: industrial-csharp-station-abnormal-pixels
+title: C#实践：异常原帧导出、像素归档与恢复
+description: 使用ExportAbnormalFrame和AbnormalImageArchive保存故障周期原始Mono8像素，掌握保存、读回、恢复及收据释放顺序。
+tags: [工业自动化, C#, 综合工位, 文件IO, 机器视觉]
+difficulty: intermediate
+status: published
+updated: "2026-11-02"
+order: 250
+prerequisite: [industrial-station-abnormal-pixels]
+related: [industrial-csharp-station-reconciliation, industrial-csharp-station-evidence]
+---
+
+## 1. 项目与验证入口
+
+继续扩展examples/industrial-station-evidence，新增AbnormalImageArchive.cs。视觉与组合端口各新增ExportAbnormalFrame；没有新增包、网络或原生SDK。
+
+```powershell
+dotnet build examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --reconciliation-test
+```
+
+该入口现在执行65项检查，其中新增13项像素归档相关检查。输出唯一临时证据目录，late-Capture、late-Inspect和processing-failure下面的images目录含本批实际生成的归档。
+
+## 2. 导出原OwnedFrame
+
+```csharp
+AbnormalEvidence diagnostic = AbnormalEvidence.Capture(
+    session.Snapshot, session.Devices);
+OwnedFrame frame = port.ExportAbnormalFrame(session.Snapshot);
+```
+
+调用前必须等待任务和Pending结清。组合端口拒绝活动、关闭或没有运动交接的状态，视觉端口继续检查原周期、原终态和保留帧。它不调用Acquire或Inspect。
+
+OwnedFrame包含FrameStamp和不可变Mono8Image，分享的是已经复制到自有内存的原图，外部CopyPixels取得副本。端口确认后不再允许重新导出；已经导出的托管引用仍可能持有内存，因此需要由调用方限制保留数量。
+
+## 3. 保存与原工作流组合
+
+```csharp
+string archivePath = AbnormalImageArchive.Save(
+    imageDirectory, diagnostic, frame);
+AbnormalImageDocument checkedArchive =
+    AbnormalImageArchive.Read(archivePath);
+if (checkedArchive.Diagnostic.Terminal != diagnostic.Terminal)
+    throw new InvalidDataException("Terminal mismatch");
+
+await workflow.SaveAbnormalThenAcknowledgeAsync(abnormalStore);
+```
+
+上例由同一合作所有者顺序运行。Save/Read是同步文件操作，WPF集成应放入受控后台操作，不能让UI线程逐图等待磁盘，也不能为每帧创建无界后台任务。
+
+任何归档异常都应阻止后面的保存/确认调用。旧工作流没有强制要求图像归档，调用方需要明确选用该顺序；本批没有替换默认WPF或MC入口。
+
+## 4. API和数据
+
+| API/属性 | 说明 |
+| --- | --- |
+| Save(directory,diagnostic,frame) | 绑定原诊断和Stamp，返回归档路径 |
+| Read(path) | 有界读取、严格JSON与像素校验 |
+| Restore(document) | 再校验后复制像素构造Mono8Image |
+| Schema/Scope | 当前1与AbnormalPixels-DiagnosticOnly |
+| Diagnostic | 原异常终态、帧关联、统计或处理错误 |
+| Width/Height | 紧排Mono8尺寸 |
+| PixelSha256 | 原始像素字节的SHA-256 |
+| Pixels | byte[]，在JSON中为Base64 |
+
+Read返回的byte[]可以被调用方修改，因此Restore会重新检查哈希，不能把已经读取过当作永远可信。恢复得到的Mono8Image仍拥有自己的像素副本。
+
+## 5. 发布与冲突
+
+文件名由原Session和Cycle生成，不包含工件文本。Save先校验数据，再写同目录.json.pending，CreateNew、Write、Flush(true)、关闭，最后不覆盖移动为.json，并读回校验。
+
+已存在归档时，必须完整读取并比较诊断、宽高和像素；相同内容返回原路径，不同内容抛冲突，不改旧文件。残留.pending会导致CreateNew失败；工具不自动清理或重拍。
+
+单文件归档减少了图像/明细两文件组合的发布问题，但它与原账本、诊断说明之间仍没有跨存储事务。目录和上级路径应为可信专用位置，调用方停止并发修改后再读取；没有突然断电或防篡改承诺。
+
+## 6. 读取失败与故障含义
+
+读取限制1500000字节，拒绝空文件、链接、坏JSON、重复/未知字段、未知Schema/Scope、非法尺寸、像素长度和哈希不匹配。有原统计时按固定教学配方重算ROI；没有原统计时保留为空。
+
+本批使用实际异常与迟到路径做像素往返验证。归档内即使DiagnosticJudgment=Ok，原Terminal仍可以是Faulted、Judgment为空；Restore只返回图像，不把结果重新提交给工位。
+
+异常无图时ExportAbnormalFrame拒绝，继续保留原DiagnosticOnly-NoPixels说明。旧对账器不扫描images；要验证原图必须显式Read，不能只看MatchedAbnormal。
+
+## 7. 后续范围
+
+本批补齐离线工位异常原图的独立归档入口。真实相机、E3032原生SDK、跨进程设备任务绑定、批量图像索引及现场长期验收仍分别推进，不以本地像素往返替代实机证据。
+
+
+## 续读：图像完整性核对
+
+新增[异常图像核对](/knowledge/industrial/host-computer/station/abnormal-image-inventory-and-evidence-completeness/)与 [C#图像报告](/knowledge/industrial/host-computer/station/csharp-image-inventory-report-and-readonly-query/)显式连接images目录；原对账器仍保持诊断语义。

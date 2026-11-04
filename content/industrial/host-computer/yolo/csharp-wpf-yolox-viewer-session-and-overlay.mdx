@@ -1,0 +1,142 @@
+---
+id: industrial-csharp-yolox-wpf
+title: C#实践：WPF查看器、YOLOX会话与同图框叠加
+description: 用冻结BitmapSource、DisplaySession和自绘Viewer连接已验证的离线推理，详细说明常用属性方法、切图隔离、关闭排空与离屏检查。
+tags: [工业自动化, C#, WPF, YOLOX, 异步]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 110
+prerequisite: [industrial-yolox-wpf-display]
+related: [industrial-csharp-yolox-images, industrial-csharp-yolo-onnx-session]
+---
+
+## 1. 编译、检查和打开窗口
+
+新增`examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj`，.NET10 Windows/x64、UseWPF，通过ProjectReference复用上批图片项目及固定OpenCvSharp/ONNX Runtime。不升级包、不下载第二份模型，不安装相机驱动。
+
+在Windows、有.NET10 SDK和Windows Desktop运行环境的机器，从仓库根目录运行：
+
+```powershell
+dotnet restore examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj --locked-mode
+dotnet build examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-restore
+
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --open examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+最后一条才打开可见窗口。本轮自动检查运行前两种测试入口，没有自动打开可见窗口。`--open`后还可增加一个图片路径，窗口加载后会异步打开该图；仍需点击“检测当前图”才推理。
+
+托管/WPF检查成功退出0、失败1，用法错误2，真实原生检查失败3。GUI的读图/推理错误显示在状态文本中，不使用黑图或伪检测回退。模型首次获取沿用[第三批显式入口](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)，图片格式和信任边界沿用[第五批](/knowledge/industrial/host-computer/yolo/csharp-opencv-image-files-resize-and-yolox-inference/)。
+
+## 2. 代码按职责查阅
+
+| 文件 | 核心类型 | 负责什么 |
+| --- | --- | --- |
+| DisplayModel.cs | ImageSnapshot、OverlayResult | 自有原图、冻结显示图与同图结果 |
+| DisplayModel.cs | DisplaySession、InferenceRequest | UI所属状态、单请求准入与晚到结果隔离 |
+| OfflineDetector.cs | OfflineDetector.Run | 调用上批预处理、真实模型和原图后处理 |
+| YoloViewer.cs | DisplayMapping、YoloViewer | 统一坐标映射、图像与框绘制 |
+| MainWindow.cs | MainWindow | 三个按钮、异步工作、关闭等待 |
+| ViewerChecks.cs | ViewerChecks | 手写显示检查与真实模型离屏检查 |
+| App.cs | App.Main | STA入口、测试与GUI分流 |
+
+这里用一个小窗口直接组织事件，便于沿调用链学习；没有为了三个操作加入额外MVVM框架。以后页面复杂、命令状态和参数联动增多时，再把会话状态映射到ViewModel。
+
+## 3. ImageSnapshot：同份像素生成显示图
+
+```csharp
+ImageSnapshot image = await Task.Run(() =>
+    ImageSnapshot.Create(OpenCvImageInput.Load(path)));
+session.Show(image); // await回到WPF UI上下文
+viewer.Present(session.Current, session.Result);
+```
+
+Create从LoadedImage.Bgr逐像素取B/G/R并填充紧密数组，调用BitmapSource.Create(w,h,96,96,PixelFormats.Bgr24,...)，然后Freeze。没有另用BitmapImage重新按路径解码，避免图片方向、解码方式或文件变化造成显示与推理不同源。
+
+| WPF成员 | 本批用法 | 需要注意 |
+| --- | --- | --- |
+| BitmapSource.Create | 从自有BGR数组创建显示图 | stride为width×3，不借Mat指针 |
+| PixelWidth/PixelHeight | 取得原图栅格尺寸 | 不能用DIP宽高替代像素宽高 |
+| Freeze/IsFrozen | 完成后台到UI的只读交接 | 冻结后不可修改，其他控件仍有线程归属 |
+| Dispatcher.VerifyAccess | 状态/绘制入口检查所属线程 | await续体是否回UI取决于调用上下文 |
+| ActualWidth/ActualHeight | 当前控件布局的DIP尺寸 | 首次布局可能为0 |
+| InvalidateVisual | 请求重新绘制 | 不等于立即完成屏幕呈现 |
+| DrawingContext.DrawImage/DrawRectangle | 绘制原图和可见框 | 使用同一个DisplayMapping |
+| PushClip/Pop | 将叠加限制在图像区域 | 保持成对使用 |
+| VisualTreeHelper.GetDpi | 提供文字PixelsPerDip | 不再给框坐标额外乘DPI |
+
+ImageSnapshot的构造器私有，Source和Bitmap只读，避免对外任意拼接A图像素与B显示位图。Id是应用内本次加载身份，不是来自相机的帧号或工件编号。
+
+## 4. OfflineDetector：后台生命周期在同一调用内闭合
+
+```csharp
+PreparedImage prepared = OpenCvImageInput.Prepare(image.Source);
+using YoloXNanoSession session = new(modelPath);
+YoloXRawOutput raw = session.Run(prepared.Tensor);
+return OverlayResult.FromReport(image,
+    ImagePostprocessor.Process(raw, prepared,
+        new PostprocessSettings(score, .45)));
+```
+
+这些代码在Task.Run中执行。预处理Mat在Prepare内部释放，ONNX输入/输出在既有Run内部释放，本次会话在返回前Dispose。OverlayResult只复制可见框信息，Bitmap由捕获的ImageSnapshot持有，没有原生指针逃逸到OnRender。
+
+FromReport要求report.Prepared.Source与image.Source是同一对象，然后取VisibleSource.Original不为空的项；保留Kept总数与Boxes.Count可见数的区别。它不验证raw的来源签名，因此后台仍必须沿这一条调用链把正确的raw和prepared送入Process。
+
+OverlayResult检查可见框范围、分数有限、固定80类索引和不重复行号。类名目前显示`#索引 分数`，没有套用工业缺陷标签表。界面默认score0.1；native检查的0.01是固定渐变参考展示，不增加GUI阈值控件。
+
+每次新建会话有加载成本。此方案用于离线手动单次检测、明确资源归属；不能拿按钮耗时作为纯模型推理耗时或连续采集FPS。
+
+## 5. 会话API与请求处理
+
+| 方法/属性 | 行为 |
+| --- | --- |
+| Show(snapshot) | 换图并递增显示代次，清空旧结果/错误 |
+| Clear() | 清空当前显示并递增代次，不释放运行槽 |
+| TryBegin() | 有图、未关闭、未忙时接收一个请求，否则返回null |
+| Busy | 是否仍有未完成的已接收请求 |
+| Complete(request,result,error) | 验证原请求对象、当前图和代次后附着或拒绝 |
+| BeginClose() | 停止新准入，清空显示，保留槽等待真实任务退出 |
+| Current/Result/Error | UI线程读取的当前快照、结果和错误 |
+
+处理按钮的关键结构是：
+
+```csharp
+InferenceRequest? request = session.TryBegin();
+if (request is null) return;
+try
+{
+    OverlayResult result = await Task.Run(() =>
+        OfflineDetector.Run(modelPath, request.Image));
+    Attachment outcome = session.Complete(request, result);
+    // 仅Attached时更新当前图的检测状态。
+}
+catch (Exception error)
+{
+    session.Complete(request, null, error.Message);
+}
+```
+
+完整窗口还会在finally刷新按钮和Viewer。切图不会覆盖已捕获的request.Image；旧任务回来被标为Stale，其结果不会画到新图。请求record字段相同也不够，Complete需要原active对象，防止复制或重复通知误释放另一个任务槽。
+
+新加载也使用loadVersion：清空或关闭时递增，已在后台读取的旧文件即使成功返回也不能重新显示。读取期间只禁用打开按钮，清空仍可用；推理期间允许打开下一张，但检测按钮保持禁用直到旧推理实际结束。
+
+## 6. 绘制与关闭代码怎么读
+
+YoloViewer.Present首先检查overlay.Image与current相同，作为会话检查之外的第二层防串图保护。OnRender根据当前布局重新生成映射，先画黑底，再画原图，再逐项绘制源框；不把源框改写成显示坐标后永久存储，否则窗口缩放后就难以重算。
+
+关闭事件第一次设置e.Cancel=true，进入closing并禁用操作，再await当前loading和processing，结束后设置closeAllowed并再次Close。重复关闭只维持等待，不再启动一套关闭工作。它没有调用Task.Wait，也没有在ONNX调用仍运行时从UI线程Dispose会话。
+
+这些等待没有硬超时或强制终止能力。若生产需求要求固定关闭期限，需设计原生终止策略或进程隔离，不能仅给Task.Run外面加取消令牌就宣称中断底层推理。
+
+## 7. 检查结果与验收范围
+
+Release零警告零错误，锁模式还原通过。38项WPF/手写检查与10项实际OpenCV/CPU/WPF检查通过。手写部分验证身份状态、冻结BGR、源框映射、留白、96/144 DPI离屏像素，拒绝错图、重复/复制请求和无效框；门闩检查不依赖Thread.Sleep。
+
+真实native入口自己新建641×359渐变PNG，读取/冻结原图，运行CPU模型，核对5个保留行3439/3468/3462/3454/3420，附着后输出800×600离屏PNG到bin/verification/GUID/overlay.png。模型会话已在绘制前释放；重开同一文件产生新Snapshot并拒绝旧结果。默认0.1阈值仍正常为空。
+
+离屏PNG已查看，原图、留白和检测框一致；本轮没有自动打开窗口或声称完成可见窗口人工验收。还需人工检查实际文件对话框、快速切图、窗口关闭时序、多显示器DPI、真实物体标注和长期资源。示例只是教学离线应用，不连接相机/PLC，不输出产品OK/NG。
+
+理论回看[原图显示、框坐标与同图结果](/knowledge/industrial/host-computer/yolo/wpf-original-image-overlay-and-result-identity/)。第七批已补[C#复用会话、Channel账本与排空](/knowledge/industrial/host-computer/yolo/csharp-yolox-worker-channel-ledger-and-drain/)，新增--open-reused入口，原--open保留；下一步真实标注评价及部署记录。WPF线程行为依据[Microsoft线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)，冻结图片依据[Freezable文档](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/freezable-objects-overview)。

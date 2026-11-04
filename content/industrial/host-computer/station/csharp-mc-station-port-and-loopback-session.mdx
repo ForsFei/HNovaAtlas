@@ -1,0 +1,177 @@
+---
+id: industrial-csharp-station-communication-adapter
+title: C#实践：MC工位通信端口与本机回环会话
+description: 用CommunicationStationPort实现IStationAsyncPort，逐项说明Execute/Observe、MC库读写、请求映射、保存后远端释放和会话关闭API。
+tags: [工业自动化, C#, McpX, MC协议, 异步]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 90
+prerequisite: [industrial-station-communication-adapter]
+related: [industrial-csharp-station-operator-application, industrial-csharp-mcpx-read-write]
+---
+
+## 1. 项目与运行
+
+新增examples/industrial-station-communication/IndustrialStation.Communication.csproj，net10.0，引用核心工位项目，并链接既有Contract、Mailbox、HandshakeClient、LoopbackController和McFrames源码；不复制另一套协议实现。
+
+固定使用已有McpX 0.13.0，带packages.lock.json。没有新型号SDK或模型下载。
+
+```powershell
+dotnet restore examples/industrial-station-communication/IndustrialStation.Communication.csproj --locked-mode
+dotnet build examples/industrial-station-communication/IndustrialStation.Communication.csproj -c Release --no-restore
+dotnet run --project examples/industrial-station-communication/IndustrialStation.Communication.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-communication/IndustrialStation.Communication.csproj -c Release --no-build -- --demo
+```
+
+成功0、异常1、用法2。两个入口只创建127.0.0.1随机端口监听器，命令行没有真实设备IP/端口选项；文件写入新建的系统临时目录并保留，打印实际路径。
+
+## 2. 工位端口如何注入应用
+
+核心应用层新增OpenWithPortAsync，保留原OpenAsync的纯模拟行为：
+
+```csharp
+CommunicationStationPort port = CommunicationStationPort.CreateLoopback();
+StationApplication application = await StationApplication.OpenWithPortAsync(directory, port);
+```
+
+所有权交给应用：目录打开失败会释放端口，正常运行则由宿主在收尾后释放。调用方不要再用一个提前结束的using把端口释放掉。
+
+公开的CommunicationStationSession进一步组合应用与端口，统一约束远端结果槽释放。使用该门面完成本例流程即可；不需要修改上一批WPF窗口。
+
+## 3. CommunicationStationSession的属性和方法
+
+| API | 作用与返回 |
+| --- | --- |
+| OpenAsync(directory) | 创建本机回环端口并打开本地账本，返回会话 |
+| Snapshot | 应用/宿主/账本的最新内存快照 |
+| Communication | 本次映射、远端终态/释放证据和测试计数 |
+| StartAsync(workpiece,recipeVersion) | 远端槽允许后交给应用启动；意图仍先于派发保存 |
+| SaveResultAsync() | 落盘后消费原本地终态 |
+| ReconcileAsync() | 通过宿主开始只读Observe，true只代表已开始查询 |
+| ResetObservedControlAsync() | 明确检查后写0归零控制通道，不是只读操作 |
+| ReleaseRemoteAfterSavedAsync() | 检查同周期保存/消费后写2释放远端结果 |
+| ObserveReleaseAsync() | 只读核对原释放是否生效，不重复写2 |
+| SimulateReviewAndReleaseAsync(disposition) | 远端槽已确认释放后，再做本地模拟核对/放行 |
+| RequestClose() | 提出关闭，阻止新启动 |
+| CloseStepAsync() | 一次有限收尾，实际任务未结则返回false |
+
+true、Known、ReadyForNextCycle的含义不同：查询开始不是完成，Known不是成功，远端槽就绪也不等于整机安全Ready。
+
+## 4. ExecuteAsync与ObserveAsync
+
+CommunicationStationPort实现IStationAsyncPort。Move调用既有HandshakeClient，其余三个步骤仍交给RecipeSimulationPort。
+
+ExecuteAsync的主要顺序：
+
+```text
+验证固定配方和工位身份
+  → 原操作已有绑定则返回缓存/null，不重新提交
+  → 旧远端槽未释放或旧周期则拒绝
+  → InspectAsync读取空闲邮箱
+  → CreateTicket：BootId + HighWater+1 + 固定Target
+  → 保存原StationCommand与Ticket的绑定
+  → SubmitAsync一次
+  → 只有明确Recorded/Duplicate才只读WaitAsync原Ticket
+  → 有效同Ticket终态才映射StationReply
+```
+
+ObserveAsync对Move只调用QueryAsync，要求原StationCommand完整相等；不会自动补Submit、Reset或Release。Known且状态Done形成Success=true，Rejected/Faulted形成Success=false，其他情况返回null保留未知。
+
+端口内一个即时拒绝的调用槽，拒绝并发I/O和调用进行中Dispose；不在内部排队更多写入。应用代码应顺序await会话操作，不能并行启动、归零和释放来碰运气。
+
+## 5. McpX对象连接、读取、写入和关闭
+
+本批复用既有HandshakeClient.SessionAsync；下面是其中的连接与关键调用形式：
+
+```csharp
+using var plc = new McpX(
+    controller.Endpoint.Address.ToString(), controller.Endpoint.Port,
+    password: null, isAscii: false, isUdp: false,
+    requestFrame: RequestFrame.E3,
+    timeoutMilliseconds: 800,
+    processorSeries: ProcessorSeries.Q);
+
+ushort[] words = await plc.BatchReadAsync<ushort>(Prefix.D, "240", 18);
+await plc.BatchWriteAsync<ushort>(Prefix.D, "200", ticket.Encode());
+await plc.WriteAsync<ushort>(Prefix.D, "206", 1);
+```
+
+这是既有客户端中的调用片段，需要对应McpX命名空间、controller与ticket；不要独立运行三条写入代替完整握手。
+
+| 选项/API | 本例用途 |
+| --- | --- |
+| McpX(host,port,...) | 构造时建立连接，在后台执行；本例host只能来自回环监听器 |
+| isAscii=false/isUdp=false | 二进制TCP |
+| RequestFrame.E3 | MC 3E报文 |
+| ProcessorSeries.Q | 固定教学设备规格 |
+| timeoutMilliseconds=800 | 单次请求期限，不是工位全流程时间 |
+| BatchReadAsync&lt;ushort&gt; | D240起18字，读取带发布版本的状态 |
+| BatchWriteAsync&lt;ushort&gt; | D200起六字，暂存原Ticket完整载荷 |
+| WriteAsync&lt;ushort&gt; | D206写1提交、0归零、2释放；不同业务动作 |
+| using/Dispose | 关闭这一组请求的连接，不代表PLC动作停止 |
+
+该版本旧客户端没有把调用方CancellationToken传给这些读写方法。取消业务等待后仍要观察在途I/O，不能先Dispose然后宣布设备动作终止。
+
+包API依据[McpX 0.13.0作者说明](https://www.nuget.org/packages/McpX/0.13.0)，既有用法可查[C# McpX读写](/knowledge/industrial/host-computer/communication/csharp-mcpx-read-write/)。D200/D240布局是仓库自定义教学邮箱，非厂商通用动作地址。
+
+## 6. 诊断快照看哪些属性
+
+CommunicationPortSnapshot包含：
+
+| 属性 | 用来区分 |
+| --- | --- |
+| Operation | 当前绑定的原工位OperationKey |
+| BootId/RequestId | 原远端请求身份，断线时保留 |
+| RemoteTerminalObserved | 是否真的观察到匹配的远端终态 |
+| ReleaseAttempted | 是否已进入一次释放尝试，未知时禁止重复写2 |
+| ReleaseObserved | 是否只读或正常回复确认了本协议释放证据 |
+| ReadyForNextCycle | 没有绑定，或释放已证明且通道0/0 |
+| LastResolution | 最近Known/Unknown/EpochChanged等观察摘要 |
+| SubmitWrites/ReleaseWrites | 模拟服务端实际收到对应控制写入的次数 |
+| Connections | 模拟服务端接受的TCP连接数，可观察重新连接 |
+| Disposed | 端口和它拥有的回环服务已结束 |
+
+这些计数只是本次模拟运行诊断，不是持久化审计、PLC执行次数或防重复执行凭据。
+
+## 7. 正常周期如何交接
+
+```csharp
+CommunicationStationSession session = await CommunicationStationSession.OpenAsync(directory);
+await session.StartAsync("part-001", "demo-ng-v1");
+// 等待并检查本地终态；本例自测/Demo提供了有截止时间的等待辅助。
+await session.SaveResultAsync();
+bool released = await session.ReleaseRemoteAfterSavedAsync();
+if (released)
+    await session.SimulateReviewAndReleaseAsync(PeerResultDisposition.AcceptedByPeer);
+```
+
+这是正常路径片段，前提是终态已出现且Task/Pending结清；不能删掉等待条件连着调用。关闭还应持续调用CloseStepAsync直到完成，并观察错误，而不是遗漏资源收尾。
+
+如果提交回复丢失：显式ReconcileAsync，等原Pending排空，保存原故障终态，再ResetObservedControlAsync和ReleaseRemoteAfterSavedAsync，最后本地模拟核对/复位。故障之后不会自动续跑采图。
+
+## 8. 释放未知的处理
+
+ReleaseRemoteAfterSavedAsync在真正尝试释放前要求同Ticket远端终态及控制0/0；有保持电平则先明确归零，不把这次前置拒绝记成已尝试释放。
+
+真正调用释放以后若Unknown，保留ReleaseAttempted。再次调用不会重复写2，应调用ObserveReleaseAsync。只有匹配BootId、RequestId、HighWater、Idle、Released及控制状态的组合才形成释放证据。
+
+若证据确认但仍保持2/2，显式ResetObservedControlAsync写0，读回确认后ReadyForNextCycle才true。NotRetained或仅Idle都不够。
+
+本例偏保守：释放尝试后无法证明的分支保持阻止，没有自动诊断修复全部故障的实现。真实协议要提供足够的可查询记录，不能用“多发一次应该没问题”替代。
+
+## 9. 演示、验证和边界
+
+实际Demo输出：
+
+```text
+Lost submit ACK: stage=Faulted; ticket=1/1; submits=1
+Read-only reconciliation: stage=Faulted; submits=1; executions=1
+Saved/released/closed: releaseWrites=1; closed=True; portDisposed=True
+```
+
+新增51项实际TCP回环检查，原215项工位/WPF回归通过，共266项；旧邮箱55项单独回归通过。锁文件还原和Release构建零警告零错误，测试关闭后再次连接原端口失败，确认监听器已释放。
+
+绑定未落盘、BootId不具跨进程可信性，当前例子不支持进程重启后恢复原Ticket。默认WPF入口继续纯模拟，本批通信入口仅控制台；尚无实际PLC、机械、相机、模型、长期吞吐和安全验收。
+
+理论见[任务身份、MC回环与只读核对](/knowledge/industrial/host-computer/station/communication-task-mapping-and-readonly-reconciliation/)。继续[C#运动端口与工位会话](/knowledge/industrial/host-computer/station/csharp-motion-station-port-and-qualified-feedback/)，再分批组合视觉与实机链路。

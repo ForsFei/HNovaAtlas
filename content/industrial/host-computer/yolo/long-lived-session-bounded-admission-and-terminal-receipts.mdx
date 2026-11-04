@@ -1,0 +1,121 @@
+---
+id: industrial-yolox-bounded-worker
+title: YOLOX后台处理：长寿命会话、有界准入与结果收据
+description: 将模型会话交给单个逻辑消费者，解释排队、运行、未确认终态的统一容量，处理重复提交、故障停止、关闭排空与WPF结果消费。
+tags: [工业自动化, YOLOX, C#, Channel, 生命周期]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 120
+prerequisite: [industrial-yolox-wpf-display, industrial-csharp-yolox-wpf]
+related: [industrial-csharp-yolox-bounded-worker, industrial-csharp-yolo-onnx-session]
+---
+
+## 1. 从每次加载模型到单所有者会话
+
+第六批的离线窗口每次点击检测都创建模型会话，处理完成后释放。它让单次生命周期清楚，但重复校验、解析和初始化模型会增加开销。本批增加一个后台工作器：初始化一次会话，串行处理多张图，最后统一释放。
+
+```text
+创建工作器 → 后台初始化会话 → Ready
+→ 接收任务 → 排队 → 预处理/Run/后处理 → 保留终态
+→ 消费者确认结果 → 释放账本槽
+停止准入 → 排空已接收任务 → 释放会话 → Completion
+```
+
+一次模型会话处理多个任务，不表示多个任务可以同时Run，也不表示Dispose可以从UI线程抢先执行。模型初始化、预处理、Run和Dispose由一个逻辑消费者串行拥有；消费者等待Channel后可能在不同线程池线程继续，所以这里不承诺固定OS线程号。
+
+固定模型、BGR输入和源空间NMS策略沿用前批，不因复用会话而改变。当前仍为CPU、顺序运行、参考用途的单线程及禁图优化配置，不据此给出生产性能建议。
+
+## 2. 为什么仅限制Channel长度还不够
+
+假设Channel容量为2。消费者从队列取走第一张图时，队列空出一个位置；如果生产者继续提交，而完成的结果不断保存在其它集合，虽然Channel从未超过2，系统仍可能持续增长。
+
+本批的容量覆盖整个未完成交接链条：
+
+```text
+Retained = Queued + Running + Unacknowledged
+Retained <= Capacity
+Running <= 1
+```
+
+其中Unacknowledged包括成功和失败终态。容量2时，一个正在推理、一个排队，已经满；两个结果都已完成但消费者尚未确认，也仍然满。
+
+| 状态 | 占槽吗 | 何时释放 |
+| --- | --- | --- |
+| 排队中 | 是 | 转成运行，继续占槽 |
+| 运行中 | 是 | 转成终态，继续占槽 |
+| 成功或失败终态未确认 | 是 | 消费者提交匹配收据 |
+| 仅因切图而不显示 | 是 | 本地消费者明确处理并确认后 |
+| Full/Starting/Closed拒绝 | 否 | 从未接收，没有结果任务 |
+
+这里限制的是任务数量，不是精确内存字节。大图的自有像素、冻结BitmapSource、原生运行时与预处理中间缓冲仍占内存；也没有阻止调用方在提交之前自己无限创建图片。连续相机系统还必须在更上游限制缓冲和解码并发。
+
+## 3. Channel与账本各管一部分
+
+Channel负责把已接收的任务交给一个消费者，账本负责覆盖排队、运行和终态的全部容量及身份。使用有界Channel、SingleReader=true、SingleWriter=false、AllowSynchronousContinuations=false，FullMode=Wait。
+
+本例实际使用TryWrite，不在提交路径中无限等待。若不能立即转移就返回Full；没有DropOldest、DropNewest或DropWrite。检测任务不能像最新预览一样随意覆盖，否则已经接收的图可能没有终态。
+
+“Wait模式”不代表TryWrite也会阻塞。异步等待空间属于WriteAsync的行为；TryWrite在没有空间时返回false。账本准入和TryWrite在同一个锁保护下完成，失败会回滚条目，也不推进已接收编号的高水位。
+
+TaskCompletionSource使用RunContinuationsAsynchronously，避免完成Promise时直接在账本锁内执行消费者续体。它不自动把续体安排到WPF线程；UI所属await调用仍依赖Dispatcher上下文。
+
+## 4. 编号、重复与所有权转移
+
+每个工作器有自己的Producer和Session；YoloWork携带Producer、递增Number和捕获的ImageSnapshot。只有Accepted表示本次任务被接收，调用方可以等待其Completion。
+
+| 准入结果 | 含义 |
+| --- | --- |
+| Starting | 模型尚在初始化，没有转移 |
+| Accepted | 新任务已接收，返回终态Promise |
+| AlreadyTracked | 同一个任务对象重复提交，返回原Promise，不再运行 |
+| Conflict | 仍保留的同编号对应另一个对象 |
+| Stale | 编号不高于已接收高水位，且原条目已不在账本 |
+| Full | 未释放槽已达到容量，本次不接收 |
+| Closed | 正在关闭或已经停止，不接收 |
+| Invalid | 生产者、编号或图像无效 |
+
+相同字段的record副本也不是同一任务对象。准入尚未关闭时，处理完成前或完成后未确认的原对象重复提交均复用同一Promise；确认并移除后再提交旧编号返回Stale，不能把它当重新推理命令。
+
+Full不推进高水位，因此消费者释放槽后，可以重新提交尚未被接收的该编号。超过高水位的编号跳跃是允许的，但一旦更大的编号已经接收，更小编号便不能倒退接收。多生产线程应统一编号策略；32个并发测试提交的是同一个对象，不是证明所有乱序编号都可接受。
+
+## 5. 收据确认不是产品合格
+
+每个Accepted任务都得到YoloTerminal：Session、原任务、Completed/Failed、可选OverlayResult和错误码。Acknowledge要求收到的正是账本保留的终态对象，复制出来的相同record不能代替它；重复确认返回false。
+
+WPF消费者先让DisplaySession判断本图附着、迟到或失败，然后明确确认本地结果。旧图结果不能显示，但应用已经检查并消费了它，所以仍可以确认并释放槽。这里的确认只表示本地交接完成，不表示人工看过、质量合格、结果已落盘或PLC收到。
+
+退出后账本仍可保留未确认结果。Completion成功只说明工作器已退出并释放会话，不会偷偷把这些结果标成“已消费”；调用方仍可以ReadTerminal和Acknowledge。进程重启后没有持久化恢复，本地编号与收据也不是生产事务协议。
+
+## 6. 初始化失败和运行失败怎样收尾
+
+Ready表示模型初始化成功这一事实；初始化失败时Ready和工作器Completion均失败，尚未接收任务。Ready成功后，不能用它判断工作器永远健康，还要读取Closed/Faulted或观察Completion。
+
+本批采用明确的故障停止策略：某次预处理、推理、后处理或错图验证发生异常时，当前任务产生Failed；停止接收新任务，已接收但未运行的任务产生WorkerStoppedBeforeRun，释放会话后Completion报告异常。没有继续使用状态不明的原生会话、自动重建或重试。
+
+这样能区分“模型成功运行但没有框”和“根本未成功处理”。两者不能都返回空集合。异常类型通过终态错误码记录，整体异常保留在Completion的内部异常中；控制层应观察它，避免只等待单图Promise而忽略会话故障。
+
+正常关闭则不同：停止新准入后，已接收的排队任务继续运行并产生终态；最后才Dispose。初始化期间关闭也需要等构造返回并释放刚建好的会话，不承诺中断模型加载。
+
+## 7. 与WPF显示状态分工
+
+原DisplaySession仍控制“当前选择”和一个显示请求；新工作器负责后台会话和有界任务生命周期。新的窗口入口复用这两个对象，仍只显示打开、检测、清空三个按钮。
+
+手动窗口一次只提交一个检测，UI不展示积压队列；工作器容量2及多任务行为在独立检查中验证。点击清空不取消后台任务，切图后旧结果也不叠加；任务返回后窗口会消费其收据。关闭时先Complete停止后台准入，再等待当前UI交接和后台Completion，避免在Run仍执行时从UI调用Dispose。
+
+当前没有最新预览槽、连续相机接入、PLC结果交接或任务持久化。将来若增加最新预览，可以允许预览替换，但不能让这种替换规则删除已经接受的检测终态。
+
+## 8. 本批证据与下一步
+
+新增49项门闩/账本/WPF交接检查，使用内部测试引擎验证准入、容量、重复、并发、失败、初始化中关闭、Dispose错误和迟到结果；另有12项真实CPU/OpenCV/WPF检查。真实检查使用同一个会话执行3次Run，得到与已有641×359渐变参考相同的行号和数值，并验证真实缺失模型失败。
+
+一次3图短回放不能证明FPS、长期无泄漏或现场吞吐；32次同对象并发提交也不代表32路模型并发。新增GUI路径已编译，自动检查不打开可见窗口，完整人工交互和多显示器验收继续保留。
+
+继续[C# Channel账本、复用会话与关闭实践](/knowledge/industrial/host-computer/yolo/csharp-yolox-worker-channel-ledger-and-drain/)。第八批已补[本地样本、标注与误检漏检](/knowledge/industrial/host-computer/yolo/local-dataset-label-contracts-and-operating-point-review/)，工具已交付，真实用户质量尚待验收；下一步部署与综合工位。
+
+## 参考资料
+
+- [Microsoft Channels文档](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)：有界通道、满载模式和TryWrite行为。
+- [Channels官方介绍](https://devblogs.microsoft.com/dotnet/an-introduction-to-system-threading-channels/)：单消费者提示及异步生产消费。
+- [WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)：Dispatcher及后台结果交接。
+- 固定模型会话的输入、输出与释放继续遵循[第三批契约](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)。

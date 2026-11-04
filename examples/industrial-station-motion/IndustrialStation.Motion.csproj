@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings><TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../industrial-station/IndustrialStation.csproj" />
+    <Compile Include="../industrial-motion/SimAxis.cs" Link="Motion/SimAxis.cs" />
+    <Compile Include="../industrial-motion/MotionMath.cs" Link="Motion/MotionMath.cs" />
+    <Compile Include="../industrial-motion/MotionObservation.cs" Link="Motion/MotionObservation.cs" />
+  </ItemGroup>
+</Project>

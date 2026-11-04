@@ -19,6 +19,7 @@ src/generated/
 examples/industrial-s7/.local/
 examples/industrial-opcua/.local/
 examples/industrial-yolo-onnx/.local/
+examples/industrial-yolo-images/.local/
 task_plan.md
 progress.md
 findings.md

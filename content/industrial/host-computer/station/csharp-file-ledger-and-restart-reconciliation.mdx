@@ -1,0 +1,192 @@
+---
+id: industrial-csharp-station-result-ledger
+title: C#实践：FileStream结果记录与重启核对
+description: 通过StationLedger演示FileStream创建写入刷盘释放、JsonSerializer严格读写、追加文件发布、重复处理和重启准入报告。
+tags: [工业自动化, C#, FileStream, JSON, 持久化]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 50
+prerequisite: [industrial-station-result-ledger]
+related: [industrial-csharp-station-async-host, industrial-csharp-station-controller]
+---
+
+## 1. 项目与运行入口
+
+沿用examples/industrial-station/IndustrialStation.csproj，纯.NET10，无第三方包。本批新增StationLedger.cs、LedgerSimulation.cs、LedgerChecks.cs，保留所有旧入口。
+
+```powershell
+dotnet build examples/industrial-station/IndustrialStation.csproj -c Release
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --ledger-test
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --ledger-demo
+```
+
+成功退出0，异常1，用法错误2。两条新入口只在系统临时目录新建唯一hnova-station-ledger目录，打印实际路径，保留文件供检查；不覆盖用户目录，也不自动清除失败证据。运行一次测试会保留若干小型场景目录，后续可在确认不需要后自行清理打印出的专用目录。
+
+Demo输出：
+
+```text
+Saved terminal: Completed/Ng; newCycleAllowed=False
+Reopened: terminalPresent=True; blocked=True
+Explicit simulated review: allowed=True; no command executed by review
+Interrupted intent: terminalPresent=False; blocked=True; autoReplay=false
+```
+
+这是实际文件关闭/重开的模拟，不调用设备。并非真实进程崩溃或断电试验。
+
+## 2. StationLedger对象怎么用
+
+```csharp
+using StationLedger ledger = new(directory);
+LedgerReport report = ledger.Report;
+if (!report.CanStartNewCycle)
+{
+    // 展示原周期和待核对事项；不派发新工件。
+    return;
+}
+
+bool newlySaved = ledger.Begin(session, cycle, order);
+if (!newlySaved)
+{
+    // 同一意图已经存在，不能因此再次派发动作。
+    return;
+}
+// 只有新意图保存成功，才进入后续命令派发。
+```
+
+这里directory、session、cycle、order由编排调用方提供，是API使用片段。实际可运行顺序见LedgerSimulation.RunNormal，控制器命令在Begin成功前没有被取走。
+
+| 属性/方法 | 用途与返回 |
+| --- | --- |
+| new StationLedger(directory) | 绝对化路径、建目录、持有独占写锁、加载并验证历史；失败抛异常 |
+| DirectoryPath | 规范化绝对目录，便于诊断 |
+| Report | 最新不可变记录数组快照，含CanStartNewCycle |
+| Begin(session,cycle,order) | 追加新周期意图；全内容相同返回false，冲突/旧来源号/未核对周期拒绝 |
+| SaveTerminal(terminal) | 追加已记录周期的终态；内容相同幂等返回false，冲突拒绝 |
+| Review(session,cycle,evidence) | 追加显式核对，封存该周期，不修改旧终态，不发动作 |
+| Dispose() | 释放文件写锁；using保证异常路径释放 |
+
+对象内部短路径用lock协调调用，但磁盘I/O是同步的，可能阻塞。不要在WPF UI线程或上一批StationHost的状态循环里直接执行。后续编排需要单独的有界记录工作者与明确成功回执，本例未加入后台队列。
+
+## 3. FileStream创建、写入和关闭
+
+追加事件的核心片段对应StationLedger.Append：
+
+```csharp
+byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(entry, options);
+using (FileStream output = new(
+    temporary,
+    FileMode.CreateNew,
+    FileAccess.Write,
+    FileShare.None))
+{
+    output.Write(bytes);
+    output.Flush(flushToDisk: true);
+}
+File.Move(temporary, destination, overwrite: false);
+```
+
+| API/参数 | 本例的选择 | 常见误用 |
+| --- | --- | --- |
+| Path.GetFullPath | 规范化调用方给出的目录 | 误以为规范化就是授权或防符号链接 |
+| Directory.CreateDirectory | 创建日志根目录 | 把任意旧目录当空日志使用 |
+| FileMode.CreateNew | 目标存在立即失败 | Create覆盖旧文件证据 |
+| FileAccess.Write | 本流仅写 | 不必要的读写权限 |
+| FileShare.None | 流存活期间禁止合作访问 | 认为锁文件名存在就代表仍持锁 |
+| `Write(ReadOnlySpan<byte>)` | 写序列化后的UTF-8字节 | 多次AppendText拼成半份JSON |
+| Flush(true) | 请求刷新文件与中间缓冲 | 认为Dispose/Flush等于任何断电场景永久安全 |
+| Dispose/using | 即使异常也关闭句柄 | 持有流后提前Move或遗漏关闭 |
+| File.Move(...,false) | 发布正式文件且拒绝覆盖 | 覆盖已有序号，丢掉原始结果 |
+
+.writer.lock使用OpenOrCreate+ReadWrite+FileShare.None持有整个账本生命周期；文件在Dispose后仍存在，判断写锁要看能否取得句柄，而不是File.Exists。这个机制不代替数据库多机并发或网络共享锁策略。
+
+正式文件读取采用FileMode.Open、FileAccess.Read、FileShare.Read，先检查Length，再分配有界byte[]，ReadExactly读取完整长度。坏文件不跳过。
+
+相关语义依据[FileStream.Flush](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush?view=net-10.0)及[File.Move](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.move?view=net-10.0)。
+
+## 4. JsonSerializer的配置和验证
+
+JSON选项包括：
+
+```csharp
+JsonSerializerOptions options = new()
+{
+    UnmappedMemberHandling = JsonUnmappedMemberHandling.Disallow,
+    RespectRequiredConstructorParameters = true,
+    AllowDuplicateProperties = false,
+    WriteIndented = true,
+    Converters = { new JsonStringEnumConverter(allowIntegerValues: false) }
+};
+```
+
+这是.NET10项目；不要未经版本检查复制到旧.NET Framework工程。SerializeToUtf8Bytes生成本次保存的完整字节；Deserialize读取LedgerEntry，record构造参数必须出现，未知属性与重复属性拒绝。
+
+类型正确还不够。代码继续检查Schema=1、连续Sequence、非空Session、正Cycle/Number、字符串长度/控制字符、枚举定义、订单关联与事件顺序。Completed终态必须同时有帧与判定；故障可以没有它们。
+
+记录枚举使用字符串，整数枚举拒绝。观察时间不能default，但本例没有证据有效期、权限或签名验证。未知JSON字段处理见[System.Text.Json官方说明](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/missing-members)。
+
+## 5. 保存终态与本地消费的次序
+
+LedgerSimulation.RunNormal在新控制器中接收订单，先Begin，再调用原OfflineSimulation.Finish，最后：
+
+```csharp
+StationTerminal terminal = station.Snapshot.Terminal!;
+ledger.SaveTerminal(terminal);
+if (!station.ConsumeTerminal(terminal))
+    throw new InvalidOperationException("Local consume failed.");
+```
+
+SaveTerminal抛异常时，执行流不会到ConsumeTerminal。它已经发布文件却在返回前出错时，当前实例同样进入StorageUncertain；调用方停止动作，不能根据内存猜测成功。
+
+重开账本后，若正式文件完整，重复保存相同终态返回false而不会新增文件。这个幂等只处理本地记录，不能授权重发设备命令或跨进程消费原收据。
+
+## 6. 如何读取重启报告
+
+```csharp
+using StationLedger ledger = new(directory);
+foreach (RecordedCycle cycle in ledger.Report.Cycles)
+{
+    if (cycle.Review is not null) continue;
+    Console.WriteLine($"{cycle.Session}/{cycle.Cycle}: " +
+        $"part={cycle.Order.Workpiece}, recipe={cycle.Order.RecipeVersion}, " +
+        $"terminal={cycle.Terminal?.Outcome.ToString() ?? "Unknown"}");
+}
+```
+
+报告只建立数据视图。没有Task、计时器或设备连接从JSON复活，也没有给新StationController恢复旧Session。CanStartNewCycle=true仅表示该账本没有未核对周期且当前实例没有写入不确定，不表示整台设备Ready。
+
+对Producer的Number高水位从Began重建。日志仍完整时，同一Producer旧号即使换Session也会拒绝；更换Producer或删除尾部后没有全局去重保证。正式上游订单系统还应持有自己的唯一业务ID与持久化接收账本。
+
+## 7. 显式核对的属性
+
+RestartReview包含Reviewer、EvidenceReference、ObservedUtc，以及MotionIdle、VisionIdle、MaterialHandled、ResultChannelReconciled四个正向声明，和ResultDisposition。
+
+ResultDisposition=AcceptedByPeer表示已经核对对端接收；ConfirmedNotPublished表示确认没有发布。仍未知就保留未核对，不能随便选择一个枚举放行。
+
+示例LedgerSimulation.DeclaredReview是测试夹具，字符串明确标记simulated-observation-only。它没有查询设备。Review成功只是追加记录；不会调用Reset、回零、清料或结果补发，也不创造原周期缺失的Terminal。
+
+若还在原进程，状态机的Pending、活跃Task、终态消费与RecoveryEvidence检查仍分别生效；日志Reviewed不能绕过这些门槛。
+
+## 8. 异常之后怎样处理
+
+| 情况 | 本例响应 |
+| --- | --- |
+| 其他写者持锁 | 构造失败，不降级为无锁写 |
+| 当前写入过程失败 | 标记StorageUncertain，停止新增写入和新周期 |
+| 目录残留.tmp | 构造失败，保留证据，不自动改名/删除 |
+| 截断、null、缺失/重复/未知属性 | 加载失败 |
+| 正式序号中间缺失 | 加载失败 |
+| 目录出现未知文件或子目录 | 加载失败，日志专用目录不可混放文件 |
+| 1000条容量耗尽 | 拒绝新增，不自动清旧日志 |
+
+检查/备份目录之后，由明确的运维流程决定修复、迁移或封存。程序没有自动修复按钮；直接删尾部可能隐藏未结周期，代码无法识别这种历史丢失。该目录需要可信本机访问；没有抵御恶意篡改、路径替换或管理员删除的保证。
+
+## 9. 本批测试和下一步
+
+Release零警告零错误。新增59项检查实际创建、写入、关闭和重新打开文件，覆盖两处发布边界注入失败、结果发布但返回失败、格式破坏、重复/冲突、生产者高水位和重启阻止。既有57项状态机、48项异步宿主回归通过，共164项。
+
+注入位置CommitPoint只供内部测试使用，公共构造函数没有故障注入参数。测试文件保留供检查，不把抛IOException模拟称为真实掉电、硬盘可靠性或PLC/MES联调验收。
+
+本批是独立持久化编排示例，未改变StationHost默认行为。继续[C#应用层与WPF工位窗口](/knowledge/industrial/host-computer/station/csharp-wpf-station-application-and-recipe-capture/)，再分批连接既有通信、运动和视觉模块。
+
+理论见[周期意图、落盘顺序与重启核对](/knowledge/industrial/host-computer/station/result-recording-durable-intent-and-restart-review/)，异步运行义务见[C#单所有者宿主](/knowledge/industrial/host-computer/station/csharp-async-host-mailbox-ports-and-reconciliation/)。

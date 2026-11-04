@@ -1,0 +1,170 @@
+---
+id: industrial-csharp-station-operator-application
+title: C#实践：WPF工位窗口、配方捕获与应用层API
+description: 用StationApplication组合宿主和账本，逐项说明启动、保存、核对、关闭API及WPF异步事件、DispatcherTimer、Closing和离屏检查。
+tags: [工业自动化, C#, WPF, 异步, 配方]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 70
+prerequisite: [industrial-station-operator-application]
+related: [industrial-csharp-station-async-host, industrial-csharp-station-result-ledger]
+---
+
+## 1. 项目与运行方式
+
+核心应用层仍在examples/industrial-station，新增StationApplication.cs和ApplicationChecks.cs；WPF独立放在examples/industrial-station-wpf，目标net10.0-windows/x64，引用核心项目，没有新增第三方包。
+
+```powershell
+dotnet build examples/industrial-station-wpf/IndustrialStation.Wpf.csproj -c Release
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --application-test
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --application-demo
+dotnet run --project examples/industrial-station-wpf/IndustrialStation.Wpf.csproj -c Release --no-build -- --ui-test
+```
+
+打开全新临时目录的交互窗口：
+
+```powershell
+dotnet run --project examples/industrial-station-wpf/IndustrialStation.Wpf.csproj -c Release --no-build -- --open-demo
+```
+
+使用自己的专用可信本机目录，以便关闭后重新打开核对：
+
+```powershell
+dotnet run --project examples/industrial-station-wpf/IndustrialStation.Wpf.csproj -c Release --no-build -- --open "C:\HNovaData\OfflineStation"
+```
+
+最后两条是手动窗口入口，不会连接设备。目录必须专用于本例，不能混放图片、截图或其他文件；已有未知.tmp或坏记录会拒绝打开，不自动修复。
+
+应用Demo和检查在系统临时目录新建唯一目录并打印路径，保留文件。UI检查不显示窗口，创建WPF控件、渲染PNG并测试关闭；成功0、异常1，用法2。
+
+## 2. StationApplication的对象和API
+
+```csharp
+StationApplication application = await StationApplication.OpenAsync(directory);
+ApplicationSnapshot snapshot = application.Snapshot;
+Admission accepted = await application.StartAsync("part-001", "demo-ng-v1");
+```
+
+OpenAsync把目录加载与文件锁获取放到后台，构造内部StationHost。打开失败时释放已取得资源，异常返回调用方，不继续显示可启动状态。
+
+| 属性/方法 | 用途 |
+| --- | --- |
+| Recipes | 两份只读、不可变的固定版本配方目录 |
+| DemoProducer | 本示例固定来源身份，用持久化Number高水位防旧号重入 |
+| DirectoryPath | 当前记录目录 |
+| Snapshot | 内存快照，包含Host、Ledger、Busy、CloseRequested、Closed、Error |
+| StartAsync(workpiece,recipeVersion) | 验输入/状态，后台Begin成功后才让宿主Start |
+| StopAsync() | 请求软件流程停止；无当前订单时返回false |
+| SaveResultAsync() | 文件保存成功后消费原本地终态；还没有终态返回false |
+| ReconcileAsync() | 请求宿主启动只读核对，不能重发Execute |
+| SimulateReviewAndReleaseAsync(disposition) | 检查本地收尾，保存模拟核对，再放行或复位；不接设备 |
+| RequestClose() | 独立于应用槽提出关闭，立即阻止后续启动路径 |
+| CloseStepAsync() | 执行一次关闭收尾，完成返回true，仍等待任务则返回false |
+
+Snapshot没有执行文件I/O。它读取缓存的LedgerReport和最新HostSnapshot；两者不是跨对象数据库事务快照，写入期间应结合Busy理解。
+
+## 3. 配方如何捕获
+
+```csharp
+public sealed record StationRecipe(
+    string Version,
+    Verdict Judgment,
+    int SimulatedDelayMilliseconds);
+```
+
+Validate检查Version非空、修剪、无控制字符且不超过64字符，枚举有定义，模拟延迟0～250ms。固定目录的两个Version不能重复，模拟端口会拒绝重复键或未知版本。
+
+启动时生成WorkOrder，RecipeVersion来自这次传入的Version。RecipeSimulationPort按每个StationCommand.Order.RecipeVersion查已固化目录；界面选择不作为运行期共享变量。
+
+本批配方只包含模拟判定与显示节奏，不包含实际位置、曝光或阈值。扩展真实配方时应捕获完整不可变内容与版本，而不是在每个步骤重新读一个可变JSON文件。
+
+## 4. 应用槽与后台磁盘I/O
+
+每个应用操作先尝试SemaphoreSlim.Wait(0)，没有槽就即时返回ApplicationBusy失败Task。成功取得槽后，在Task.Run里执行编排与同步账本调用；finally释放槽并更新Busy。
+
+```csharp
+// 顺序概念片段，实际状态和异常检查见StationApplication.StartAsync。
+if (!ledger.Begin(session, nextCycle, order))
+    throw new InvalidOperationException("ExistingIntentNeverReplay");
+
+// 保存成功后仍要再次检查关闭标志。
+Admission accepted = await host.StartAsync(order, readiness);
+```
+
+不使用WaitAsync无限排队点击，也不为每次UI刷新起一个磁盘任务。这个槽限制的是应用请求，不是硬件安全互锁；流程停止不具有抢占正在写文件的能力，关闭标志另有独立路径。
+
+Start所用nextCycle来自Idle宿主的当前Cycle+1；只有此应用层可以启动内部宿主，外部不暴露可修改的StationHost实例。若未来增加自动上料线程，也必须经过同一应用准入，不能同时绕过它调用宿主Start。
+
+写入失败会保留账本的StorageUncertain限制，异常不会被转换成“启动成功”。关闭恰好赶上保存意图时，已保存但未派发的Began留作重开核对，不能删除记录后静默重试。
+
+## 5. 保存、消费和模拟核对
+
+SaveResultCoreAsync取宿主原终态，先调用ledger.SaveTerminal，再调用host.ConsumeAsync。只有原内存收据用于消费，文件反序列化的副本不代替它。
+
+重复点击保存时，相同结果不会追加第二份文件；本地已经消费则直接返回成功。故障终态仍有Pending时也可先保存，但保存不能清除待结义务。
+
+SimulateReviewAndReleaseAsync先拒绝活跃Task、非空Pending和未消费终态。随后记录明确标记为explicit-simulated-review-only的声明，再用匹配Session/Cycle/RecoveryVersion的测试恢复声明，调用ReleaseAsync或ResetAsync。
+
+对重启的旧周期，新宿主没有当前订单，只记录对旧周期的模拟核对，不调用旧状态恢复。PeerResultDisposition需明确为AcceptedByPeer或ConfirmedNotPublished；真实项目必须换成已验证的观察证据，本方法名中的Simulate不能去掉后直接接现场。
+
+## 6. WPF按钮与UI线程
+
+本例使用一个小型MainWindow代码类直接组合控件，没有额外的通用命令框架。窗口只调用应用API和刷新显示，后续规模扩大再拆ViewModel。
+
+按钮事件使用async；调用应用方法后立即Refresh显示Busy，再await任务，最后更新状态。事件中的异常由统一Act方法捕获，显示在窗口错误文本里。
+
+```csharp
+string workpiece = workpieceInput.Text;
+string version = selectedRecipe.Version;
+try
+{
+    Task<Admission> pending = application.StartAsync(workpiece, version);
+    Refresh();
+    await pending;
+}
+catch (Exception error)
+{
+    errorText.Text = error.Message;
+}
+Refresh();
+```
+
+这是UI线程事件片段。输入在点击时捕获；await后的事件继续回到WPF上下文，后台应用层不直接修改TextBlock、ComboBox或Button。不要用.Wait()或.Result阻塞UI线程，线程模型参考[Microsoft WPF threading model](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)。
+
+DispatcherTimer每200ms在UI Dispatcher上触发，读取内存快照、更新文本和IsEnabled。计时器不负责运动控制、文件写入或流程期限；实际调度可能晚于间隔。窗口关闭后Stop计时器，避免继续持有窗口，API见[DispatcherTimer](https://learn.microsoft.com/en-us/dotnet/api/system.windows.threading.dispatchertimer?view=windowsdesktop-10.0)。
+
+## 7. 按钮什么时候可以用
+
+| 控件 | 本例条件 |
+| --- | --- |
+| 启动、工件输入、配方选择 | 应用不忙、不关闭，宿主Idle且账本允许新周期 |
+| 流程停止 | 有当前订单、尚无终态且未关闭 |
+| 保存结果 | 有终态，尚未消费，应用不忙 |
+| 只读核对 | 宿主NeedsReconciliation，关闭中也可用 |
+| 模拟核对放行 | 无Task/待结，终态已消费，有未核对周期且未关闭 |
+| 关闭 | 始终可提出请求；真正退出取决于收尾 |
+
+应用层重复检查条件，因此“禁用按钮”不是唯一保护。文件CanStartNewCycle=true也不够，宿主必须Idle；本地消耗了终态也不够，文件未核对仍不能新启动。
+
+窗口显示最近5个周期摘要，账本总容量仍为1000条事件。没有自动滚动清空账本，也没有可视化全量历史查询或配方编辑器。
+
+## 8. Closing为什么先取消
+
+Closing是同步事件，第一次发生时设置Cancel=true，然后提出RequestClose；不能在这个事件里同步阻塞等待异步任务。
+
+之后DispatcherTimer调用有限的CloseStepAsync。有终态先保存并消费；宿主尚未完成则本次返回false。tickActive防止async事件重入形成并行关闭泵。
+
+最终宿主Completion成功，端口释放，再释放账本写锁。窗口设置allowClose后重新Close，此时Closing允许真正退出，Closed停止计时器。API语义见[Window.Closing](https://learn.microsoft.com/en-us/dotnet/api/system.windows.window.closing?view=windowsdesktop-10.0)。
+
+关闭保存失败时显示错误并停止自动关闭重试，保留窗口。端口Task永不返回时也不会提前释放端口。正常关闭没有硬编码强制退出时间；测试中的10秒仅防检查挂起。
+
+## 9. 验证与后续
+
+两个项目Release零警告零错误，新增44项应用检查、7项WPF离屏/控件状态/关闭检查；原57项状态机、48项异步宿主、59项账本回归通过，共215项。
+
+应用Demo实际执行NG周期，保存后消费，模拟核对放行，再完成宿主和账本关闭。WPF离屏PNG已检查；离屏检查渲染已Measure/Arrange的内容树，并检查非空绘制像素。此结论不等于人工鼠标/键盘、不同DPI和长期运行验收。
+
+本批所有动作仍由RecipeSimulationPort产生，未调用PLC、雷赛、相机或视觉模型。继续[C#通信端口与回环会话](/knowledge/industrial/host-computer/station/csharp-mc-station-port-and-loopback-session/)，已提供独立MC集成入口，默认WPF仍保持本批纯模拟行为。
+
+理论见[配方捕获、应用编排与关闭收尾](/knowledge/industrial/host-computer/station/operator-window-recipes-and-application-orchestration/)，文件协议见[C#结果记录与重启报告](/knowledge/industrial/host-computer/station/csharp-file-ledger-and-restart-reconciliation/)。

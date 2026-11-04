@@ -1,0 +1,124 @@
+---
+id: industrial-station-vision-adapter
+title: 工位视觉适配：自有帧、同帧处理与结果交接
+description: 将Mono8回放源、单拍会话和有界处理器接入工位Capture/Inspect，区分借用缓冲、自有像素、原帧判定、结果确认及超时迟到排空。
+tags: [工业自动化, 上位机, 机器视觉, 图像采集, 结果交接]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 120
+prerequisite: [industrial-station-motion-adapter, industrial-csharp-single-capture-session, industrial-csharp-inspection-pipeline]
+related: [industrial-csharp-station-vision-adapter, industrial-csharp-mono8-buffer-lifetime]
+---
+
+## 1. 这一批真正处理像素
+
+本批新增industrial-station-vision，复用已有OfflineFrameSource、SingleCaptureSession、InspectionPipeline和Mono8Image。工位Capture取得带身份的自有图，Inspect对这份图做真实ROI统计，再按固定教学规则得出Ok/Ng。
+
+图像来自仓库原创8×6 P2夹具及内存反相图，不是相机照片。Move和PublishResult仍模拟，后者只是本地模拟回执，没有PLC/MES投递。本批不调用相机SDK、HALCON、OpenCvSharp或YOLO，也不改变默认WPF窗口。
+
+前两批的通信、单轴和本批视觉是独立集成入口，尚未自动拼成一套设备程序。下一批再组合运动与视觉的完整离线工位。
+
+## 2. 一次采图转移了什么
+
+```text
+本周期Capture命令
+  → 更新离线采集上下文
+  → Prepare/TakeTrigger转移一次本地采图意图
+  → Acquire借用源缓冲
+  → CopyToOwned按Stride复制像素
+  → Dispose归还借用
+  → 声明本回放帧的离线触发关联
+  → ObserveFrame核对原请求/源/帧/质量
+  → TakeForProcessing转移自有帧
+  → ReleaseCapture释放单拍会话槽
+  → 返回本周期FrameId
+```
+
+实际代码在归还借用后再做帧关联和异步交接，保证原源缓冲不会被处理器持有。源每行有2字节填充，复制只取Width个有效像素，填充值238不参与统计。
+
+ReleaseCapture表示采图结果的所有权已经转交应用，不是算法结束，更不是结果已经保存。处理器自己的结果槽还要在后面确认。
+
+## 3. 同一张图需要哪些身份
+
+| 身份 | 表达的关系 |
+| --- | --- |
+| OperationKey | 原工位Session/Cycle/Operation/Step |
+| WorkOrder | 原工件与配方版本 |
+| CaptureRequest.Key | 本地单拍会话与请求号 |
+| CameraEpoch与TriggerSequence | 本次回放定义的采集代/关联号 |
+| FrameStamp | 回放源Session/Number |
+| 工位FrameId | 本周期生成的GUID，映射到已接受FrameStamp |
+| PipelineSession与ProcessingRecipe | 原处理器及固定处理配方 |
+
+适配器在Capture后保留这些对应关系。Inspect必须携带该工位FrameId；处理器结果必须匹配原请求、源帧、采集代、触发号、处理器和配方。PublishResult的帧与判定也要一致。
+
+本例离线源本身决定帧顺序，因此可以显式声明该回放帧与本地请求关联。不能把这种夹具能力推广成真实相机的“第N次触发必然是第N帧”；原始触发号、清旧缓冲、相机重连代和完整帧证明仍需真实SDK适配。
+
+## 4. 判定来自统计，不来自配方名字
+
+固定两个视觉配方：
+
+| 工位版本 | ROI | 阈值 | 教学Ok条件 |
+| --- | --- | --- | --- |
+| demo-ok-v1 | 左侧(1,1,2,2) | 200，包含等于 | 均值至少200，且4像素中至少3个达到阈值 |
+| demo-ng-v1 | 右侧(5,1,2,2) | 200，包含等于 | 同上 |
+
+Version名字只是沿用已有工位目录，不是强制结果。演示连续两次使用demo-ok-v1：原图左侧均值220、4个亮像素，得到Ok；反相图同ROI均值35、0个亮像素，得到Ng。
+
+这是可核算的像素示例，不是缺陷检测算法或真实产品质量标准。曝光、照明、饱和、噪声与标注集都没有实机验证；不要据此设定生产阈值。
+
+测量抛异常或返回NaN等无效统计时，处理器形成Failed终态，工位记录StepFailed:Inspect，不制造Ng/Ok，也不发送模拟结果回执。算法失败和产品Ng是不同结果。
+
+## 5. 为什么归还了借用还不能接下一件
+
+单拍槽、处理器容量和工位周期槽分别约束不同对象：
+
+- FrameLease归还：源可以复用原缓冲。
+- ReleaseCapture：应用已取得自有帧，不再占单拍请求槽。
+- InspectionPipeline结果待确认：仍保留原输入/结果，容量没有释放。
+- 工位周期待核对：即使算法已结束，也不能覆盖旧工件。
+
+本例为两份固定配方各建一个容量1处理器，适配器另外只保留一个工位周期，合计最多一个未确认处理结果；不会逐帧Task.Run或自动丢旧结果。
+
+正常顺序是SaveResultAsync保存并消费工位终态，AcknowledgeVisionAfterSavedAsync确认原处理器结果收据，然后显式模拟核对并放行。确认方法检查同周期、原订单、本地保存内容与消费状态，且实际Task/Pending都已结束。
+
+CycleAcknowledged只是本地周期/结果确认，不表示所有托管数组已经被GC回收。SingleCaptureSession还保留最近一次转交历史，像素仍可能被有限的历史对象引用；没有原生图像句柄需要释放。
+
+## 6. 错帧和重复请求怎样处理
+
+同一工位步骤、同样完整命令，返回原Task。重复Capture不再Acquire，重复Inspect不再TrySubmit或测量；相同身份换工件、配方、FrameId或判定拒绝。
+
+不匹配的CameraEpoch、TriggerSequence、源Session、不完整图或未确认身份都会拒绝。借用已经归还，处理器没有收到这些像素，也不会尝试“取最新一帧补上”。
+
+ObserveAsync只读取原步骤已有的回复或null，不重新采图、处理或发布。一个异常采图Task之后的null不表示“没有缺陷”，它仍是未结的工位义务。
+
+当前FrameId/FrameStamp及处理绑定只在内存里。工位结果文件保存FrameId和判定，但本批没有将源帧身份、测量明细或图片落盘；不能声称重启后可凭GUID还原原图。
+
+## 7. 超时后图到了，为什么还不检测
+
+Capture等待超时时，工位锁存故障并保留原Pending。后来采图Task成功返回，只能排空待结；该帧不会成为工位接受的当前FrameId，也不会派发Inspect。
+
+Inspect超时时，处理器可能仍在计算自有像素。关闭要等待原处理结束，不能提前释放处理器。即使后来算法算出Ok，工位的原Faulted终态保持不变，不发布结果。
+
+诊断快照可能同时出现“原工位故障”和“后来处理均值220/Ok”。前者是生产流程终态，后者是迟到诊断结果，不能混成一次正常合格产出。
+
+本例关联会话使用每次递增0.001的虚构回放时间，全部采图转移同步完成。它只用于离线顺序，未证明真实相机帧龄；工位阶段超时依旧使用宿主TimeProvider，与这个回放计数分开。
+
+## 8. 关闭和重启核对
+
+关闭首先保存并消费工位终态，等待实际端口Task与Pending结清。随后停止接收新处理，Complete并等待两个处理器退出，再关闭回放源。
+
+关闭不自动伪造处理器Acknowledge。迟到处理完成后可能仍保留一份未确认原结果；源与工作器已结束，周期文件仍未Reviewed，重开继续要求显式核对。托管对象最终回收与业务结果确认是两件事。
+
+重启只有旧Began时，先核对旧周期，不必打开回放源；模拟核对不补造终态。核对完成后才允许OpenReplay和新工件，新宿主/源有新Session，生产者Number继续沿用本地持久化高水位。
+
+这不恢复原相机Task、触发号或图像。真实相机/机械恢复、跨进程绑定、结果留图和数据库/MES交接仍需后续适配。
+
+## 9. 验证与续读
+
+新增47项视觉工位检查，原309项工位/通信/运动/WPF回归通过，共356项；旧视觉63、单拍73、流水线71项另外回归。Release零警告零错误。
+
+实际演示同配方处理两帧，均值220→35、判定Ok→Ng，借用数始终回到0，正常确认后保留结果数0并关闭。还覆盖错帧、重复、不合格统计、异常、重启旧周期、迟到采图和迟到处理。
+
+继续[C#视觉端口、自有帧与处理收据API](/knowledge/industrial/host-computer/station/csharp-vision-station-port-and-frame-receipts/)。继续[组合运动与视觉的离线端到端工位](/knowledge/industrial/host-computer/station/integrated-offline-station-motion-to-image-and-result/)，真实相机/雷赛/原生算法与现场验收继续单列。

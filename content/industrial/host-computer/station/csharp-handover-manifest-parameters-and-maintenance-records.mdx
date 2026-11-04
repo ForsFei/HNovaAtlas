@@ -1,0 +1,133 @@
+---
+id: industrial-csharp-station-handover
+title: C#实践：交付清单、现场参数模板与维护记录
+description: 使用HandoverPackage生成并只读核对资料包，通过SiteParameters.Review检查待填项，以MaintenanceRecord保留配置变更和运行事件声明。
+tags: [工业自动化, C#, 综合工位, 部署, 文件IO]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 230
+prerequisite: [industrial-station-handover]
+related: [industrial-csharp-station-commissioning, industrial-csharp-yolox-deployment]
+---
+
+## 1. 项目和运行
+
+新增examples/industrial-station-handover/IndustrialStation.Handover.csproj，net10.0，引用原commissioning项目。没有新包、网络、驱动安装或设备SDK调用。
+
+```powershell
+dotnet build examples/industrial-station-handover/IndustrialStation.Handover.csproj -c Release
+dotnet run --project examples/industrial-station-handover/IndustrialStation.Handover.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-handover/IndustrialStation.Handover.csproj -c Release --no-build -- --demo
+```
+
+成功0、异常1、用法2。Demo创建新的系统临时目录，生成五份材料并打印路径；已有目录拒绝覆盖，原材料保留。
+
+## 2. HandoverPackage的入口
+
+```csharp
+string folder = HandoverPackage.CreateExample(newDirectory, "offline-release-v1");
+PackageVerification result = HandoverPackage.Verify(folder);
+foreach (string issue in result.Issues)
+    Console.WriteLine(issue);
+```
+
+| API/数据 | 作用 |
+| --- | --- |
+| RequiredNames | 四份固定材料文件名的只读列表 |
+| CreateExample(directory,releaseId) | 只在新目录生成离线资料示例并封存清单 |
+| Verify(directory) | 只读清单和材料，不执行或加载其中配置 |
+| Sha(byte[]) | 字节内容的SHA-256大写十六进制 |
+| HandoverManifest | Schema、Scope、ReleaseId和文件条目 |
+| PackageFile | Name、Bytes、Sha256 |
+| PackageVerification.Issues | 缺失、变化、多余或整体不可读/非法等说明 |
+| FilesMatchManifest | 文件一致性结果，不是设备或验收状态 |
+
+Verify捕获预期的文件/权限/JSON/格式异常，返回问题列表；缺失根目录不会创建目录。超限或文件无法读取时可能返回整体错误，而不是完整的逐文件差异列表。调用方应完整显示Issues，不能只看是否出现Missing前缀。
+
+## 3. 校验器如何防止误读其它文件
+
+清单只允许四个固定文件名，不接受相对路径跳转、绝对路径、重复或大小写冲突名称。验证先检查清单结构，再扫描实际根目录并比较字节数和SHA。
+
+根目录和材料拒绝重解析点；扫描不递归目录，子目录会形成问题。单份文件上限64KiB，根目录扫描条目有上限。专用可信本地目录及合作写者是使用前提，不把检查当成处理任意恶意文件系统的沙箱。
+
+清单JSON要求构造参数存在，拒绝未知字段和重复属性；生成的维护样例使用字符串枚举。Verify只校验材料字节与清单一致，不解析四份材料各自的业务语义。材料读取用FileMode.Open、FileAccess.Read、FileShare.Read；先限制Length，再ReadExactly，检查读后没有额外字节。
+
+校验没有跨文件系统快照或认证签名，操作时应停止修改这份已封存材料。
+
+## 4. SiteParameters模板
+
+```csharp
+SiteParameters template = SiteParameters.Template("release-v1");
+IReadOnlyList<string> issues = template.Review();
+```
+
+| 属性组 | 字段 |
+| --- | --- |
+| 顶层 | Schema、TemplateOnly、ReleaseId、StationIdentity |
+| 通信 | PlcEndpoint、AddressMapRevision |
+| MotionParameters | CardFamily、CardNumber、AxisNumber、MillimetresPerRevolution、FeedbackToleranceMillimetres、MaximumVelocityMillimetresPerSecond |
+| CameraParameters | DeviceIdentity、PixelFormat、TriggerAssociationRevision |
+| 数据/验收 | DataRoot、AcceptanceCriteriaRevision |
+
+已知CardFamily填E3032，其余现场数值和身份均为null。不会默认卡0、轴0、固定速度、曝光或PLC地址。
+
+Review始终包含TemplateOnly-NoRuntimePermission，并报告空字段、负轴号、非有限或非正机械比例/误差/速度，以及不同卡族需要独立适配。它不会检查端点是否有效、毫米与SDK单位如何转换，也不校验真实设备或目录写权限。
+
+```csharp
+SiteParameters candidate = template with
+{
+    Motion = template.Motion with { AxisNumber = -1 }
+};
+// Review列出MissingOrInvalid:Motion.AxisNumber。
+```
+
+这是模板形状检查。完整生产配置解析、版本迁移和参数应用时机需要由实际适配器另行定义；本项目没有将模板接入原工位的运行参数。
+
+## 5. MaintenanceRecord
+
+```csharp
+byte[] actualConfigurationBytes = File.ReadAllBytes(configPath);
+string configurationSha = HandoverPackage.Sha(actualConfigurationBytes);
+MaintenanceRecord note = new(
+    1, true, Guid.NewGuid(), MaintenanceKind.StartupReview,
+    DateTimeOffset.UtcNow, "offline-observer", "release-v1",
+    configurationSha, configurationSha,
+    "offline example; no machine observation", "configuration unchanged");
+note.Validate();
+```
+
+示例ExampleOnly=true。MaintenanceKind有StartupReview、Incident、ParameterChange和RestoreReview。Validate要求合法记录号、UTC、人员、发布号、证据说明、两个64位大写哈希；ParameterChange还要求哈希不同。
+
+这里使用配置原始字节计算哈希，和上一批验收基线声明文本的指纹不同。两者应分别保存，不能用一段配置版本描述冒充文件字节校验值。
+
+Validate不验证证据引用、不认证人员，也不执行恢复。示例只提供记录模型与一份样例文件，没有实现可追责数据库、签名日志或完整运行维护系统；实际追加记录应保存新记录，保留旧记录与关联材料。
+
+## 6. 文件写入顺序
+
+生成器分别以CreateNew写同目录.pending文件，Write后Flush(true)、using关闭，再File.Move到最终文件且不覆盖。四份材料完成后写清单；哈希覆盖文件原始字节，包含JSON编码和换行。
+
+生成中断可能留下部分目录或.pending。CreateExample遇到已有目录直接拒绝，不自动删掉材料继续；Verify会报告不完整或多余文件。没有跨文件事务、突然断电验证或自动修复。
+
+程序、模板和日志目录分开后，后续运行记录不应追加进这份封存包，否则Verify会报告额外文件或变化。
+
+## 7. 实际发布与仓库外运行
+
+```powershell
+dotnet publish examples/industrial-station-handover/IndustrialStation.Handover.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=false -p:PublishTrimmed=false -o C:/Temp/AtlasHandoverTool
+Set-Location C:/Temp
+& C:/Temp/AtlasHandoverTool/IndustrialStation.Handover.exe --demo
+```
+
+应为每次实际试验选择新的输出目录；上面的固定目录仅展示命令用法。运行后资料目录仍写在系统临时目录，不依赖仓库当前路径。框架依赖发布仍要求目标环境具备匹配.NET运行时，参见[Microsoft发布概览](https://learn.microsoft.com/en-us/dotnet/core/deploying/)。
+
+本批已在当前电脑执行该类发布并从仓库外运行成功。这不证明干净目标机、WPF桌面运行时、原生DLL、驱动或现场设备已验收。
+
+## 8. 实际检查与后续
+
+新增30项检查覆盖原包只读/不覆盖、参数缺失和非法数值、维护记录约束、文件变化/缺失/多余/.pending、超限、Schema/JSON错误和路径条目。Demo输出FilesMatchManifest=True、template issues=14、field evidence missing=8。
+
+这三个结果可以同时成立：文件一致、参数未填、现场未验收。默认工位/WPF/MC入口不变。下一步补异常周期原始图像归档，继续完善实际证据链。
+
+
+本批实际验证：Release零警告零错误，新增30项与原验收运行簿34项相关回归共64项通过；实际win-x64框架依赖发布和仓库外--demo通过。

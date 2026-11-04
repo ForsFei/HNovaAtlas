@@ -1,0 +1,138 @@
+---
+id: industrial-station-integrated-flow
+title: 离线端到端工位：运动到位、原帧检测与结果保存
+description: 组合已有单轴模型和视觉端口，以唯一Move执行者完成到位、采图、同帧ROI检测、结果保存、收据确认与关闭，验证停止和迟到边界。
+tags: [工业自动化, 上位机, 综合工位, 运动控制, 机器视觉]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 140
+prerequisite: [industrial-station-motion-adapter, industrial-station-vision-adapter]
+related: [industrial-csharp-station-integrated, industrial-station-result-ledger]
+---
+
+## 1. 从两个例子组合成一条流程
+
+本批新增industrial-station-integrated，将已有MotionStationPort与VisionStationPort装入同一个工位端口，仍由StationHost驱动原状态机。
+
+现在一件工件可以走完：显式参考准备、合格定位、取得自有原图、同帧统计判定、本地模拟结果回执、结果保存、处理收据确认、模拟核对放行和关闭。
+
+运动来自纯C#模型，图像来自原创P2回放，PublishResult仍是本地模拟回执；没有真实雷赛、相机、PLC/MES、原生算法或网络。本批也没有改变默认WPF窗口。
+
+```text
+先保存本周期Began
+  → MotionStationPort唯一执行Move
+  → 合格到位证据交给视觉端口（不再运动）
+  → 状态机派发Capture
+  → 借用复制并归还，生成原帧绑定
+  → 状态机派发Inspect，实际ROI统计
+  → 同帧同判定的模拟PublishResult回执
+  → 保存TerminalSaved，再消费本地终态
+  → 确认原处理收据
+  → 显式模拟核对与本地放行
+```
+
+## 2. 为什么不能顺序调用两个Move
+
+单轴例子自己的Move负责轨迹与合格到位；视觉独立例子原本也有一个模拟Move，用来演示状态流。如果把两者的ExecuteAsync(Move)先后调用，会造成职责重复，未来换成硬件时更不能这样拼接。
+
+本批由组合端口唯一选择运动执行者。成功后只调用视觉端口新增的RecordQualifiedExternalMove，记录原StationCommand及同身份成功回复，不再调用视觉的模拟Move。
+
+演示两周期的计数是：轴Move=2、视觉模拟Move=0、外部完成证据交接=2。数据交接也不会自行采图，Capture始终由状态机派发。
+
+RecordQualifiedExternalMove只校验数据结构与身份，不会独立证明真实机械到位。组合层传入的证据来自它拥有的动作观察Task；不能让任意外部调用方伪造Success=true后绕过运动观察。
+
+## 3. 哪些对象保持唯一所有者
+
+| 对象 | 本批所有者 | 职责 |
+| --- | --- | --- |
+| StationApplication/StationHost | 组合会话 | 意图先保存、状态流、超时、终态消费与关闭 |
+| MotionStationPort | 组合端口 | 单轴模型及动作观察，唯一Move派发 |
+| VisionStationPort | 组合端口 | 原帧采集、统计、判定、模拟结果回执 |
+| IntegratedStationPort | 宿主 | 路由、步骤Task缓存、完整模块收尾 |
+| StationLedger | 应用层 | 本地周期意图/终态/显式核对记录 |
+
+一份工位命令在组合层保存原Task；重复相同命令不再派发，改工件/配方或同步骤载荷拒绝。子模块继续执行各自的帧、命令和收据检查。
+
+运动和视觉拥有各自的资源，不共享可变图像缓冲，也不让处理器直接发运动命令。业务顺序来自状态机，不靠某个设备回调偷偷调用下一步。
+
+## 4. 准备条件是两份，不是一个Ready
+
+会话要求在无当前工件、无Task/Pending、账本不要求核对且宿主Idle时执行准备：
+
+1. 打开模型连接、显式使能。
+2. 打开回放源。
+3. 开始简化回零，推进模型并取得合格参考。
+4. 同时确认运动准入与视觉周期槽可用。
+
+Start不会自动使能、回零或打开相机。运行周期里重新回零被拒绝；旧账本未核对时，两个准备入口都阻止。
+
+核对旧Began只记录旧工件处置声明，不恢复旧Task、图像、使能或参考。新周期有新Session，Producer.Number继续从本地持久化高水位递增。
+
+## 5. 如何把一次定位关联到一张图
+
+组合层保留同一WorkOrder和Move OperationKey。运动端口再绑定单轴ConnectionGeneration/Sequence；视觉端口接收这份Move证据后，按同Session/Cycle/Order接受后续Capture。
+
+图像进一步关联CaptureRequest、回放采集代、源FrameStamp和工位FrameId。Inspect和模拟结果回执必须使用同帧、同配方和同判定。
+
+两周期演示：
+
+| 周期 | 模型反馈位置 | 回放帧 | ROI均值 | 工位判定 |
+| --- | --- | --- | --- | --- |
+| 1，demo-ok-v1 | 1.000mm | 1，原图 | 220 | Ok |
+| 2，demo-ng-v1 | 2.000mm | 2，反相图 | 75 | Ng |
+
+这里的图像不是机械位置触发的真实曝光；位置与帧在应用元数据上对应，回放源按自己的顺序提供像素。真实触发线、相机缓冲、运动稳定时间和曝光时序仍未验证。
+
+第二周期均值75来自反相图右侧ROI，不是上一批同左侧配方演示的35。判定仍由实际像素统计得到，没有按配方名字硬编码。
+
+## 6. 停止后什么时候能再进入新周期
+
+StopFlowAsync只锁存工位停止，不自动停止轴。明确请求RequestOrdinaryStopSimulation后，仍需推进模型观察减速终结；Stopped不算到达原目标。
+
+失败或未知Move不会交给视觉端口建立成功前置，因此没有采图、处理或虚构视觉收据。已结停止可以保存本地终态，显式模拟核对后再接新周期；原动作不会被重放。
+
+没有足够证据的Unknown仍保留Pending。组合层的只读Observe只返回原步骤已存在的结果或null，不补发运动、不补拍，也不补建缺失的执行步骤。
+
+## 7. 超时之后的三种迟到
+
+| 迟到位置 | 仍允许做什么 | 不会做什么 |
+| --- | --- | --- |
+| Move到位迟到 | 记录合格完成证据、排空原Pending | 不派发Capture，不改Faulted |
+| Capture回复迟到 | 归还借用并记录诊断元数据、排空 | 不把它接受为当前工位帧，不启动Inspect |
+| Inspect回复迟到 | 保留诊断统计、结束原Task、排空 | 不把迟到Ok计为正常合格，不发布结果 |
+
+即使组合层已经记录了一份成功Move证据，也不意味着状态机一定还允许Capture。阶段超时的锁存由原状态机负责，子模块数据不能绕开它。
+
+组合Task可能比内部算法Task更晚完成，例如回复交接尚未结束。宿主要等组合Task实际结束；不能看到某个子模块空闲，就提前释放整套资源。
+
+## 8. 保存、收据、核对和关闭
+
+正常周期依次保存本地终态并消费，再确认原视觉处理收据，最后显式模拟核对与本地放行。新工件需要这些条件与两模块准入同时满足。
+
+原Move没有成功交给视觉时，AcknowledgeVisionAfterSavedAsync返回false，表示本周期没有视觉收据，不伪造一份确认；应用的保存/消费与恢复检查仍单独执行。
+
+关闭阻止新任务，保存并消费当前终态，等待Task/Pending，再分别释放两个模块及账本。关闭不隐式发轴停止，也不伪造处理器Acknowledge；迟到结果仍可能保持一份未确认诊断记录。
+
+关闭推进使用TryAdvanceSimulation：宿主已经开始释放子模块后，返回false，不再Tick已关闭的模型。测试里的等待截止时间只用于防挂起，不是生产强制退出策略。
+
+## 9. 离线主链完成到什么程度
+
+本批已串通运动模型→合格到位→原帧统计→本地结果保存及收尾，MC通信例子仍是独立执行方案，没有与轴模型重复派发同一运动。
+
+仍未交付：真实SDK与现场恢复、原图/FrameStamp/测量明细落盘、跨进程设备任务绑定、实体工件/曝光因果证明和现场质量/安全验收。默认WPF仍使用原入口，本批只有控制台集成。
+
+下一批补结果留图与测量明细追溯，使FrameId能指向明确的保存证据；当前GUID本身不能从磁盘恢复原图。
+
+## 10. 验证与续读
+
+新增49项组合检查，原356项工位/通信/运动/视觉/WPF回归通过，共405项。Release零警告零错误；正常双周期、重复/错身份、错误完成证据、停止后新周期、三处迟到、关闭及重启旧周期均已覆盖。
+
+演示Move2次、视觉模拟Move0次、成功证据交接2次，两周期保存、确认、核对及关闭完成。全部为模型、自有合成图像和本地文件，没有真实设备动作。
+
+继续[C#组合端口、唯一Move与端到端会话](/knowledge/industrial/host-computer/station/csharp-integrated-station-routing-and-single-move-handoff/)。异步任务基础见[Microsoft Task-based programming](https://learn.microsoft.com/en-us/dotnet/standard/parallel-programming/task-based-asynchronous-programming)。
+
+
+## 后续：原图和测量证据
+
+第九批已补[结果留图与测量明细](/knowledge/industrial/host-computer/station/original-image-measurement-evidence-and-publication/)和 [C#证据存储工作流](/knowledge/industrial/host-computer/station/csharp-image-evidence-store-and-save-workflow/)。原入口仍可独立运行；新工作流在确认视觉收据前保存并验证原始像素。

@@ -1,0 +1,103 @@
+---
+id: industrial-station-async-host
+title: 异步工位宿主：端口任务、不确定结果与关闭排空
+description: 在离线状态机外增加单所有者宿主和有界控制邮箱，分别观察流程期限、实际Task和设备终态，处理异常、取消、只读核对及关闭资源交接。
+tags: [工业自动化, 上位机, 异步, 状态机, 资源生命周期]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 20
+prerequisite: [industrial-station-flow, industrial-csharp-station-controller]
+related: [industrial-csharp-station-async-host, industrial-yolox-bounded-worker]
+---
+
+## 1. 给状态机增加运行宿主
+
+上一批只生成命令、接收声明式回复；本批增加StationHost，让它独占状态机，接收外部控制请求、驱动期限，并通过IStationAsyncPort执行或只读观察命令。
+
+仍然只使用模拟端口，不加载PLC、雷赛、相机或视觉SDK。目的不是制造一个万能设备框架，而是先让“等待超时”“Task结束”“设备动作终结”这三个事实在运行代码中分开。
+
+```text
+控制请求 → 有界邮箱 → 单所有者宿主 → 状态机
+                              ↓ 转移一次命令
+                         异步模拟端口Task
+                              ↓ 实际结束后观察
+                  匹配终态 / 不确定记录 / 只读核对
+```
+
+状态机仍负责周期、工件、配方、帧和判定关联；宿主负责异步运行义务与端口释放。原来的--self-test和--demo入口保留。
+
+## 2. 三种结束不能混为一谈
+
+| 事实 | 本例观察方式 | 能否直接释放待结命令 |
+| --- | --- | --- |
+| 阶段期限到达 | 状态机Tick/Receive检查单调时间 | 不能，已转移命令仍待结 |
+| Task成功、异常或取消结束 | 宿主观察实际Task | 只有Task结束仍不够 |
+| 有效设备终态 | 端口返回匹配StationReply | 可以交给状态机推进或迟到排空 |
+
+一个发送调用可能在异常前已经把命令交给设备；一个取消的等待也可能留下仍在运行的物理动作。所以宿主不会把IOException、TaskCanceled或null结果伪造成Success=false回复。
+
+这些情况调用RecordUncertain锁存故障，保留原Pending。RecordUncertain只记录不确定性，没有清除动作、停止设备或自动重试。
+
+## 3. 端口接口为什么拆成执行和观察
+
+ExecuteAsync转移本次动作意图；ObserveAsync只读核对原命令，不重新发送动作。端口返回null表示没有可供确认的终态，不表示“没有检测目标”或“动作已失败完成”。
+
+原Task仍在运行时，本例拒绝并发Observe，避免同时访问不保证线程安全的SDK。原Task已经结束但Pending仍在时，NeedsReconciliation=true，调用方可显式启动只读核对。
+
+若核对返回有效终态，状态机按原身份接收；故障/关闭中的回复仅DrainedLate，不推进采图、检测或结果发布。若仍为null或再次异常，继续保留义务。接口名本身不能保证厂商SDK只读，真实适配必须核对具体调用路径。
+
+## 4. 单所有者不等于固定线程
+
+宿主有一个逻辑消费循环，只有它调用状态机的修改方法。外部控制请求经Channel发送，端口调用则在Task.Run中执行，避免某个async方法在第一个await之前同步阻塞宿主。
+
+逻辑所有者和端口Task都可能换线程池线程。它没有提供STA、线程亲和性或固定创建线程保证；若后续SDK有这些要求，需要专用线程调度适配，不能直接照搬Task.Run。
+
+每次最多一个端口任务，包括执行或只读核对。状态机只有一个周期槽，宿主邮箱则容纳有限的控制请求，两者是不同容量：邮箱满会即时拒绝，不静默丢弃，也不无限积累等待写入的宿主内部任务。
+
+## 5. 邮箱、公平处理与关闭入口
+
+邮箱默认容量16，可配置1～64。采用有界Channel、Wait满载模式和TryWrite：无空间就返回MailboxFull失败Task，本请求没有被接收。WaitToReadAsync用于消费者等待数据，并不意味着提交方无限等待。
+
+每轮最多处理一批邮箱消息，然后重新观察实际Task、期限与关闭信号，避免连续控制请求饿死运行观察。关闭信号独立于邮箱容量，邮箱满也能请求关闭。
+
+关闭准入标志和正常动作转移在同一把短锁下决定。关闭标志先建立时不再转移新动作；已经在关闭之前转移的命令不能被软件“收回”，仍要等待或核对。邮箱里此前接受的请求仍有明确返回，不在退出时悬挂调用方。
+
+## 6. 自动Tick与时间预算
+
+默认宿主大约每25ms获得一次定时唤醒并调用状态机Tick，阶段时间仍取自注入的TimeProvider。25ms是调度目标，不是实时性、运动控制周期或超时精度保证。
+
+测试可以关闭自动Tick，手动推进ManualStationClock并发送PulseAsync；也单独覆盖了自动Tick路径。手动时钟现在对读写加锁，支持测试线程推进、宿主线程读取。
+
+定时唤醒本身使用系统Task.Delay，注入的手动时钟只改变阶段期限，并没有接管所有运行时计时器。端口和状态机都不使用Thread.Sleep模拟正常耗时。
+
+## 7. 关闭必须等哪些事实
+
+RequestClose只提出关闭请求，不阻塞调用方。宿主先让状态机停止新准入，随后仍允许本地终态消费和必要的只读核对。正常关闭需要：
+
+1. 实际执行/观察Task已被宿主观察结束。
+2. 状态机Pending已由有效终态结清。
+3. 本地终态已显式消费，状态机进入Closed。
+4. 端口DisposeAsync成功，宿主Completion正常完成。
+
+如果Task永不返回，关闭继续等待；如果Task已异常结束而物理状态未知，关闭也继续等待核对。单纯对Completion调用WaitAsync超时，只结束调用方这次等待，不会取消端口或解除待结。
+
+内部不可预期故障若仍留下Pending，本例不伪装端口已释放；Completion报告故障，保留不确定状态。DisposeAsync失败时，逻辑状态可能已经Closed，但PortDisposed=false，Completion异常，不能只看状态枚举宣布清理成功。
+
+软件Stop仍只锁存流程，未实现实际设备停止命令，不证明物理停止。真实安全控制和现场恢复条件继续由独立设备/工艺验证。
+
+## 8. 快照、通知与追溯范围
+
+HostSnapshot同时展示Station状态、TaskActive、QueryActive、NeedsReconciliation、CloseRequested、PortDisposed和最近一次PortObservation。这样可以看到“故障态但Task仍运行”，而不是把它压成一个Busy。
+
+ObserveAfterAsync按Revision等待后续快照，不轮询整个状态。所有同代观察者共用一次变更通知；快照可能跳过中间版本，不是每条事件的可靠投递。状态机仍只有最近128条内存日志，没有落盘、重启恢复或PLC结果持久化。
+
+## 9. 本批验证与下一步
+
+新增48项门闩/异步宿主检查，原57项状态机回归通过。覆盖正常NG串行四步、超时后Task仍活跃、只读核对、取消/错配、不确定结果关闭、邮箱满时关闭、同步阻塞前缀、自动Tick及释放异常。
+
+演示中的移动仅执行一次，超时后关闭保持等待；迟到回复到达后DrainedLate，最后Closed且端口释放一次。没有真实SDK、设备、算法或性能验收。
+
+继续[C#单所有者宿主、模拟端口与收尾实践](/knowledge/industrial/host-computer/station/csharp-async-host-mailbox-ports-and-reconciliation/)。继续[周期意图、结果记录与重启核对](/knowledge/industrial/host-computer/station/result-recording-durable-intent-and-restart-review/)，区分内存状态、文件保存与对端接收。
+
+参考：[Microsoft Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)、[Task.WhenAny](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenany?view=net-10.0)、[Task.WaitAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.waitasync?view=net-10.0)。

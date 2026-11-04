@@ -38,12 +38,9 @@ public static class YoloXPostprocessor
         return ProcessValues(raw.Values, input.SourceHeight, settings);
     }
 
-    // Also accepts explicitly handwritten arrays for offline tests, never used as native fallback.
-    public static PostprocessReport ProcessValues(ReadOnlySpan<float> raw, int sourceHeight, PostprocessSettings settings)
+    // Pure fixed-artifact decoding, shared by r=1 and general-image adapters.
+    public static IReadOnlyList<DecodedYoloXRow> DecodeValues(ReadOnlySpan<float> raw)
     {
-        Require(settings is not null && float.IsFinite(settings.ScoreThreshold) && settings.ScoreThreshold is >= 0 and <= 1 &&
-            double.IsFinite(settings.NmsThreshold) && settings.NmsThreshold is >= 0 and <= 1, "Thresholds must be finite,0..1.");
-        Require(sourceHeight is >= 1 and <= 416, "r=1 source height must be1..416.");
         Require(raw.Length == RowCount * Columns, "Only the fixed3549x85 raw layout is supported.");
         List<DecodedYoloXRow> rows = new(RowCount);
         for (int row = 0; row < RowCount; row++)
@@ -70,6 +67,16 @@ public static class YoloXPostprocessor
             }
             rows.Add(new(row, grid, box, values[4], bestClass, values[5 + bestClass], score));
         }
+        return Array.AsReadOnly(rows.ToArray());
+    }
+
+    // Also accepts explicitly handwritten arrays for offline tests, never used as native fallback.
+    public static PostprocessReport ProcessValues(ReadOnlySpan<float> raw, int sourceHeight, PostprocessSettings settings)
+    {
+        Require(settings is not null && float.IsFinite(settings.ScoreThreshold) && settings.ScoreThreshold is >= 0 and <= 1 &&
+            double.IsFinite(settings.NmsThreshold) && settings.NmsThreshold is >= 0 and <= 1, "Thresholds must be finite,0..1.");
+        Require(sourceHeight is >= 1 and <= 416, "r=1 source height must be1..416.");
+        IReadOnlyList<DecodedYoloXRow> rows = DecodeValues(raw);
         DecodedYoloXRow[] candidates = rows.Where(row => row.Score > settings.ScoreThreshold).ToArray();
         List<DecodedYoloXRow> kept = [];
         List<YoloXSuppression> suppressed = [];

@@ -179,4 +179,4 @@ maxCoordinateError=6.10351562E-05
 
 66项手写检查不执行模型，验证解码/排序/抑制/裁剪与错误值；12项真实CPU检查运行既有固定模型，验证默认空结果、低阈值36候选/33抑制/3保留、输入和原始结果未改写、源图范围和释放后快照。全量NumPy比较另外记录，不把数组元素数当测试案例数。
 
-下一批加入一般图片读取、模型专属缩放填充与参考对照，再接WPF显示。真实标注/质量、相机/工件、GPU与长期性能仍未验收。
+第五批已补[C#一般图片读取、模型缩放与离线推理](/knowledge/industrial/host-computer/yolo/csharp-opencv-image-files-resize-and-yolox-inference/)，新适配层共享DecodeValues但在原图参考空间执行NMS，本篇r=1命令保留。后续WPF显示；真实标注/质量、相机/工件、GPU与长期性能仍未验收。

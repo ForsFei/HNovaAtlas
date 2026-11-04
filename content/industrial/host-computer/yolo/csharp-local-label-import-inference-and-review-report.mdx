@@ -1,0 +1,141 @@
+---
+id: industrial-csharp-yolox-local-review
+title: C#实践：本地标注导入、批量推理与评价报告
+description: 用独立CLI读取固定版本清单与YOLO五列TXT，复用CPU会话逐图评价，解释严格JSON、路径与哈希核对、贪心匹配、分类汇总和新文件发布API。
+tags: [工业自动化, C#, YOLOX, 标注, 离线评价]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 150
+prerequisite: [industrial-yolox-local-review]
+related: [industrial-csharp-yolox-images, industrial-csharp-yolox-bounded-worker]
+---
+
+## 1. 项目和可复现入口
+
+新增`examples/industrial-yolo-review/IndustrialYolo.Review.csproj`，.NET10/x64控制台项目，通过ProjectReference复用固定图片、OpenCvSharp与CPU ONNX Runtime。独立于WPF窗口，不新增包版本、模型下载或训练环境。
+
+在仓库根目录运行：
+
+```powershell
+dotnet restore examples/industrial-yolo-review/IndustrialYolo.Review.csproj --locked-mode
+dotnet build examples/industrial-yolo-review/IndustrialYolo.Review.csproj -c Release --no-restore
+dotnet run --project examples/industrial-yolo-review/IndustrialYolo.Review.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-yolo-review/IndustrialYolo.Review.csproj -c Release --no-build -- --native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+dotnet run --project examples/industrial-yolo-review/IndustrialYolo.Review.csproj -c Release --no-build -- --demo examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+Demo只在bin/verification/GUID新建自有图片、TXT、manifest.json和report.json，打印完整路径。得到的目录也是清单结构参考，不包含第三方照片。--self-test不加载OpenCV或模型；--native-test和--demo实际运行CPU推理。
+
+用户准备好本地清单后运行：
+
+```powershell
+dotnet run --project examples/industrial-yolo-review/IndustrialYolo.Review.csproj -c Release --no-build -- --evaluate examples/industrial-yolo-onnx/.local/yolox_nano.onnx "D:/inspection/manifest.json" "D:/inspection/review-v1.json"
+```
+
+输出父目录必须已经存在，输出文件必须是新路径。成功退出0、托管检查失败1、用法2、原生/文件/评价失败3。任何图片、标注或推理失败都会终止本批，不发布一份假装完整的部分报告。
+
+## 2. 清单字段怎么准备
+
+以下为单图模板，尺寸、路径和两个文件哈希要替换成真实值。标注仍采用固定COCO80索引，不能把labelSet改为工业缺陷后继续使用同一权重：
+
+```json
+{
+  "schemaVersion": "atlas-yolo-review-v1",
+  "datasetVersion": "line-a-validation-v1",
+  "annotationVersion": "annotation-v1",
+  "datasetKind": "user-supplied",
+  "partition": "validation",
+  "labelSet": "coco80-yolox",
+  "modelSha256": "C789161ED43C8269FCD4E67C67EEEB4E80C622DA2EB296A20BC6007BD18A0B7D",
+  "pipelineVersion": "atlas-yolox-image-v1",
+  "scoreThreshold": 0.1,
+  "nmsThreshold": 0.45,
+  "matchIouThreshold": 0.5,
+  "cases": [
+    {
+      "id": "frame-001",
+      "group": "workpiece-001",
+      "image": "images/frame-001.png",
+      "labels": "labels/frame-001.txt",
+      "width": 640,
+      "height": 480,
+      "imageSha256": "填入图片文件真实64位十六进制SHA256",
+      "labelsSha256": "填入TXT文件真实64位十六进制SHA256"
+    }
+  ]
+}
+```
+
+用PowerShell读取哈希：
+
+```powershell
+(Get-FileHash -LiteralPath "D:/inspection/images/frame-001.png" -Algorithm SHA256).Hash
+(Get-FileHash -LiteralPath "D:/inspection/labels/frame-001.txt" -Algorithm SHA256).Hash
+```
+
+修改图片、换行、BOM或标注内容后哈希会变化，应重新核对并递增相应版本。空负样本也需要存在的空TXT及其真实哈希。datasetKind只允许synthetic-check或user-supplied，后者仅声明来源，不表示标注已经被工具验证正确。
+
+partition只允许validation/test，每份清单属于一个集合。Group可以跨同批多张图片重复，用于同一工件/批次复盘；Id必须唯一。没有目录自动扫描或默认按文件名推断标注，所有路径都显式列出，使用正斜杠相对于清单目录。
+
+## 3. 常用API与数据所有权
+
+| 文件/方法 | 负责什么 |
+| --- | --- |
+| ReviewData.Load | 读取清单、版本与阈值检查、相对路径和标注哈希审核 |
+| ReviewData.ParseLabels | 五列TXT转原图连续Truth框 |
+| LoadedReview | 已审核元数据和只读真值快照，外部不能任意构造 |
+| Matching.Evaluate | 对已经筛选/NMS的预测做固定IoU工作点匹配 |
+| ReviewRunner.Run | 一次模型会话，顺序逐图解码/推理/匹配及汇总 |
+| ReviewRunner.Publish | 发布新JSON报告，拒绝覆盖 |
+
+```csharp
+LoadedReview input = ReviewData.Load(manifestPath);
+ReviewReport report = ReviewRunner.Run(input, modelPath);
+ReviewRunner.Publish(report, newReportPath);
+Console.WriteLine(report.Total.Precision);
+```
+
+主要.NET成员包括FileStream.Length/ReadExactly、SHA256.HashData、UTF8Encoding的严格解码、JsonSerializer.Deserialize与SerializeToUtf8Bytes、double.Parse的InvariantCulture、File.Move的overwrite:false。图像和模型API继续复用前批，不重新实现一套模型输入。
+
+清单JSON限制1MiB/深度24，必需构造参数和未知字段严格检查；每个标注文件限制128KiB，UTF8可带一个BOM，空白行允许，没有注释行或额外列。数字解析后仍要检查有限、范围和原图框正面积。最多32图、每图128个真值，预测最多为固定模型3549行。
+
+输入边界读取后复制只读集合，调用方不能通过修改原数组改变已审核数据。路径拒绝绝对、父目录、反斜杠、冒号、遇到的重解析链接及Windows末尾点/空格别名；这仍是可信本地目录规则，不是对恶意并发文件系统操作的完整隔离。
+
+## 4. 图像哈希和实际尺寸在哪里核对
+
+标注在Load时读取并形成快照，图片在Run时逐张交给OpenCvImageInput.Load。使用同一份解码字节的EncodedSha256对照清单，实际BGR宽高也必须一致。然后Prepare生成输入，报告保存输入float数组的SHA256、理想Ratio和实际缩放宽高。
+
+读取每张图后即推理和匹配，不一次保留所有原图Mat或冻结位图。using YoloXNanoSession放在批次外层，逐图局部原生对象沿用既有释放约定；批次任意一步失败时会话也会释放。
+
+图片去重按实际编码字节哈希，不能识别重新编码、裁剪或连续曝光的近似图；跨训练集的数据泄漏还需另行审计。解码器可能先分配内存再做尺寸校验，本入口依旧只面向可信本地PNG/JPEG，EXIF/ICC约定沿用前批。
+
+## 5. 匹配器怎么解释结果
+
+ReviewPrediction保留原始Row、ClassId、Score、可见原图Box及WasClipped。Matching先按分数降序/行号升序，再与同类未占用真值计算BoxMath.IoU；达到匹配阈值配为TP，否则FP，最后把所有未占用真值索引记录为MissedTruth。
+
+这一处连续IoU没有加1，和模型NMS的兼容面积公式不同。分数严格大于阈值的筛选已由ImagePostprocessor执行，Matching不再重筛或重做NMS。真值框拒绝越界，模型预测使用前批有效栅格裁剪后的可见框；无可见面积的预测保留ExcludedPadding决策，不计入TP/FP。
+
+Counts保存Tp/Fp/Fn，Precision和Recall由计数计算，零分母为null。报告还包括80个类别统计、每个Group统计及图片Id集合。总体通过累加计数计算，不平均每张图的Precision。
+
+## 6. 报告如何追溯和发布
+
+报告含ReportVersion、StartedUtc、清单/模型哈希、PipelineVersion、LabelSet、数据/标注版本、用途集合、三类阈值、ORT/OpenCV/.NET/进程架构，以及匹配和可见性策略文本。
+
+每图记录清单信息、实际输入指纹、Ratio/整数缩放尺寸、所有真值、完整预测决策及漏检真值索引。用户可以从FP预测的Box与原图对照，也能从FN索引直接找到漏检的标注。版本名和Group是声明，不是签名、Git提交证明或物理工件身份认证。
+
+Publish先序列化完整报告并检查不超过32MiB，再在目标目录新建唯一临时文件、写入并Flush(true)，最后用File.Move(...,overwrite:false)发布。失败仅清理本命令创建的临时文件，不覆盖旧报告；没有把一半JSON当完整结果。
+
+这个流程没有承诺断电后目录元数据必然持久化，也不是数据库事务或PLC结果确认。报告大小限制发生在序列化之后，不等于对全部托管/原生峰值内存提供硬上限。
+
+## 7. 本轮验证
+
+Release零警告零错误，锁模式还原通过；43项纯托管标注/匹配/清单检查、12项实际OpenCV/CPU/报告检查通过。覆盖归一化转换、边界、错误类别/列数/UTF8/数值、负样本、错类/重复框/稳定排序/阈值相等、空分母、缺失标签、未知字段、路径边界和哈希。
+
+自有641×359渐变图的输入指纹仍为E4964C41C78FA76F8EF08D8AE0120C600209788B12F040140BF05F62BD750907，实际保留行3439/3468/3462/3454/3420；配任意手写person真值，故TP0/FP5/FN1。第二张黑图及空标签正常处理，类别/分组计数平衡、报告不覆盖、尺寸/图片哈希错误和重复内容拒绝通过。
+
+没有从模型输出制造真值、没有真实用户数据或AP/mAP质量结论。用户自己的完整标注样本可以按清单接入；下一批补部署清单和运行环境/产物检查，真实质量与长期资源继续单列。
+
+第九批已补[C#发布清单与CPU探针](/knowledge/industrial/host-computer/yolo/csharp-release-inventory-publish-and-cpu-probe/)，本例评价工具保留；下一阶段综合工位，真实质量和目标机单列验收。
+
+理论见[样本、标注契约与误检漏检](/knowledge/industrial/host-computer/yolo/local-dataset-label-contracts-and-operating-point-review/)。格式依据[Ultralytics检测标注说明](https://docs.ultralytics.com/datasets/detect/)，类别顺序依据[固定YOLOX类别表](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/yolox/data/datasets/coco_classes.py)，模型来源仍按前批THIRD_PARTY记录。

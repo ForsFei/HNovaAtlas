@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "atlas-yolo-deployment-settings-v1",
+  "settingsVersion": "cpu-smoke-v1",
+  "pipelineVersion": "atlas-yolox-image-v1",
+  "labelSet": "coco80-yolox",
+  "scoreThreshold": 0.1,
+  "nmsThreshold": 0.45
+}

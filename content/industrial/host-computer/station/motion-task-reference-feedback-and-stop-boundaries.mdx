@@ -1,0 +1,123 @@
+---
+id: industrial-station-motion-adapter
+title: 工位运动适配：参考、反馈到位、普通停止与结果未知
+description: 将已有SimAxis和动作观察器接入工位Move，区分显式连接使能回零、稳定到位、流程停止、模型停止、故障与超时迟到排空。
+tags: [工业自动化, 上位机, 运动控制, E3032, 状态机]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 100
+prerequisite: [industrial-station-communication-adapter, industrial-csharp-e3032-motion-observation]
+related: [industrial-csharp-station-motion-adapter, industrial-csharp-single-axis-simulation]
+---
+
+## 1. 这一批连接哪一层
+
+本批增加独立industrial-station-motion例子，链接已有SimAxis、MotionMath和MotionObservation，把工位Move接到真正运行的纯C#单轴模型及动作观察器。Capture、Inspect、PublishResult仍使用原模拟端口。
+
+它不是E3032固件、EtherCAT主站或伺服仿真，不加载LTDMC.dll，不连接网卡、驱动或执行机构。硬件学习方向仍以E3032总线卡为主，脉冲卡对照；原生SDK映射与现场动作另行验证。
+
+上一批MC例子将动作交给下位机邮箱，本批由PC侧模型执行动作，是两个独立的执行方案。没有把同一个Move同时发到MC邮箱和轴模型，避免误以为通信完成后还应再执行同一份运动。
+
+## 2. 工件启动不能顺便使能和回零
+
+本批会话将准备步骤显式拆开：
+
+```text
+打开本地记录目录/创建宿主
+  → OpenSimulation连接模型
+  → EnableSimulation使能模型
+  → BeginReferenceSimulation开始简化回零
+  → AdvanceSimulation持续推进并观察回零
+  → 合格参考 + Idle + 账本允许
+  → StartAsync接收工件
+```
+
+会话只允许在无当前工件、无Task/Pending、账本不要求核对且宿主Idle时执行这些准备操作。运行周期内重新回零会被拒绝。直接使用底层端口时，调用方仍要遵守单所有者和周期外准备的契约。
+
+回零采用原模型的正侧单阶段搜索，初始位置1mm，观察到运动及未完成到完成的变化，才能设置ReferenceQualified。它不实现雷赛驱动的各种回零模式，也不把上电读到的旧完成位当成新参考。
+
+故障复位不会自动使能、回零或重发工件。应用Idle不等于轴已建立参考；下一工件仍由运动门槛检查。
+
+## 3. 工位操作和轴命令怎样关联
+
+| 身份 | 用途 |
+| --- | --- |
+| 工位OperationKey | Session/Cycle/Operation/Step，识别本周期Move |
+| 模型CommandKey | ConnectionGeneration/Sequence，识别本连接代的单轴命令 |
+| 不可变StationCommand | 保留工件、配方与原始操作身份 |
+| MotionAttempt | 记录派发证据及后续运动/到位观察 |
+
+适配器在调用MoveAbsolute之前准备观察器，按单所有者顺序核对返回CommandKey，然后记录Acknowledged。相同工位命令再次调用Execute，得到同一个Task，不重复派发轴动作；相同身份改载荷以及旧周期拒绝。
+
+模型CommandKey是本地身份，不是雷赛硬件事务ID，更不是跨进程防重复执行凭据。当前映射仍只在内存里，没有恢复原Task或旧原生动作的能力。
+
+## 4. 什么证据才允许触发后续采图
+
+本批固定两个位置配方：demo-ok-v1对应1mm，demo-ng-v1对应2mm，速度均为5mm/s。它们只用于模型；图像判定依旧模拟，位置并不决定真实产品合格与否。
+
+Move成功要同时满足：
+
+1. 观察属于同一连接代与命令。
+2. 派发后确实看见运动，不能复用旧Done。
+3. 轴模型回到Ready，结果为本CommandKey的Completed。
+4. 指令位置、反馈位置都在目标容差内，InPosition为true。
+5. 合格候选经重复采样稳定达到默认0.1秒。
+
+模型先完成、观察器还在稳定确认时，工位Task仍不结束，不允许提前采图。指令位置到目标但反馈偏差或到位信号不合格，也不会完成。
+
+无反馈配置不自动退化成指令到位成功。这个工位适配策略要求反馈证据，最终无法取得时保持Unknown。真实项目是否允许指令位置模式，需要另定工艺验收标准。
+
+## 5. 三种时间不要混用
+
+| 时间 | 本批由谁推进 | 作用 |
+| --- | --- | --- |
+| 轴模型时间 | 显式AdvanceSimulation(seconds) | 推进理想轨迹与模型状态 |
+| 动作观察时间 | 同一个模型时间 | 判断采样间隔、起动、稳定与观察期限 |
+| 工位阶段期限 | 宿主TimeProvider | 约束Move/Capture等业务等待 |
+
+Advance每次步长必须大于0且不超过0.1秒，演示用0.01秒。测试辅助中的Task.Delay只让异步宿主有机会运行，不会把模型变成真实时间伺服循环。
+
+测试可以冻结模型时间，仅把宿主单调时间推进2秒：工位进入Faulted，但原运动Task和模型Busy仍在。继续推进模型后，合格迟到回复只排空原Pending，不改故障、不继续采图。
+
+默认动作观察器另有0.25秒采样年龄/间隔、0.5秒起动观察、3秒总观察期限及0.01mm容差。它们是教学策略，不是E3032参数或现场整定结论。
+
+## 6. 流程停止和轴停止分别做什么
+
+| 操作/观察 | 本例行为 |
+| --- | --- |
+| StopFlowAsync | 只锁存工位Stopped，不向模型发停止 |
+| RequestOrdinaryStopSimulation | 明确请求模型减速停止，仍需继续推进并观察 |
+| 观察到原模型命令Stopped | 原目标没有完成，返回已结失败，不触发采图 |
+| 模型Faulted且同命令已结束、数据有效 | 返回已结失败，撤销参考资格 |
+| 总线数据失效/采样缺口/观察超时 | 返回null保留未知，不伪造停止或失败终态 |
+
+普通停止也有减速过程，不是调用返回就已经静止。Move的停止结果与完成到目标不同；即使工位终态已Stopped，原轴任务依旧需要结清。
+
+这里能把模型Faulted/Stopped映射成已结失败，是因为理想模型明确结束了同一命令且不再Busy。真实驱动报警、SDK返回码或停止原因本身不证明机械已经静止，不能直接复制这个模拟归一化映射。
+
+## 7. Unknown之后不补造一个成功
+
+观察中断会使MotionAttempt历史结果变为Unknown；它不发送停止。测试中Task已经返回null，而轴模型仍Busy，此时即使Task已退出也不能Dispose轴。
+
+调用方可以明确请求普通模型停止并观察空闲，但后来静止不会把原Unknown改成Completed。ObserveAsync仅返回原绑定的已有终态或null，不Tick模型、不重发Move、不回零。
+
+没有充分关联证据时，宿主Pending会继续保留。本批没有“清掉Unknown继续生产”的入口；真实恢复需要设备/工件处置证据与专门的核对流程，不能用新建对象伪装原动作已结。
+
+同目标重复定位也是边界：原观察器要求看到起动运动，零位移可能只观察到静止。因此本例返回StartNotObserved的Unknown，而不是把旧完成状态当成本次成功。正式方案需定义“执行前已在位”或快速命令的独立证据策略。
+
+## 8. 保存、关闭与本批限制
+
+已结结果仍按原流程保存TerminalSaved后消费，显式模拟核对后才能放行。故障后本地逻辑复位不恢复轴参考，运动准备条件仍独立生效。
+
+关闭只提出工位关闭请求，不隐式发模型停止。调用方继续推进原任务到终结，或明确请求普通停止后观察；宿主等Task/Pending及本地终态结清，再释放模型和账本。没有强制退出或真实安全停止功能。
+
+本批不修改默认WPF窗口，不与MC例子自动串联，不含多轴协调、插补、机械碰撞或真实编码器动力学。继续[自有帧与图像流程适配](/knowledge/industrial/host-computer/station/vision-task-owned-frames-and-inspection-handoff/)，原生雷赛SDK与现场链路仍待验证。
+
+## 9. 验证与续读
+
+新增43项工位/运动集成检查通过，原266项工位、通信与WPF回归通过，共309项；旧单轴68项及动作观察52项另外回归。Release零警告零错误，Demo显式回零1次、定位1次，反馈2.000mm后得到模拟NG，保存/核对/关闭通过。
+
+检查覆盖旧完成位、同操作不重发、反馈/到位等待、普通停止、故障后参考丢失、无反馈、总线失效、观察缺口、同目标定位与超时迟到关闭。本批43项使用内存模型和本地文件；既有回归另含MC本机回环，没有真实轴动作或安全验收。
+
+继续[C#运动端口、准备API与工位会话](/knowledge/industrial/host-computer/station/csharp-motion-station-port-and-qualified-feedback/)。原状态接口导读见[C# E3032动作观察](/knowledge/industrial/host-computer/motion/csharp-e3032-motion-observation/)，计时概念见[Microsoft TimeProvider](https://learn.microsoft.com/en-us/dotnet/standard/datetime/timeprovider-overview)。

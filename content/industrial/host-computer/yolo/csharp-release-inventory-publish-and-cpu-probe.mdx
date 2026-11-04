@@ -1,0 +1,138 @@
+---
+id: industrial-csharp-yolox-deployment
+title: C#实践：发布清单、原生加载路径与CPU自检
+description: 用独立win-x64框架依赖工具封存目录、校验模型与配置、分阶段执行原生探针，提供自动发布验证脚本、运行报告和明确退出码。
+tags: [工业自动化, C#, YOLOX, 部署, 运行环境]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 170
+prerequisite: [industrial-yolox-deployment]
+related: [industrial-csharp-yolox-local-review, industrial-csharp-yolo-onnx-session]
+---
+
+## 1. 项目和自动验证脚本
+
+新增`examples/industrial-yolo-deployment/IndustrialYolo.Deployment.csproj`，net10.0、win-x64、x64进程，框架依赖文件夹发布。显式关闭SelfContained、PublishSingleFile和PublishTrimmed，通过ProjectReference复用既有模型/图像/评价程序集，不新增模型下载或第三方包版本。
+
+仓库根目录执行：
+
+```powershell
+dotnet restore examples/industrial-yolo-deployment/IndustrialYolo.Deployment.csproj --locked-mode
+dotnet build examples/industrial-yolo-deployment/IndustrialYolo.Deployment.csproj -c Release --no-restore
+dotnet run --project examples/industrial-yolo-deployment/IndustrialYolo.Deployment.csproj -c Release --no-build -- --self-test
+
+& examples/industrial-yolo-deployment/Verify-PublishedRelease.ps1 -ModelPath examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+self-test使用自有假文件和清单元数据，不加载OpenCV或模型；脚本执行真实publish和独立子进程检查。它先验证现有模型哈希，在本项目bin/release-GUID创建新发布目录，复制本地权重，生成release-profile.json，最后打印RELEASE_ROOT与PROBE_REPORT。
+
+脚本会临时修改自己刚创建目录的配置字节、移动其中的OpenCvSharpExtern.dll来检查拒绝路径，finally还原；不会操作其它项目或已安装程序。诊断文件位于发布目录外，已有路径拒绝覆盖。
+
+## 2. 手动发布与封存
+
+自动脚本内部的核心命令是：
+
+```powershell
+dotnet publish examples/industrial-yolo-deployment/IndustrialYolo.Deployment.csproj -c Release --self-contained false --no-restore -o "D:/releases/yolox-new-v1"
+```
+
+手动操作时必须换成新的空发布位置，然后在该目录创建model文件夹、复制经过固定哈希核对的yolox_nano.onnx；完整操作以脚本为准。不要把示例绝对路径误认为仓库已有目录。
+
+假设已经准备好的新发布目录是D:/releases/yolox-new-v1：
+
+```powershell
+& "D:/releases/yolox-new-v1/IndustrialYolo.Deployment.exe" --seal "D:/releases/yolox-new-v1" "cpu-v1"
+& "D:/releases/yolox-new-v1/IndustrialYolo.Deployment.exe" --inspect "D:/releases/yolox-new-v1/release-profile.json" "D:/releases/cpu-v1-inventory.json"
+& "D:/releases/yolox-new-v1/IndustrialYolo.Deployment.exe" --probe "D:/releases/yolox-new-v1/release-profile.json" "D:/releases/cpu-v1-probe.json"
+```
+
+三个输出路径都必须未存在，报告父目录必须已经存在。--seal拒绝重复封存同目录；--probe必须运行被清点目录自己的可执行文件。运行无需SDK，但框架依赖程序要能找到适合的.NET10运行时及原生依赖；SDK只用于构建发布。
+
+## 3. 配置与发布清单
+
+deployment-settings.json随构建和publish复制：
+
+```json
+{
+  "schemaVersion": "atlas-yolo-deployment-settings-v1",
+  "settingsVersion": "cpu-smoke-v1",
+  "pipelineVersion": "atlas-yolox-image-v1",
+  "labelSet": "coco80-yolox",
+  "scoreThreshold": 0.1,
+  "nmsThreshold": 0.45
+}
+```
+
+配置必须与固定图像处理契约和COCO80类别匹配，阈值有限且在0～1。它是部署烟雾检查配置，不包含业务OK/NG规则、运动参数或自动优化阈值。
+
+release-profile.json包含ReleaseId、RID、Mode、模型路径/固定哈希、配置路径及每个文件的Path/Bytes/Sha256。只支持本例的framework-dependent-folder和win-x64；必须包括exe、主dll、deps/runtimeconfig、配置、模型以及唯一的两个主要原生库。
+
+清单最多512文件、单文件512MiB、累计1GiB；JSON最多1MiB、深度16、严格必需和未知字段检查。扫描拒绝遇到的重解析链接，文件流计算SHA，不把完整大DLL一次读入byte数组。清单本身不计入被清点文件集合，诊断文件则明确写在目录外。
+
+## 4. API查用表
+
+| 类型/方法 | 作用与边界 |
+| --- | --- |
+| ReleaseInventory.Scan | 顺序枚举实际目录，记录相对路径、长度与流式SHA |
+| ReleaseInventory.Seal | 核对固定模型、配置、框架依赖runtimeconfig，创建新清单 |
+| ReadProfile(path,out sha) | 同份JSON字节反序列化并计算报告指纹 |
+| Verify(root,profile) | 比较整个集合，拒绝缺失、未声明和内容变化 |
+| ReadSettings(...,expectedSha) | 校验实际解析字节与清单配置哈希，验证版本和阈值 |
+| DeploymentProbe.Run | 返回分阶段结果，失败后的步骤NotRun |
+| DeploymentProbe.WriteReport | 目录外发布新报告，不覆盖旧文件 |
+| ModelArtifact.ReadVerified | 校验固定模型长度/哈希，不自动下载 |
+
+主要.NET成员包括Directory.EnumerateFileSystemEntries、File.GetAttributes/ReparsePoint、FileInfo.Length、SHA256.HashData(Stream)、AppContext.BaseDirectory、Environment.CurrentDirectory、RuntimeInformation和Process.Modules。
+
+```csharp
+DeploymentReport result = DeploymentProbe.Run(profilePath, native: true);
+DeploymentProbe.WriteReport(result, newReportOutsideRelease);
+bool passed = result.Status == "ProbePassed";
+```
+
+Publish步骤使用同目录唯一临时文件、FileMode.CreateNew、Flush(true)及不覆盖File.Move；只有成功创建的临时文件才由finally清理。它防止把部分JSON当完整输出，但不承诺断电事务或签名认证。
+
+## 5. 阶段与状态不能混淆
+
+Environment检查Windows/x64/.NET10；Profile检查清单契约；Inventory核对实际文件；Settings重新读取同份字节指纹；Model检查官方权重；实际探针再检查ExecutionRoot、CpuPipeline和NativeOrigins。
+
+--inspect成功只返回InventoryPassed，原生阶段为NotRun。--probe通过全部步骤才返回ProbePassed。任一步骤捕获异常后记Failed，后续NotRun，并保留异常类型与信息；这不是应用永远健康的承诺。
+
+Process.Modules在本进程真正使用原生库之后枚举，按模块名找到onnxruntime.dll和OpenCvSharpExtern.dll，要求各一个且路径等于清单对应文件。没有通过“某目录存在一个同名DLL”就宣布实际加载位置正确。
+
+本工具不验证全部系统DLL来源，也不是完整加载器安全策略；启动已执行宿主/托管程序集，哈希清单本身也没有签名。只在可信、静止的本地发布目录检查，不把这些步骤包装成安全启动认证。
+
+## 6. CPU烟雾检查的精确范围
+
+创建固定416×208自有BGR夹具，OpenCV内存编码PNG再解码，经过同一Prepare得到输入。整个输入SHA必须为5F598DA750EAE012350FC7B4B49B154C609104EE2B65A9AA3AC5D51C7C469863。
+
+CPU会话实际运行并释放；输出301665值由原会话检查形状和有限性，再用NumericReference.CheckSamples验证20个固化参考值，最后ImagePostprocessor解码3549行并执行配置阈值。实际版本必须为ORT1.27.0/OpenCV4.13.0。本次默认0.1阈值下kept=0正常。
+
+这个入口没有全量raw参考文件比较、真实工件图片、WPF显示或设备握手；20样点不等于301665值都与参考逐项相同。真实质量继续使用上一批本地标注评价工具和独立样本验收。
+
+## 7. 报告与退出码
+
+报告保存StartedUtc、Status、profile路径/实际字节SHA、ReleaseId、Framework/OS/架构、AppBase和WorkingDirectory、各阶段状态、SmokeEvidence与两个原生模块的相对加载路径。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | self-test、封存或所选检查模式成功；仍要区分InventoryPassed/ProbePassed |
+| 1 | self-test失败 |
+| 2 | 命令用法错误 |
+| 3 | 检查结果Failed，诊断JSON正常发布 |
+| 4 | 封存/输出等命令异常，可能没有报告，例如重复清单或报告路径不允许 |
+
+宿主在进入Main前失败、原生进程崩溃或挂起不保证遵循这些退出码；外层还要看进程是否正常退出及报告是否存在。本例不安装VC运行库、不改PATH、不拉取GPU包，也不为同步原生调用提供强制取消。
+
+## 8. 本轮实测与后续
+
+Release零警告零错误、locked restore通过。26项假文件/配置/诊断检查未加载原生引擎；8项实际发布/子进程场景通过，包括配置字节改动、原生文件缺失、错误执行根、目录外报告和不覆盖清单。测试还原后再次清点通过。
+
+本机独立发布目录44文件约119.5MB；Framework=.NET10.0.12，AppBase为发布目录，WorkingDirectory为源码示例目录。CPU编解码/预处理、20样点和3549行解码通过，两项原生模块均从清单路径加载。
+
+这不是干净机器、WPF人工UI、长期内存/性能或现场验收。第11步基础教学主线已交付，下一阶段进入综合工位的离线状态机与通信/运动/视觉结果交接，再逐项对接实际设备。
+
+综合工位首批已补[C#离线状态机与故障场景](/knowledge/industrial/host-computer/station/csharp-offline-station-reducer-and-fault-scenarios/)，保留本篇独立部署工具，实机项分别验收。
+
+理论见[发布目录、环境与原生库诊断](/knowledge/industrial/host-computer/yolo/deployment-contract-runtime-and-native-library-diagnostics/)。发布选项依据[Microsoft .NET发布概述](https://learn.microsoft.com/en-us/dotnet/core/deploying/)，Windows原生依赖说明见[ONNX Runtime安装文档](https://onnxruntime.ai/docs/install/)。

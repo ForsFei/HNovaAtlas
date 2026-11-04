@@ -1,0 +1,110 @@
+---
+id: industrial-station-abnormal-reconciliation
+title: 异常周期：无图说明、迟到诊断与重启对账
+description: 区分异常工位终态、已接受帧和迟到诊断数据，保存明确无像素的异常记录，逐项核对结果账本与留图目录。
+tags: [工业自动化, 综合工位, 数据追溯, 故障恢复]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 180
+prerequisite: [industrial-station-image-evidence, industrial-csharp-station-evidence]
+related: [industrial-station-integrated-flow]
+---
+
+## 1. 为什么异常周期不能强行补一张图
+
+正常OK/NG周期已经能保存原图和测量明细。异常周期却可能在运动、采图、检测或结果发布阶段结束：有的没有合格帧，有的已经得到图，有的算法完成了但回复超过期限。
+
+这些状态不能统一写成NG，更不能再采一张图补到旧工件名下。本批新增明确标注`DiagnosticOnly-NoPixels`的异常记录，保存原工位终态与可用诊断信息；这份JSON不包含图像文件，即使记录里有FrameStamp，也不表示原图像素已保存。
+
+正常留图仍使用上一批image.pgm与manifest.json。异常记录另存abnormal目录，以便查询界面清楚区分“可查看原图”与“只有诊断明细”。异常原始像素的导出与归档没有在本批冒充完成。
+
+## 2. 工位终态和诊断数据分开看
+
+| 数据 | 含义 | 能否据此改变原终态 |
+| --- | --- | --- |
+| Terminal.Outcome/Reason | 原工位完成、故障或停止结论 | 只保留原结论 |
+| Terminal.FrameId | 当时被工位状态机接受的图像号 | 不能用晚到图补上 |
+| Terminal.Judgment | 工位已接受的OK/NG | 故障时可能为空 |
+| DiagnosticFrameId/FrameStamp | 同周期端口保留的图像关联信息 | 只供诊断 |
+| DiagnosticMeasurement/Judgment | 同周期处理器留下的统计和判定 | 可能未被工位接受 |
+| ProcessingError | 处理失败代码 | 不能转换成NG |
+
+例如检测期限为3秒，算法已经计算出OK，但组合回复仍被延迟。期限到达后工位Faulted；稍后回复结清Pending，记录里可以出现“DiagnosticJudgment=Ok、Terminal.Judgment=null”。这不是两份互相覆盖的结果，前者说明处理器看到了什么，后者说明工位接受了什么。
+
+单凭一份快照不能证明数据何时产生。示例通过门闩与独立业务时钟重现迟到路径；持久化字段本身没有构成真实设备时间证明。
+
+## 3. 四种帧状态
+
+| FrameState | 条件 | 查询时应如何表达 |
+| --- | --- | --- |
+| NoQualifiedFrame | 没有当前Session/Cycle的Capture操作记录 | 当前周期没有可关联的合格采集记录 |
+| CaptureWithoutQualifiedFrame | 有本周期Capture，但没有合格FrameId/Stamp | 采图步骤存在，未取得合格帧 |
+| UnacceptedFrame | 同周期端口有帧，Terminal.FrameId为空 | 有诊断帧关联，工位未接受 |
+| AcceptedFrame | Terminal.FrameId与诊断帧号相同 | 工位曾接受此帧；不等于处理成功 |
+
+这四种状态描述本次应用记录，不证明物理世界中是否曾经曝光。没有统计可能表示尚未处理，也可能表示处理失败，必须结合ProcessingError和原终态原因；不能把“统计为空”直接显示成“算法未执行”。
+
+端口可能还留着上一周期的快照。导出时先核对CaptureOperation.Session/Cycle；不属于本周期的数据不会被附到当前异常记录。工件名相同不够，必须核对周期身份。
+
+## 4. 何时保存异常说明
+
+必须先等本地终态存在、实际组合/视觉Task结束、Pending清空，且运动模型不再Busy。软件超时本身不代表实际动作停止；仍在进行的任务不能被快照包装成“已结清”。
+
+异常保存工作流依次执行：
+
+1. 导出原Faulted/Stopped终态和当前周期诊断。
+2. 保存异常JSON，发布后读回校验。
+3. 保存原工位终态并消费本地收据。
+4. 若有视觉周期，确认其原处理收据；没有视觉周期时不伪造收据。
+
+保存失败时后续步骤不执行。JSON中的帧号和统计只是诊断，确认视觉收据前必须明确本示例的“异常仅保存明细、不保存像素”政策；生产项目若要求异常原图，不能直接采用这条释放策略。
+
+真正观察未知、Pending无法结清的情况仍由原账本Began和启动阻止表示。本批不会为了生成异常说明而取消实际Task、伪造失败回复或清空Pending。
+
+## 5. 重启核对两份存储
+
+本地项目现在有三个目录：ledger保存Began/TerminalSaved/Reviewed；normal保存正常原图证据；abnormal保存异常诊断JSON。
+
+对账器按Session/Cycle取两边身份并集。先使用原账本加载规则检查事件连续性和内容，再分别检查正常图包与异常记录；最后比较完整Terminal，不只比较工件名或判定。
+
+| 对账结果 | 含义 | 后续处理原则 |
+| --- | --- | --- |
+| MatchedNormal | 原图与统计校验通过，终态匹配 | 仍检查是否已记录Review |
+| MatchedAbnormal | 异常诊断与终态匹配 | 明确没有保存图像字节 |
+| IntentWithoutTerminal | 有Began，既无终态也无发布证据 | 保持原结果未知 |
+| EvidenceWithoutTerminal | 有Began和证据，账本没有终态 | 不从证据反向补造终态 |
+| EvidenceWithoutIntent | 有证据，没有原Began | 作为孤立材料处理 |
+| MissingEvidence | 账本有终态，无发布证据 | 不能当作正常留图成功 |
+| TerminalConflict | 两边终态内容不同 | 保留原文件，人工调查 |
+| InvalidEvidence | 文件存在但损坏、结构或身份不合法 | 与缺文件分别显示 |
+| DuplicateEvidence | 同周期出现多份正常/异常证据 | 不自动挑选其中一份 |
+
+.pending残留、未知条目、不可读根目录和目录超限通过StorageIssues单列。存在根目录读取问题时，对账只是一份不完整报告，应先看StorageIssues，不能把某行MissingEvidence当作已经证明“文件确实不存在”。
+
+## 6. 对账必须做到只读
+
+对账器不创建目录或锁文件，使用现有.writer.lock以FileMode.Open和只读权限打开；这个语义与OpenOrCreate不同，参见[Microsoft FileMode](https://learn.microsoft.com/en-us/dotnet/api/system.io.filemode?view=net-10.0)。不存在的账本路径会报告不可用，保持原路径不存在。
+
+读取期间保留账本和证据根目录的合作读锁，写者在占用时会被报告不可用。正常图包使用原严格校验器独立读取，因此即使同一目录有.pending，也能单独核验其它已经发布的图包，同时保留.pending问题。
+
+只读核对不调用Review、Reset、Start、Move、Acquire或Inspect，也不删除、改名、修补文件。它并非跨存储数据库快照：应在原应用停止写入后使用，权限和专用可信目录由部署方保证，非合作进程的修改不在本例保护范围内。
+
+## 7. 文件匹配为什么还提示需要关注
+
+ReconciliationReport.RequiresAttention在任何存储问题、任何非匹配分类，或者任何周期尚未Review时返回true。
+
+演示中的异常终态和诊断完全匹配，但ReviewRecorded=false，所以RequiresAttention=true。原StationLedger启动阻止不被解除。即使所有文件匹配且Review已有记录，也只说明这份本地检查未发现这些问题，不能当真实运动、相机、物料、安全或对端状态的许可。
+
+生产恢复需要可信设备状态、物料处置、结果通道核对和明确操作人责任；“磁盘两份JSON一致”无法替代这些证据。
+
+## 8. 本批验证与后续
+
+新增52项异常与只读对账检查，包括实际处理异常、两处迟到、停止无图、旧周期帧隔离、文件内容/名称不变、活跃写者、缺失路径、损坏图、孤立/冲突/重复证据和.pending残留。原留图、账本、应用、组合与视觉共251项相关回归通过。
+
+下一步转向实机接入前的验收与故障演练，把离线假设逐项换成设备、SDK、工艺和现场可核验的约束。继续[C#异常证据与只读对账API](/knowledge/industrial/host-computer/station/csharp-abnormal-evidence-and-readonly-reconciliation/)。
+
+
+## 后续：接入前验收与运行簿
+
+第十一批已补[验收基线与故障演练](/knowledge/industrial/host-computer/station/field-commissioning-baselines-and-fault-rehearsals/)和 [C#运行簿与报告](/knowledge/industrial/host-computer/station/csharp-acceptance-book-and-offline-fault-drills/)。离线演练不填写现场通过记录，实际设备验收继续待执行。

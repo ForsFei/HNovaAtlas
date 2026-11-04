@@ -1,0 +1,125 @@
+---
+id: industrial-yolox-image-geometry
+title: YOLOX一般图片：解码、模型专属缩放与原图空间NMS
+description: 从PNG/JPEG解码到BGR输入，区分理想缩放比与实际栅格尺寸，解释YOLOX先还原坐标再做加1 NMS的原因及可见框裁剪边界。
+tags: [工业自动化, YOLOX, OpenCvSharp, 图像预处理, 坐标变换]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 80
+prerequisite: [industrial-yolox-postprocessing]
+related: [industrial-csharp-yolox-images, industrial-yolo-preprocessing, industrial-yolo-onnx-contract]
+---
+
+## 1. 从受限夹具进入一般图片
+
+前两批模型示例只接收宽416、高不超过416的自有图像，缩放比为1。本批增加本地PNG/JPEG文件、OpenCV解码与线性缩放，串起固定YOLOX-Nano的CPU推理和原图框。输入不再限制为416宽，模型契约仍然固定。
+
+本批仍围绕官方发布0.1.1rc0的YOLOX-Nano、输入images float32 `[1,3,416,416]`、输出output float32 `[1,3549,85]`。不同YOLO代际、导出脚本和任务可能使用不同颜色、归一化、输出布局和NMS方式；模型名称里都带YOLO不能证明它们兼容。
+
+学习时把以下链条分别核对：
+
+```text
+文件字节 → 解码后的存储栅格 → 自有BGR像素
+→ 按模型缩放 → 左上放图/右下填充 → BGR float32 NCHW
+→ ONNX原始输出 → 网络坐标框 → 原图参考坐标NMS
+→ 与有效栅格求交 → 可见原图框
+```
+
+其中“参考坐标”用于匹配模型后处理约定；“可见框”用于以后显示，两个概念不能混用。
+
+## 2. 文件格式不等于像素布局
+
+PNG和JPEG是压缩文件格式。不能把文件内容直接复制为网络输入，也不能根据.png扩展名判定解码后一定是三通道8位。PNG可能是灰度、带透明通道或16位；JPEG有损，解码值通常不能与压缩前像素严格相等。
+
+示例使用FileStream读取一份字节，再对这一份字节计算SHA256并交给`Cv2.ImDecode`。这样中文路径交给.NET处理，OpenCV接收内存字节；哈希也对应实际解码的数据，而非先计算文件哈希、随后重新按路径读取可能变化的文件。
+
+| 输入情况 | 本批策略 | 理由 |
+| --- | --- | --- |
+| PNG/JPEG签名、解码CV_8UC3 | 按BGR复制 | 固定模型需要BGR |
+| CV_8UC1灰度 | GRAY2BGR，三个通道取同一亮度 | 转换明确、可检查 |
+| 四通道透明图 | 拒绝 | 透明度如何与背景合成会改变模型输入 |
+| 16位图 | 拒绝 | 右移、线性归一化或窗口映射需要应用定义 |
+| 扩展名错误但签名有效 | 仍按内容解码 | 文件名不是类型证明 |
+| 解码为空或不支持格式 | 明确失败 | 不用黑图替代失败输入 |
+
+`ImreadModes.Unchanged`在本批保留解码深度和通道，并使用未按EXIF旋转的存储栅格。照片查看器可能根据EXIF显示另一方向，标注和叠加必须约定相同坐标。这里没有验收EXIF方向修正、ICC色彩管理或不同解码器的逐像素一致性，手机照片和生产相机图像接入时需要单独确认。
+
+本地入口限制文件不超过16MiB、解码边长1～8192且总像素不超过16777216。**解码器在尺寸检查前已经可能分配内存**，所以这些是教学输入边界，不是对不可信上传文件的解压炸弹防护；当前只处理可信本地文件。
+
+## 3. 固定YOLOX的缩放与填充
+
+令原图为W×H，目标416×416：
+
+```text
+r = min(416 / W, 416 / H)
+resizedWidth  = int(W * r)
+resizedHeight = int(H * r)
+```
+
+这里int表示正数截断。`Cv2.Resize`使用`InterpolationFlags.Linear`，缩放后的图像放在左上角，其余区域填BGR(114,114,114)。允许把小图放大；没有stride自动对齐、居中留边或只缩小选项。
+
+颜色维持BGR，像素转float32后仍是0～255，按CHW排布并增加batch维；不执行RGB交换、不除255、不重复减均值。第二批自有教学预处理采用RGB/255、居中与另一种取整策略，不能直接拿来替代这个模型适配器。
+
+极端细长图可能让短边截断为0，例如8192×1。上游公式没有自动把短边改成1；示例明确拒绝，避免悄悄改变模型策略。
+
+## 4. 为什么需要同时记录r和实际尺寸
+
+641×359图像有：
+
+```text
+r = 416 / 641 ≈ 0.6489859594
+W*r = 416
+H*r ≈ 232.986 → int后为232
+实际图像区域：[0,416] × [0,232]
+下方填充：184行
+```
+
+模型参考框还原用理想r：`sourceX = networkX/r`、`sourceY = networkY/r`。但是实际栅格比例分别是416/641与232/359，两者并不完全相同。不要为了让边缘正好落在原图359处，就把模型框改为按实际Y比例还原；那会偏离固定上游推理约定。
+
+这也意味着模型参考坐标不是每个插值像素中心的物理逆映射。图像插值有自身采样规则，框坐标还原有模型约定，两者不能合并成“图片缩放了多少，坐标就一定完全可逆”。正反公式往返通过，也不能证明网络输入像素正确。
+
+`ImageGeometry`同时保留Width/Height、Ratio、ResizedWidth/Height、RasterScaleX/Y与PadRight/Bottom，以便追溯这些差异。
+
+## 5. 原图空间NMS不能省略
+
+固定YOLOX的ONNX示例先把解码框除以r，再做NMS。上一批r=1时，网络坐标与原图参考坐标相同；本批缩放后必须保留这个执行顺序。
+
+若使用连续面积IoU，同一正比例缩放会同时约掉面积因子。但本教程兼容上游示例的`+1`宽高口径，常数1不会随比例缩放，IoU不再具有这种性质。
+
+看一个小反例：
+
+| 空间 | 框A | 框B | 加1 IoU |
+| --- | --- | --- | --- |
+| 网络 | (0,0,1,1) | (1,0,2,1) | 1/3 |
+| 原图，r=0.5 | (0,0,2,2) | (2,0,4,2) | 1/5 |
+
+NMS阈值设0.25：在网络空间先做NMS会抑制一个框；先除r再做NMS会保留两个。它不是可以忽略的显示误差，而是直接改变保留结果。
+
+本批顺序固定为：float32解码与乘积分数 → 严格score大于阈值 → 除以理想r → double几何的跨类加1 NMS → 可见框裁剪。分数并列时行号小者优先，不增加隐式TopK。`BoxMath.IoU`仍用于第一批连续坐标的评价，不拿来替换这个兼容NMS。
+
+double几何和稳定并列是本地明确策略；上游NumPy默认的排序与float32除法在数值边界上可能不同，不宣称任何平台下位级完全复现。
+
+## 6. NMS参考框与显示可见框
+
+网络可能输出图像外或padding中的框。先裁剪再NMS会改变重叠，因而裁剪放在NMS之后。保留下来的框仍保留NetworkBox与未裁剪ReferenceSource，显示需要的VisibleSource单独计算。
+
+可见裁剪先与**实际缩放栅格**求交，再除r并限制到原图边界。对于641×359，网络y在232.1～232.5的框虽然除r后仍可能落在原图359以内，却完全位于实际padding，应返回空可见框。直接把除r后的框裁到原图范围会漏掉这一点。
+
+这是本教程额外的显示策略，上游示例的NMS结果本身不包含这层可见性裁剪。无交集时`Original=null`，仍保留该检测记录；有裁剪时`WasClipped=true`。`Detections.Count`和`Visible`因此可能不同。末端边界按连续框理解，不能直接当作有效像素索引去访问W或H。
+
+## 7. 本批证据与工程边界
+
+新增35项托管几何检查、30项实际OpenCV/CPU检查。自有641×359渐变PNG与Python OpenCV4.13.0/ORT1.27.0参考对照：全部519168输入值严格一致，301665个原始输出最大绝对误差0；全部3549行原图参考框、类别/分数、候选与保留顺序以及可见裁剪通过，最大坐标差约0.000094047像素。
+
+score0.01/NMS0.45得到32个候选、5个保留且可见；这5项是渐变图网络响应，不是识别到5个真实物体。输入一致是跨语言实现检查；相同OpenCV和ORT后端也不构成独立推理引擎验证。真实标注集的误检漏检、AP/mAP、现场照明、耗时和长期资源仍需单独评估。
+
+面试可以围绕三个问题展开：为什么颜色正确但结果不对？为什么尺寸取整后要保留理想r？为什么同一批框在缩放前后NMS结果可能改变？答案应同时说明固定模型契约、数值口径和处理顺序。
+
+继续[C#图片读取、OpenCV缩放与离线YOLOX完整实践](/knowledge/industrial/host-computer/yolo/csharp-opencv-image-files-resize-and-yolox-inference/)。第六批已补[WPF原图显示与同图结果](/knowledge/industrial/host-computer/yolo/wpf-original-image-overlay-and-result-identity/)，本篇离线入口保留。
+
+## 参考资料
+
+- [固定YOLOX预处理源码](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/yolox/data/data_augment.py)：缩放、截断、填充与通道布局。
+- [固定ONNX推理示例](https://github.com/Megvii-BaseDetection/YOLOX/blob/6ddff4824372906469a7fae2dc3206c7aa4bbaee/demo/ONNXRuntime/onnx_inference.py)：除ratio与NMS的执行顺序。
+- [OpenCV4.13图像编解码](https://docs.opencv.org/4.13.0/d4/da8/group__imgcodecs.html)与[几何变换](https://docs.opencv.org/4.13.0/da/d54/group__imgproc__transform.html)：解码模式和插值说明。

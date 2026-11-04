@@ -1,0 +1,145 @@
+---
+id: industrial-csharp-station-async-host
+title: C#实践：异步工位宿主、模拟端口与只读核对
+description: 用Channel、Task.WhenAny和变更通知实现单所有者宿主，说明端口任务观察、异常不清义务、显式核对、邮箱背压与关闭资源交接API。
+tags: [工业自动化, C#, 异步, Channel, 工位流程]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 30
+prerequisite: [industrial-station-async-host]
+related: [industrial-csharp-station-controller, industrial-csharp-yolox-bounded-worker]
+---
+
+## 1. 命令和文件
+
+沿用纯.NET10项目`examples/industrial-station/IndustrialStation.csproj`，新增StationHost.cs、AsyncSimulation.cs和HostChecks.cs，没有第三方依赖或硬件入口。
+
+```powershell
+dotnet build examples/industrial-station/IndustrialStation.csproj -c Release
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --host-test
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --async-demo
+
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --self-test
+```
+
+新host-test执行48项异步检查，async-demo展示超时、实际Task、迟到回复与关闭；原self-test的57项及原demo保留。成功退出0、异常1、用法2。没有打开窗口、读写设备或运行视觉算法。
+
+## 2. IStationAsyncPort的明确契约
+
+```csharp
+public interface IStationAsyncPort : IAsyncDisposable
+{
+    Task<StationReply?> ExecuteAsync(StationCommand command);
+    Task<StationReply?> ObserveAsync(StationCommand command);
+}
+```
+
+ExecuteAsync只负责一次意图，ObserveAsync负责原命令的只读核对。成功返回一个匹配StationReply时才有足够证据交给状态机；null表示没有权威终态。任务异常或取消由宿主记录成不确定，不构造假的失败回复来清空Pending。
+
+ScriptedStationPort是程序集内部的测试端口，用委托和门闩制造这些情况。它的DisposeAsync检查是否仍有活跃调用，统计执行/查询/释放次数；不存在真实端口失败后回退模拟器的运行路径。
+
+在真实适配中，Task完成只能按该SDK的定义解释；若厂商API仅表示发送完毕，它不能直接作为运动到位回复。原接口没有硬取消参数，本轮也没有实现实际停止或中断原生调用。
+
+## 3. 宿主公共API
+
+| 成员 | 用途与语义 |
+| --- | --- |
+| StartAsync(order,evidence) | 邮箱接收后由所有者判断准入，成功只是周期已接收 |
+| PulseAsync() | 请求所有者检查期限，不代表设备有反馈 |
+| StopAsync() | 锁存软件停止，保留已转移义务 |
+| ConsumeAsync(terminal) | 消费本地原终态，不确认物理结果 |
+| ResetAsync(evidence) / ReleaseAsync(evidence) | 实际Task不活跃且状态机条件齐全才允许 |
+| ReconcileAsync() | 接收一次只读观察；返回true表示已启动，不代表已经核对成功 |
+| RequestClose() | 独立关闭信号，邮箱满也能生效 |
+| Completion | 所有者退出和端口清理的结果，可能因清理失败异常 |
+| Snapshot | 当前不可变快照，包括实际Task和待结状态 |
+| ObserveAfterAsync(revision) | 等待后续快照，不能作为可靠事件日志 |
+
+控制请求使用有界Channel，满时得到包含MailboxFull的失败Task，未接收的请求不会改变状态。宿主已结束后的普通RPC得到HostClosed；关闭后的StartAsync返回Closed。之前已经接收的控制请求会完成或明确失败，不遗留无响应Promise。
+
+## 4. 单所有者循环怎么工作
+
+StationHost内部持有唯一StationController，外部不能拿到它绕过宿主改状态。公开API只投递预定义控制操作，邮箱里的Func由宿主自身创建，不开放任意业务回调执行入口。
+
+循环主要做四件事：先应用关闭信号，观察已完成端口Task，处理有限批次控制消息，再决定是否转移下一个命令。没有端口Task时才允许正常Execute或显式Observe。
+
+```text
+等待项：邮箱可读 + 实际端口Task + 定时唤醒 + 尚未处理的关闭信号
+等待方式：Task.WhenAny
+醒来以后：判断各项是否完成，再观察对应结果
+```
+
+WhenAny本身完成，不表示胜出任务一定成功；端口Task结束后仍需GetResult/await以观察异常。本例只在IsCompleted为true后读取端口结果，捕获异常并保留Pending，不在所有者里同步等待一个未结束的SDK调用。
+
+WaitToReadAsync产生的等待任务会被复用，不在每轮无端累积读取等待。消息批次有限，避免大量控制请求使Task观察和计时长期得不到处理。
+
+## 5. 为什么还使用Task.Run
+
+有些async方法会在第一个await之前执行同步代码。宿主将端口调用放进Task.Run，使这段阻塞前缀不会卡住状态所有者；每次只有一个端口任务，不建立每帧无界Task队列。
+
+这不保证固定线程或STA。若厂商SDK要求在创建线程调用，应提供专用调度适配，而不是依赖线程池碰巧使用同一线程。本轮只测试Task式模拟端口。
+
+自动Tick使用可停止的系统Task.Delay，目标唤醒间隔25ms；阶段预算取控制器的TimeProvider，二者分开。测试可关闭自动Tick，通过ManualStationClock.Advance与PulseAsync精确触发期限，也覆盖自动唤醒路径。
+
+## 6. 异常和只读核对如何落到状态机
+
+新增StationController.RecordUncertain(key,code)：只有当前已经转移的待结命令匹配时才记录，正常等待态锁存Faulted；已经Faulted/Stopped/Closing则保留原终态，仅追加观察信息。它不会清除Pending。
+
+| 端口Task观察 | 宿主动作 |
+| --- | --- |
+| 有效匹配终态 | Receive，正常推进或DrainedLate |
+| null | NoTerminal，保留待结 |
+| IOException等异常 | TaskFault，保留待结 |
+| Task取消 | TaskCanceled，保留待结 |
+| 关联/载荷被拒绝 | ReplyRejected，锁存或保持故障 |
+
+当Task已观察结束、Pending仍为已转移命令时，NeedsReconciliation=true，ReconcileAsync可开始只读查询；原Task仍活跃则返回false。查询仍没有终态就继续保留，不会再调用ExecuteAsync。
+
+查询可以在关闭期间进行，否则“关闭等待核对”和“关闭后禁止所有操作”会形成无法收尾的死结。查询确认后仍要显式ConsumeAsync本地终态，才可完成关闭。
+
+## 7. 快照与消费示例
+
+创建宿主需要一个实现IStationAsyncPort的端口；本例模拟实现见AsyncSimulation.cs。接收与等待片段如下：
+
+```csharp
+Admission accepted = await host.StartAsync(order, readiness);
+HostSnapshot snapshot = host.Snapshot;
+while (snapshot.Station.Terminal is null)
+{
+    snapshot = await host.ObserveAfterAsync(snapshot.Revision)
+        .WaitAsync(TimeSpan.FromSeconds(10));
+}
+
+StationTerminal terminal = snapshot.Station.Terminal;
+// 先检查Outcome、关联身份及TaskActive/NeedsReconciliation，再决定展示/记录/核对。
+bool consumedLocally = await host.ConsumeAsync(terminal);
+```
+
+这是调用片段，不是异常情况下自动清理全部义务的通用模板。实际调用方还应观察Completion故障；外层WaitAsync超时只终止本次等待，不取消宿主任务。内部测试辅助Until显式检查自己的截止时间，避免“已完成快照任务”让测试无限快速循环。
+
+Snapshot的Terminal出现时，TaskActive仍可能为true，例如阶段超时但端口未返回；ConsumeAsync可以先处理本地故障记录，却不能让Reset或关闭绕过实际任务和Pending。
+
+## 8. 关闭和资源释放
+
+RequestClose与正常命令转移使用同一准入锁确定先后。标志建立后不再转移新正常命令；已经转移的任务依然受观察。循环退出前停止邮箱准入并处理剩余已接收请求。
+
+只有正常状态机Closed、没有活跃Task和待结义务，才调用端口DisposeAsync并等待其结束。Dispose成功后PortDisposed=true，Completion正常完成；失败则Completion异常，不把逻辑Closed当作已清理。
+
+对不可预期宿主内部错误，清理路径仍先观察活跃Task；若还留有Pending，不宣称端口已释放。此时需要外部诊断/恢复策略，本例没有强制丢弃义务或进程级终止实现。
+
+## 9. 实测与后续
+
+Release零警告零错误，新增48项异步检查与原57项状态机回归通过，合计105项。覆盖正常NG四次串行调用、实际Task尚未退出时的超时/关闭、null与异常/取消、错配回复、只读多次核对、满邮箱关闭、阻塞前缀、自动Tick和Dispose异常。
+
+demo实际输出：
+
+```text
+Deadline: Faulted; taskActive=True; pending=Move
+Close waits: completion=False; disposed=0
+Late result: DrainedLate; stage=Closed; executeCalls=1; disposed=1
+```
+
+这些门闩证明的是本地代码的任务与状态关系，不是PLC/控制卡/相机时序、实际停止、实时性或长期吞吐。继续[C#文件记录与重启报告](/knowledge/industrial/host-computer/station/csharp-file-ledger-and-restart-reconciliation/)，再进入界面及既有模块适配。
+
+理论见[端口任务与关闭排空](/knowledge/industrial/host-computer/station/async-ports-task-lifetime-and-host-draining/)。库行为参考[Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)、[Task.WhenAny](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.whenany?view=net-10.0)与[Task.WaitAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.waitasync?view=net-10.0)。

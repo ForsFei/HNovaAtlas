@@ -1,0 +1,116 @@
+---
+id: industrial-yolox-wpf-display
+title: YOLOX与WPF：原图显示、框坐标与同图结果
+description: 区分网络坐标、原图像素、WPF DIP与屏幕像素，建立图像出现身份和请求代次，处理切图、清空、迟到结果与关闭排空。
+tags: [工业自动化, YOLOX, WPF, 图像显示, 异步]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 100
+prerequisite: [industrial-yolox-image-geometry, industrial-csharp-yolox-images]
+related: [industrial-csharp-yolox-wpf, industrial-csharp-yolo-onnx-session]
+---
+
+## 1. 显示原图与原图框
+
+第五批已经得到一般PNG/JPEG的原图可见框。本批把同一份解码像素显示到WPF，再叠加该图的检测结果。窗口只提供打开图片、检测当前图、清空三个操作；窗口大小变化时自动重新布局，不加入参数面板、相机预览或拖拽标注。
+
+先明确四种空间：
+
+| 空间 | 单位与边界 | 本批如何使用 |
+| --- | --- | --- |
+| 网络输入 | 416×416坐标 | 留在离线推理层 |
+| 原图连续框 | 原图像素坐标，允许右边界等于宽 | 使用上一批VisibleSource.Original |
+| WPF视图 | DIP，设备无关单位 | 绘制图像和框 |
+| 离屏/屏幕位图 | 物理像素，受DPI影响 | 验证输出和实际显示 |
+
+不要把416画布的padding当作WPF窗口的留白。模型坐标还原已经完成；显示层再除一次模型ratio，会让框二次缩放。也不要在原图上画网络框，或把原图框坐标直接当屏幕像素。
+
+## 2. 图像和框共享一次Uniform映射
+
+原图尺寸为W×H，控件实际布局为Vw×Vh DIP：
+
+```text
+s = min(Vw / W, Vh / H)
+displayWidth  = W * s
+displayHeight = H * s
+offsetX = (Vw - displayWidth) / 2
+offsetY = (Vh - displayHeight) / 2
+viewX = offsetX + sourceX * s
+viewY = offsetY + sourceY * s
+```
+
+例如20×10图放进400×400 DIP，s=20，实际图像区域为(0,100,400,200)。原图框(5,2,15,8)映射到视图矩形(100,140,200,120)，最后两个参数为宽和高，不是右下坐标。
+
+本示例的YoloViewer在OnRender中按同一个DisplayMapping绘制BitmapSource和所有框。相比让Image与另一个Canvas各自自动布局，共享映射更容易保证留白、居中和窗口缩放的一致性。布局尺寸为0或非有限数时跳过绘制，不产生除零坐标。
+
+显示裁剪使用实际图像区域，框线和标签不会延伸到黑色留白；边缘框可能被裁掉半条描边，这是显示裁剪的效果。框线固定2 DIP、文字12 DIP，不随原图缩放倍数变粗。靠近右下角的标签可能被裁剪，本批没有加入标签避让算法。
+
+## 3. DIP不是屏幕像素
+
+96 DPI下，一个DIP通常对应一个物理像素；144 DPI离屏输出的物理尺寸是DIP尺寸的1.5倍。同样400×400 DIP控件，在本批144 DPI测试中输出600×600像素，框的视图x=100 DIP对应物理x=150像素。
+
+不要在框坐标公式里额外乘一次显示器DPI；WPF布局和绘制仍使用DIP。生成FormattedText时使用VisualTreeHelper.GetDpi返回的PixelsPerDip，让文字使用正确的渲染信息。原图BitmapSource显式采用96 DPI，绘制又明确指定目标矩形，原图坐标由PixelWidth/PixelHeight确定。
+
+96和144 DPI离屏结果正确，不等于已经在多显示器之间拖动窗口并验收所有缩放情况。真实窗口的字体、边缘、不同显示器切换和大图操作仍需人工检查。
+
+## 4. 冻结图片，传递自有数据
+
+后台读取和推理不能直接修改WPF控件。本批先从LoadedImage.Bgr复制紧密BGR24像素，通过BitmapSource.Create创建图片，再Freeze；UI线程只接收冻结后的图片和不可变结果。
+
+这里不把Mat.Data指针、已释放的ROI或原生输出Span传给UI。OpenCV中间Mat与ONNX会话在后台调用内部释放，OverlayResult只保留原图可见框、行号、类别索引与分数。冻结图片允许跨线程读取，但不是“所有WPF对象都可以跨线程”；窗口、控件和DisplaySession的修改仍在UI所属Dispatcher中执行。
+
+BitmapSource和托管像素也会占内存。Freeze减少变更通知并允许共享，不表示内存已经释放。切图后丢弃旧显示引用，后台仍运行时继续持有该请求捕获的旧图，直到任务正常结束。
+
+## 5. 同一个文件也有不同的显示身份
+
+文件路径、文件哈希、尺寸相同，都不能代替一次打开行为的身份。例如先打开A，开始检测，再重新打开A；旧检测结果是否允许叠加，必须由应用明确决定。本例把每次加载创建为新的ImageSnapshot，分配新的Id，关闭旧显示代次。
+
+```text
+ImageSnapshot：本次解码像素 + 冻结显示图 + 新Id
+InferenceRequest：会话 + 请求号 + 显示代次 + 捕获的Snapshot
+OverlayResult：同一Snapshot + 只读可见框
+```
+
+DisplaySession额外维护selection代次，Show与Clear都会递增。即使程序清空后再次传入同一个Snapshot对象，也不会让清空前的结果重新出现。请求完成还需要与当前active请求对象匹配；复制出来的相同字段记录、另一会话请求或重复完成都不能释放当前任务槽。
+
+这套身份只解决本地离线图片和结果关联，没有建立相机曝光、触发号、工件或PLC结果身份。文件哈希用于来源追溯，也没有替代这些现场关联。
+
+## 6. 迟到、失败和空结果是三件事
+
+| 返回情况 | 会话动作 | 窗口表现 |
+| --- | --- | --- |
+| 当前请求、当前图、结果身份匹配 | Attached | 显示本图框 |
+| 已切图、清空或开始关闭 | Stale | 丢弃显示发布，释放已结束任务槽 |
+| 当前请求推理失败或结果错图 | Failed | 无框，显示错误 |
+| 非当前请求或重复返回 | Rejected | 不改变当前有效结果/任务槽 |
+| 匹配结果但框集合为空 | Attached | 正常显示0项 |
+
+开始新检测时立即清掉旧叠加。不能在推理失败后继续显示上次的框，仿佛本次仍成功；也不能把0个框标成通讯失败或直接等价于产品合格。
+
+本批GUI固定score>0.1和NMS0.45。渐变测试图在默认阈值下为空，低阈值0.01仅在独立native检查中展示5项响应。这些类别是固定COCO模型索引，不是scratch/dent工业标签，更不是5个缺陷。
+
+## 7. 一个后台推理槽与关闭排空
+
+检测按钮只在有图且没有运行请求时启用。检测期间可以打开另一张图，但不能开始第二个推理。读图期间打开按钮禁用，所以最多一个读取任务和一个推理任务；没有隐藏排队或连点累积。
+
+清空不释放推理槽，也不取消ONNX原生调用。关闭窗口时先阻止新任务、使当前显示失效，然后异步await已开始的读取与推理，最后真正关闭；不要在UI线程调用Task.Wait或Result等待需要回到UI线程的续体。
+
+本例每次检测在后台创建一个会话，完成后Dispose，方便说明生命周期；没有把重复加载模型的耗时当作稳定推理性能。以后连续处理应增加单所有者长寿命会话、有界准入和更完整的结果交接。本批不承诺关闭硬期限、强制终止原生调用、连续相机采集或长期内存表现。
+
+## 8. 本批验证与追问
+
+新增38项WPF/手写结果检查，覆盖后台冻结BGR图片、Uniform留白、框映射、窗口重排、96/144 DPI离屏像素、错图、复制/重复请求、切图/清空/失败/空结果及关闭状态；另有10项真实OpenCV/CPU/WPF检查，实际读取641×359图、运行模型、保留顺序核对、UI状态附着与离屏PNG输出。
+
+手写测试结果只用于显示层检查，不作为模型推理替身。没有打开可见窗口进行人工操作，关闭测试主要验证会话状态与晚到结果，不能据此声称人工交互和所有窗口事件时序已验收。
+
+面试可继续追问：为什么两张相同尺寸图片不能直接共用检测结果？为什么清空后重新显示同一对象还要比较代次？为什么await后台推理不等于可以从后台写TextBlock？回答应落到数据身份、所有权、Dispatcher与实际取消能力。
+
+继续[C# WPF离线查看器、会话与叠加实践](/knowledge/industrial/host-computer/yolo/csharp-wpf-yolox-viewer-session-and-overlay/)。第七批已补[长寿命会话与有界准入](/knowledge/industrial/host-computer/yolo/long-lived-session-bounded-admission-and-terminal-receipts/)，本篇单次入口保留；下一步真实标注样本和部署评价。
+
+## 参考资料
+
+- [Microsoft WPF成像概述](https://learn.microsoft.com/en-us/dotnet/framework/wpf/graphics-multimedia/imaging-overview)：BitmapSource及Stretch行为。
+- [Freezable对象](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/freezable-objects-overview)：冻结与跨线程共享。
+- [WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)：Dispatcher和异步交接。
+- [离屏图像编码](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/graphics-multimedia/how-to-encode-a-visual-to-an-image-file)：RenderTargetBitmap与PNG输出。

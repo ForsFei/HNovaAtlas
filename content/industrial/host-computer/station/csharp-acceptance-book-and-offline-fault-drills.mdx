@@ -1,0 +1,147 @@
+---
+id: industrial-csharp-station-commissioning
+title: C#实践：验收运行簿、基线指纹与离线故障演练
+description: 使用AcceptanceBook记录模拟和现场试验，以固定基线、幂等观察与不覆盖报告保留证据，运行三项明确范围的离线故障演练。
+tags: [工业自动化, C#, 综合工位, 工程实践]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 210
+prerequisite: [industrial-station-commissioning]
+related: [industrial-csharp-station-reconciliation, industrial-csharp-e3032-motion-observation]
+---
+
+## 1. 项目和入口
+
+新增examples/industrial-station-commissioning/IndustrialStation.Commissioning.csproj，net10.0，引用原evidence项目，无新NuGet包、网络、原生SDK或设备参数。
+
+```powershell
+dotnet build examples/industrial-station-commissioning/IndustrialStation.Commissioning.csproj -c Release
+dotnet run --project examples/industrial-station-commissioning/IndustrialStation.Commissioning.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-commissioning/IndustrialStation.Commissioning.csproj -c Release --no-build -- --demo
+```
+
+退出码成功0、异常1、用法2。Demo创建唯一临时目录并保留报告；只运行原状态机、模型时钟和本地只读文件检查。
+
+## 2. AcceptanceBaseline和AcceptanceBook
+
+```csharp
+AcceptanceBaseline baseline = new(
+    "app-commit-or-release",
+    "runtime-sdk-inventory-v1",
+    "e3032-camera-config-v1",
+    "protocol-v1",
+    "recipe-v1",
+    "sample-and-criteria-v1");
+AcceptanceBook book = new(baseline);
+string baselineSha256 = book.BaselineSha256;
+```
+
+六段文本均要求非空、首尾无空格、无控制字符，单段最多1024字符。实际项目应指向受版本管理的清单，不在文本中塞设备密码或完整二进制。
+
+构造时按固定记录字段顺序序列化基线并计算SHA-256。任一段声明改变，指纹会变化；方法没有扫描系统或验证外部文件内容。需要文件哈希时，将其放入实际清单并在现场核对。
+
+```csharp
+string hash = Convert.ToHexString(
+    SHA256.HashData(JsonSerializer.SerializeToUtf8Bytes(baseline)));
+```
+
+## 3. 固定八项与分阶段观察
+
+```csharp
+IReadOnlyList<AcceptanceCase> cases = AcceptanceBook.Cases;
+AcceptanceReport report = book.Snapshot;
+```
+
+| 成员 | 类型/作用 |
+| --- | --- |
+| Cases | 八个只读AcceptanceCase，包含Id、Subject、Procedure、ExpectedEvidence |
+| BaselineSha256 | 当前声明基线指纹 |
+| Record(TrialObservation) | 写入一个专题/阶段的观察；相同内容幂等返回false |
+| Snapshot | 不可变快照，包含每项模拟/现场观察 |
+| WriteNewReport(directory) | 写入不覆盖的JSON报告，返回最终绝对或组合路径 |
+| MissingFieldEvidence | 没有Field观察的项目数 |
+| FailedFieldEvidence | Field明确声明失败的项目数 |
+
+AcceptanceBook没有连接、使能、Start、Reset或Review方法，也没有“设备Ready”属性。它只负责有界记录，最多八项乘两个阶段，内部锁保证Record与Snapshot的状态一致。
+
+## 4. 怎样记录一次观察
+
+```csharp
+TrialObservation observation = new(
+    "communication",
+    TrialStage.Simulation,
+    TrialOutcome.Passed,
+    book.BaselineSha256,
+    "offline-observer",
+    DateTimeOffset.UtcNow,
+    "late-move-reply: reducer-only fixture, see run log");
+bool added = book.Record(observation);
+```
+
+TrialStage只有Simulation/Field，Outcome定义NotRun/Passed/Failed。Record拒绝NotRun：尚未执行就保持该阶段为空，避免伪造一条“观察”。Passed/Failed都必须有匹配的CaseId、基线指纹、观察人、UTC时间和非空证据引用。
+
+相同专题/阶段已经记录后，相同对象内容返回false；任何不同内容抛异常。重新试验应创建新运行簿和新报告目录，保留旧失败材料，不覆盖结果。
+
+证据引用是声明文本，不是自动认证的文件。类不会检查引用是否真实、观察人是否授权或设备是否实际执行。测试中的合成Field失败仅验证数据模型，不写入Demo的现场结果。
+
+## 5. 离线演练怎样调用原状态机
+
+```csharp
+IReadOnlyList<DrillResult> drills = OfflineDrills.Run(runDirectory);
+```
+
+每项返回CaseId、Name、Passed和Detail。Demo将Detail一起写入Simulation的EvidenceReference，明确演练范围；小范围演练通过不代表完整专题或Field通过。
+
+第一项使用原StationController和ManualStationClock：TryStart→TryTakeCommand→时钟推进2秒→Tick→Receive原成功Move回复。检查返回DrainedLate，原Terminal引用不变，Outcome保持Faulted，没有新的Capture命令。
+
+第二项使用错误Session回复，检查IgnoredCorrelation、原Pending保留且不能再次取出已转移命令。它只验证通用工位身份，不验证相机驱动的触发-帧因果关系。
+
+第三项调用原EvidenceReconciler.Inspect读取不存在路径，检查RequiresAttention=true、LedgerUnavailable、没有生成目录。这是实际本地文件读取尝试，没有设备或数据库。
+
+三项不会创建TCP服务、打开串口、加载雷赛/相机DLL或触发真实动作。
+
+## 6. 报告保存、刷新和关闭
+
+```csharp
+string path = book.WriteNewReport(runDirectory);
+```
+
+方法先取得Snapshot，再用System.Text.Json输出字符串枚举。写入acceptance-report.json.pending时使用FileMode.CreateNew、FileAccess.Write、FileShare.None；Flush(true)后using关闭流，再File.Move到最终acceptance-report.json且不覆盖。
+
+已有最终报告时直接拒绝；已有.pending时CreateNew失败并保留原文件。没有自动删残留、强制重试或改旧报告。单份报告上限64KiB，当前固定八项/两阶段的记录规模有界。
+
+AcceptanceBook只保留托管记录，没有常驻设备或文件句柄，无需Dispose。写入方法的文件流在using中关闭。报告发布与任何工位账本之间没有事务，文件哈希也不是签名或突然断电保证。
+
+## 7. 看Demo输出
+
+```text
+SIMULATION late-move-reply: True; Reducer/model only ...
+SIMULATION wrong-session-reply: True; Generic station identity reducer only ...
+SIMULATION missing-ledger-readonly: True; Actual local read attempt ...
+Missing field evidence: 8/8; no hardware executed; no machine permission.
+```
+
+JSON的Scope固定为RecordOnly-NoMachinePermission。八项Field均为空，MissingFieldEvidence=8；三项Simulation有本次演练记录，其余为空。
+
+这有助于区分“软件演练确实执行过”和“现场项目尚未执行”。报告没有声称通过E3032运动、真实触发、质量或长期运行验收。
+
+## 8. 原生SDK接入前仍需什么
+
+运行簿记录不替代SDK适配。真实雷赛/相机DLL还应核验位数、导出符号、调用约定、结构体布局、数组长度与缓冲区生命周期；调用约定应匹配原生实现，参见[Microsoft原生调用约定](https://learn.microsoft.com/en-us/dotnet/standard/native-interop/calling-conventions)。
+
+不要根据net10.0编译通过就推断目标机驱动已安装或E3032 ABI匹配，也不要在示例里填未经核对的函数签名。已有[E3032总线接入与轴映射](/knowledge/industrial/host-computer/motion/e3032-ethercat-commissioning-and-axis-mapping/)和 [C#单轴动作观察](/knowledge/industrial/host-computer/motion/csharp-e3032-motion-observation/)可作为现场核验的知识入口。
+
+## 9. 实际验证与后续
+
+新增34项检查覆盖模拟不填现场证据、基线六部分变化、重复/冲突、未知阶段、空证据、UTC、不可变快照、三项演练及报告拒绝覆盖/保留.pending。测试和报告只使用离线材料。
+
+下一批整理部署交付包、现场参数模板与运行维护记录。默认工位、WPF、MC、图像保存和异常核对入口保持原用法。
+
+
+本批实际验证：Release零警告零错误；新增34项与原状态机57项、异常对账52项相关回归通过，共143项。三项离线演练通过，报告8项现场证据缺失。
+
+
+## 后续：交付资料与维护记录
+
+第十二批已补[部署交付与现场参数](/knowledge/industrial/host-computer/station/deployment-handover-site-parameters-and-maintenance/)和 [C#资料清点、模板与维护记录](/knowledge/industrial/host-computer/station/csharp-handover-manifest-parameters-and-maintenance-records/)。工具发布与生成资料包分别记录，未填写参数不变成运行配置。

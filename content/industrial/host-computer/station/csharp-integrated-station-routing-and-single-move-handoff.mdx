@@ -1,0 +1,178 @@
+---
+id: industrial-csharp-station-integrated
+title: C#实践：组合工位端口、唯一Move与端到端会话
+description: 使用IntegratedStationPort路由原运动和视觉端口，说明显式准备、完成证据交接、原Task复用、结果确认、迟到与关闭API。
+tags: [工业自动化, C#, 综合工位, 异步, 测试]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 150
+prerequisite: [industrial-station-integrated-flow]
+related: [industrial-csharp-station-motion-adapter, industrial-csharp-station-vision-adapter]
+---
+
+## 1. 项目与运行入口
+
+新增examples/industrial-station-integrated/IndustrialStation.Integrated.csproj，net10.0，引用上一批运动/视觉项目及其核心依赖，无新第三方包。
+
+```powershell
+dotnet build examples/industrial-station-integrated/IndustrialStation.Integrated.csproj -c Release
+dotnet run --project examples/industrial-station-integrated/IndustrialStation.Integrated.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-integrated/IndustrialStation.Integrated.csproj -c Release --no-build -- --demo
+```
+
+成功0、异常1、用法2。只创建唯一系统临时结果目录，打印路径并保留；没有真实卡/相机、原生SDK、网络或设备地址参数。
+
+## 2. 创建和显式准备
+
+```csharp
+IntegratedStationPort port = new();
+IntegratedStationSession session = await IntegratedStationSession.OpenAsync(directory, port);
+session.OpenMotionSimulation();
+session.EnableMotionSimulation();
+session.OpenReplay();
+Task<bool> reference = session.BeginReferenceSimulation();
+
+for (int i = 0; i < 1000 && !reference.IsCompleted; i++)
+    port.AdvanceSimulation(.01);
+if (!await reference.WaitAsync(TimeSpan.FromSeconds(2)))
+    throw new InvalidOperationException("Reference failed");
+```
+
+会话打开应用账本并转移组合端口所有权，不自动做这些准备。准备只能在已核对Idle状态执行；Start会再次检查运动与视觉两份准入。
+
+循环推进的是虚构轴时间，既不是EtherCAT周期也不是真实时间等待。宿主仍用独立TimeProvider检查业务期限，二者区别见[TimeProvider](https://learn.microsoft.com/en-us/dotnet/standard/datetime/timeprovider-overview)。
+
+## 3. IntegratedStationSession API
+
+| API | 作用 |
+| --- | --- |
+| Snapshot | 原应用/宿主/账本内存快照 |
+| Devices | 组合端口及两个模块的诊断快照 |
+| OpenMotionSimulation/EnableMotionSimulation | 明确连接与使能模型 |
+| BeginReferenceSimulation | 开始简化回零并等待合格观察 |
+| OpenReplay | 打开自有P2回放及处理器 |
+| StartAsync(workpiece,recipe) | 两模块准备合格后，先保存意图再启动 |
+| StopFlowAsync | 只锁存工位停止，不自动停止模型 |
+| SaveResultAsync | 保存本地终态成功后消费 |
+| AcknowledgeVisionAfterSavedAsync | 确认原处理收据；本周期未建立视觉前置时返回false |
+| ReconcileAsync | 经宿主只读观察原Task结果 |
+| SimulateReviewAndReleaseAsync | 模块任务已结、视觉收据已确认后本地模拟核对/放行 |
+| RequestClose/CloseStepAsync | 提出关闭并有限推进原应用收尾 |
+
+会话不向外暴露可以直接修改的StationHost。低层端口仍是可信调用方接口，应按单所有者顺序调用，不能让其他线程同时绕过会话发新命令。
+
+## 4. Move路由与完成证据
+
+组合端口的核心分派形式：
+
+```csharp
+StationReply? result = await motion.ExecuteAsync(command);
+if (result is { Success: true })
+{
+    vision.RecordQualifiedExternalMove(command, result);
+    // 这里只记同周期前置证据，不调用视觉ExecuteAsync(Move)。
+}
+```
+
+其他步骤交给原VisionStationPort.ExecuteAsync。实际实现还检查原订单、单步骤Task、当前周期和调用是否仍在运行；这个片段不是可以绕过宿主直接启动多步骤的脚本。
+
+新增RecordQualifiedExternalMove检查：命令必须是Move、没有帧/判定，回复必须同Key、工件、配方、Success=true且没有帧/判定。重复同内容返回false，冲突或未释放旧周期拒绝。
+
+该方法只是可信完成证据入口，不执行运动，也不自己读取轴反馈来验证物理到位。组合端口只在其拥有的MotionStationPort完成合格观察后调用它。
+
+VisionPortSnapshot新增SimulatedMoveCalls与ExternalMoveHandoffs供检查：组合演示中前者为0，后者每周期1。独立视觉例子的模拟Move入口保留，旧用法未切换为运动模型。
+
+## 5. 原Task为什么要缓存
+
+组合端口按本周期StepKind保存原StationCommand与TaskCompletionSource。同一步骤相同完整命令返回原Task，不重新调用运动、取帧或计算；同身份改载荷拒绝。
+
+即使底层运动端口自己已经防重复，组合层仍保留这个边界，避免上层重复调用被解释成新一轮模块交接。
+
+ObserveAsync只读组合层已经存在的回复或null，不重新调用Execute，也不为一次失败Task补建视觉前置。它不是重试流程或自动恢复编排器。
+
+TaskCompletionSource使用RunContinuationsAsynchronously；返回结果和异常都转移到原Task，状态锁内不执行调用方的继续代码。组合层没有逐帧Task.Run，视觉内部仍用原有固定工作器。
+
+## 6. 如何等待、保存与确认
+
+Start返回的是订单准入，不是周期完成。示例检查与Demo提供有截止时间的推进辅助，直到终态出现：
+
+```csharp
+await session.StartAsync("part-001", "demo-ok-v1");
+// 在受控循环中AdvanceSimulation并观察Snapshot，直到原周期终态出现。
+// 正常周期且Task/Pending均已结束之后：
+await session.SaveResultAsync();
+await session.AcknowledgeVisionAfterSavedAsync();
+await session.SimulateReviewAndReleaseAsync(PeerResultDisposition.AcceptedByPeer);
+```
+
+FrameId、原FrameStamp、ROI与判定仍由旧视觉端口关联。NG是正常完成的判定，不触发故障复位分支。
+
+Move失败/停止而未交给视觉时，没有本周期视觉结果可确认；返回false不是确认失败，也不替代原本地终态保存。应用仍要求终态消费和待结清空，才能显式模拟核对。
+
+本例不自动为同目标零位移补一个成功结论，沿用原运动观察策略；缺少可观察起动时仍可能Unknown，需要专门证据方案。
+
+## 7. 组合诊断与历史范围
+
+| IntegratedPortSnapshot属性 | 用途 |
+| --- | --- |
+| Motion | 模型参考、反馈位置、观察原因、Move/Stop次数 |
+| Vision | 帧、统计、判定、收据及模拟Move/外部交接次数 |
+| MoveOperation | 本周期原Move身份 |
+| MoveHandedToVision | 已记录匹配Move前置，不等于宿主接受后续步骤 |
+| TaskActive | 整个组合调用仍在运行，可能晚于某个子模块Task |
+| Disposed | 两个模块均完成释放 |
+
+视觉快照可能保留上周期历史；MoveHandedToVision=false时，不能把那份旧帧统计当成本周期结果。生产结果以同周期被接受的StationTerminal为准。
+
+本地账本仍只保存工位终态、FrameId和判定，没有原图、源Stamp或测量明细。组合不自动获得跨进程设备任务恢复能力。
+
+## 8. 停止与三处迟到
+
+RequestOrdinaryStopSimulation显式请求模型普通停止，StopFlowAsync只停止流程；两者都不提供真实安全停止。
+
+检查分别在Move、Capture、Inspect阶段推进宿主单调时间到期限：
+
+- Move迟到：可以记录完成证据，但状态机已Faulted，不派发Capture。
+- Capture迟到：原工位FrameId保持null，不启动Inspect。
+- Inspect迟到：诊断可能Ok，原工位判定仍null，不发模拟PublishResult。
+
+内部算法已完成、组合回复尚未结束时，TaskActive仍为true，Dispose拒绝。不能用一个子模块的空闲状态判断整个端口可以释放。
+
+## 9. 关闭推进与资源所有权
+
+宿主等组合Task、Pending和本地消费完成后，调用组合DisposeAsync。组合端口分别等待运动和视觉释放，汇总异常，只有都成功才Disposed=true。
+
+关闭推进可用：
+
+```csharp
+session.RequestClose();
+while (!await session.CloseStepAsync())
+{
+    port.TryAdvanceSimulation(.01);
+    await Task.Delay(1); // 只给异步宿主调度机会，不是控制周期。
+}
+```
+
+真实调用方还需显示错误和观察未结义务；这个循环没有强制结束未知动作的功能。测试另外设置等待上限防挂起。
+
+TryAdvanceSimulation在组合关闭/已释放时返回false，避免关闭泵和宿主释放竞态导致Tick已关闭子模块。普通AdvanceSimulation仍用于准备/运行阶段，参数遵守原模型约束。
+
+## 10. 实测与后续
+
+Release零警告零错误，新增49项组合检查，原356项回归通过，共405项。实际Demo：
+
+```text
+Cycle 1: feedback=1.000mm; frame=1; mean=220.0; verdict=Ok
+Cycle 2: feedback=2.000mm; frame=2; mean=75.0; verdict=Ng
+moves=2; visionFakeMoves=0; handoffs=2; closed=True
+```
+
+检查覆盖原Task复用、错误完成证据、错帧、停止后显式新周期、三处超时迟到、关闭和旧周期重启核对。没有真实设备、原生算法、不同DPI/人工UI或现场安全验收，默认WPF和MC入口不变。
+
+理论见[运动到位、原帧检测与结果保存](/knowledge/industrial/host-computer/station/integrated-offline-station-motion-to-image-and-result/)。下一批补结果留图与测量明细追溯，再分批处理真实设备链路。
+
+
+## 后续：原图和测量证据
+
+第九批已补[结果留图与测量明细](/knowledge/industrial/host-computer/station/original-image-measurement-evidence-and-publication/)和 [C#证据存储工作流](/knowledge/industrial/host-computer/station/csharp-image-evidence-store-and-save-workflow/)。原入口仍可独立运行；新工作流在确认视觉收据前保存并验证原始像素。

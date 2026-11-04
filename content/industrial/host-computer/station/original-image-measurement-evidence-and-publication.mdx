@@ -1,0 +1,129 @@
+---
+id: industrial-station-image-evidence
+title: 结果留图：原始图像、测量明细与周期追溯
+description: 将工位终态、FrameId、原始Mono8帧、配方与ROI统计组成可复查证据，理解写盘顺序、重复保存、损坏检测与重启边界。
+tags: [工业自动化, 综合工位, 机器视觉, 数据追溯]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 160
+prerequisite: [industrial-station-integrated-flow, industrial-csharp-station-integrated]
+related: [industrial-station-vision-adapter]
+---
+
+## 1. 为什么有结果号，还需要保存图像
+
+上一批已经把模型定位、采图、原帧统计和工位结果串起来，但账本里的FrameId只是应用标识。进程退出后，单靠GUID无法回答“这次NG对应什么图，在哪块区域算出了什么值”。
+
+本批把正常完成周期的证据落盘。一个周期包含原始Mono8图像和一份JSON明细；明细绑定工件、配方、工位会话/周期、FrameId、采集源会话/帧号、原处理结果和统计。重新读取时，验证文件内容并重算该ROI的像素统计，用来检查保存材料是否相互一致。
+
+这里的“正常完成”包含OK和NG：它们都是成功完成检测后的业务判定。采图失败、处理失败、超时、停止仍使用原账本，不在缺图时生成一张替代图。本批先完成有合格图像、测量成功且工位Completed的路径。
+
+## 2. 保存的是哪张图
+
+保存`CaptureResult.Evidence.Frame.Image`：来自本周期单拍关联、已经复制到自有托管内存的原始图。既不重新Acquire，也不从最新预览槽取图。
+
+| 内容 | 本例保存方式 | 作用 |
+| --- | --- | --- |
+| 原始像素 | image.pgm，完整8位单通道图 | 保留ROI之外的上下文，可复核原始数据 |
+| 工位结果 | Terminal，包含Order、Outcome、FrameId、Judgment | 与结果账本核对 |
+| 图像来源 | FrameStamp：源Session与Number | 区分重开采集源后的同号帧 |
+| 处理身份 | PipelineSession、CaptureRequest、CameraEpoch、TriggerSequence | 保留这次处理所用的关联信息 |
+| 配方 | Version、ROI、Threshold、MinimumMean、MinimumBrightPixels | 解释当时采用的统计与判定规则 |
+| 测量 | Count、Min、Max、Mean、亮点/黑点/白点数 | 保存实际计算结果 |
+| 完整性 | 图像文件SHA-256、尺寸、格式、Schema | 检查图像文件与明细是否一致 |
+
+FrameId和FrameStamp用途不同：前者是工位关联号，后者是采集源身份。文件保存两者，不把源帧号当全球唯一号。
+
+示例原图本来带行填充，复制成Mono8Image后已经逐行去除填充。保存的是紧排有效像素，不会把Stride中的额外字节当图像内容。图像没有叠加框、缩放或JPEG损失；后续若需要预览图，可以另存派生图并显式记录其来源。
+
+## 3. 一个目录对应一个周期
+
+```text
+evidence/
+  .writer.lock
+  会话GUID-0000000001/
+    image.pgm
+    manifest.json
+  会话GUID-0000000002/
+    image.pgm
+    manifest.json
+```
+
+目录名只由受检的GUID与正周期号生成。工件名称和配方文本写入JSON，不拼进路径；即使工件名称包含冒号、斜杠或多个工件重名，也不会改变证据目录。
+
+本例要求专用、可信本地目录和合作的单写者，通过独占文件句柄阻止第二个EvidenceStore同时写同一根目录。读取只接受固定两个文件；重解析点、额外文件、缺文件、空文件或超限文件均拒绝。根目录的上级路径和存储权限仍须由部署者控制，这不是处理任意敌对文件系统的沙箱。
+
+## 4. 为什么采用PGM
+
+本例的算法输入是8位单通道Mono8，使用PGM的最小P5子集：ASCII头、宽高、255、换行，随后紧排逐行像素。格式细节见[Netpbm PGM规范](https://netpbm.sourceforge.net/doc/pgm.html)。
+
+```text
+P5
+8 6
+255
+后面是二进制像素，不是十进制数字列表
+```
+
+本例只读自己写出的规范头，并明确拒绝其它PGM变体；它不是通用PGM解码器。无需安装OpenCV或HALCON即可保存这份Mono8证据。实际相机若输出Bayer、16位或彩色图，应设计相应格式和位深契约，不能套用本例后丢掉通道或高位。
+
+图像哈希覆盖PGM头和全部像素。哈希不是工件识别，也不证明拍照时刻，更不是认证签名。拥有目录修改权限的人能同时改图、改统计和改哈希；本例不提供防篡改审计。
+
+## 5. 保存顺序与视觉收据
+
+原本的顺序是“工位结果保存→消费终态→确认视觉收据”。新示例的合作所有者采用：
+
+1. 等工位Completed，实际Task结束且没有Pending。
+2. 在确认前导出本周期保留的原图和处理结果。
+3. 保存图像和明细，发布目录，再读回校验。
+4. 保存原工位终态并消费本地收据。
+5. 确认原视觉处理结果，释放本周期像素引用。
+6. 显式模拟核对并放行下一工件。
+
+第3步出错时不执行第4、5步。本轮终态和视觉结果继续保留，不能为了补图再触发一次相机。测试会在目标路径注入文件冲突，验证结果未消费、视觉收据未确认、采图和处理次数仍为1。
+
+这是新增EvidenceWorkflow的编排契约。上一批直接调用SaveResult/Acknowledge的API仍可用，不会被偷偷改成强制留图；集成方必须让同一所有者顺序使用新工作流，不能同时绕过它操作底层会话。
+
+## 6. 多个文件怎样发布
+
+先在同一父目录创建以`.pending`结尾的临时目录，用CreateNew分别写image.pgm与manifest.json；两个流写完后都Flush(true)并关闭，再通过Directory.Move发布为最终目录。最终目录存在时不覆盖，先读取验证并比较已有内容。
+
+Flush(true)的用途见[Microsoft FileStream.Flush](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush?view=net-10.0)：请求刷新中间文件缓冲。本例没有进行突然断电测试，也不保证目录元数据和不同文件系统的持久性。图像证据目录与原结果账本是两份本地存储，没有跨目录事务。
+
+| 失败位置 | 磁盘可能状态 | 本例处理 |
+| --- | --- | --- |
+| 保存证据前 | 原账本有Began，尚无留图 | 保留原周期，不伪造图 |
+| 两文件写入或目录发布时 | 存在.pending或已发布但校验失败 | 当前Store拒绝继续发布，保留现场 |
+| 留图成功、终态账本保存前 | 已有证据，账本仍无终态 | 原进程重试时比对同一证据，不重复采图 |
+| 终态已存、视觉确认前 | 文件完整，内存收据仍保留 | 原会话可按顺序重试确认 |
+| 原进程退出 | 旧Task和原视觉收据消失 | 只读核对文件与账本，不复活动作 |
+
+重开时发现.pending目录会拒绝接纳新的保存。示例不自动删文件、清空坏目录或把半成品改名为成功；应保留材料，人工判断后使用明确的新目的目录或后续恢复工具。
+
+## 7. 读取时检查什么
+
+读取者限制JSON为64KiB、图像像素为Mono8Image.MaxPixels，并要求文件长度、规范头和SHA-256匹配。JSON未知字段、重复字段、缺少构造参数、错误枚举和错误Schema拒绝。
+
+接着核对目录Session/Cycle、Terminal/FrameId、Order/Recipe、FrameStamp、处理请求和配方。使用固定示例配方从保存像素重新计算ROI统计，逐字段比较，并重算OK/NG规则。重算发生在离线校验，绝不向StationHost提交第二次Inspect，也不把读取结果用作PLC动作许可。
+
+PGM图能还原不代表实体工件与曝光因果已证明。本例沿用合成回放源的关联声明，真实触发归属仍取决于相机和现场工艺。
+
+## 8. 重启后如何查用
+
+可以在没有相机和运动端口的情况下，根据账本终态里的Session和Cycle定位证据目录，读取其Terminal并与账本终态比较。匹配后才展示工件、配方、原图和测量明细。
+
+独立文件读取不会解除原账本的启动阻止，也不执行模拟核对或自动开始下一件。发现有证据无终态、有终态无证据、缺图或.pending时，需单列不一致状态；本批提供严格单包读取，批量对账和异常周期的无图证据下一批补充。
+
+## 9. 验证与后续
+
+新控制台示例验证OK/NG实际像素、同身份幂等与冲突、确认前后导出条件、持久化终态关联、重开读取，以及图像损坏、截断、JSON损坏和发布失败。所有图像都是离线夹具，未接相机、雷赛或PLC。
+
+继续[C#原图导出、证据存储与保存工作流](/knowledge/industrial/host-computer/station/csharp-image-evidence-store-and-save-workflow/)。下一批补异常周期的证据状态与账本/留图重启对账；真实设备和现场长期验证继续单列。
+
+
+本批实际验证：新增52项证据检查、原组合49项与视觉47项回归通过；Release零警告零错误，Demo两周期保存原图/明细后关闭。
+
+
+## 后续：异常说明与只读对账
+
+第十批已补[异常周期与重启对账](/knowledge/industrial/host-computer/station/abnormal-cycle-diagnostics-and-restart-reconciliation/)及 [C#诊断记录与只读核对](/knowledge/industrial/host-computer/station/csharp-abnormal-evidence-and-readonly-reconciliation/)。正常留图入口保留；异常JSON明确不含像素，不用迟到数据改写原终态。

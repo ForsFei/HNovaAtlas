@@ -1,0 +1,184 @@
+---
+id: industrial-csharp-station-vision-adapter
+title: C#实践：视觉工位端口、自有帧与处理收据
+description: 通过Mono8回放、单拍关联和有界处理器实现Capture/Inspect，说明C#借用复制、原帧测量、确认、异常及关闭API。
+tags: [工业自动化, C#, 图像采集, Mono8, Channel]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 130
+prerequisite: [industrial-station-vision-adapter]
+related: [industrial-csharp-inspection-pipeline, industrial-csharp-mono8-buffer-lifetime]
+---
+
+## 1. 项目与运行
+
+新增examples/industrial-station-vision/IndustrialStation.Vision.csproj，net10.0，无第三方包。引用industrial-station与industrial-vision，复用原代码和P2夹具。
+
+```powershell
+dotnet build examples/industrial-station-vision/IndustrialStation.Vision.csproj -c Release
+dotnet run --project examples/industrial-station-vision/IndustrialStation.Vision.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-vision/IndustrialStation.Vision.csproj -c Release --no-build -- --demo
+```
+
+成功0、异常1、用法2。文件写入新建的唯一系统临时目录，打印路径并保留；没有相机品牌/IP、原生库、外部模型或任意图片路径选项。
+
+本例只读仓库原创P2夹具，生成反相副本。没有打开相机或解码PNG/JPEG；HALCON/OpenCvSharp/YOLO实际链路仍可查原专题，当前统计处理不调用它们。
+
+## 2. 会话API怎么用
+
+```csharp
+VisionStationPort port = new();
+VisionStationSession session = await VisionStationSession.OpenAsync(directory, port);
+session.OpenReplay();
+await session.StartAsync("part-001", "demo-ok-v1");
+```
+
+打开应用目录取得端口所有权，但不自动OpenReplay。原账本需要核对时，应先显式模拟核对旧周期，再打开回放源；不恢复旧帧。
+
+| API | 用途与返回 |
+| --- | --- |
+| Snapshot | 工位/宿主/本地账本的内存快照 |
+| Vision | 回放源、帧映射、统计、判定与处理收据诊断 |
+| OpenReplay() | 仅在账本允许的Idle打开回放源，创建两份固定配方处理器 |
+| StartAsync(workpiece,recipe) | 视觉周期槽允许时交给应用，先保存意图再启动 |
+| SaveResultAsync() | 本地终态先落盘再消费 |
+| AcknowledgeVisionAfterSavedAsync() | 检查同周期保存/消费后确认原处理器结果，释放周期准入 |
+| ReconcileAsync() | 通过宿主启动原端口只读Observe |
+| SimulateReviewAndReleaseAsync(disposition) | 视觉收据已确认后本地模拟核对/放行；未打开源时也可核对旧账本周期 |
+| RequestClose()/CloseStepAsync() | 有限关闭收尾，等待原Task和处理器退出 |
+
+正常周期要等本地终态出现，再顺序保存、确认、模拟核对；不要把Start返回Accepted当成可以立即保存结果。
+
+## 3. OfflineFrameSource和FrameLease
+
+Capture中的关键代码：
+
+```csharp
+OwnedFrame owned;
+using (FrameLease lease = source.Acquire())
+{
+    owned = lease.CopyToOwned();
+}
+// 此后只交owned.Image给异步处理器，不持有lease。
+```
+
+| 对象/API | 含义 |
+| --- | --- |
+| OfflineFrameSource.Open | 新建回放SourceSession并打开源 |
+| Acquire | 借用复用缓冲，只允许一个未归还借用 |
+| FrameLease.Width/Height/Stride | 原缓冲布局，Stride可能大于Width |
+| CopyToOwned | 按行复制有效Mono8像素，获得不可变自有图 |
+| FrameLease.Dispose | 归还借用，之后不能再复制 |
+| FramesAcquired/OutstandingLeases | 本源已取帧计数与当前借用数 |
+| Close/Dispose | 关闭本回放源，并按该模型规则失效旧借用 |
+
+本例Width=8，Stride=10，填充不是像素。Mono8Image拥有紧密排列的byte[]，无需Dispose；但复制大图仍有内存成本，不能把托管所有权理解为无限容量。
+
+模型关闭失效借用是本项目策略，不是所有厂商SDK的兼容承诺。真实SDK还需核对回调指针、锁图、ReleaseBuffer和异常路径。
+
+## 4. 单拍会话与FrameId映射
+
+适配器复用SingleCaptureSession的Update、Prepare、TakeTrigger、RecordDispatch、Associate、ObserveFrame、TakeForProcessing、ReleaseCapture。
+
+先转移一次采图意图，再从回放源复制自有像素。输入帧必须匹配原CaptureRequest、CameraEpoch、SourceSession、ProfileRevision和显式TriggerAssociation，Complete与IdentityQualified都要声明合格。
+
+只有匹配成功并转移给处理阶段，才创建本周期FrameId。适配器保留FrameId到FrameStamp的映射；FrameId不能直接代替原源Session和帧号。
+
+回放中TriggerSequence取源帧号，是夹具显式定义的关联，不是用于真实相机的通用推断。回放时间每次加0.001，仅为同步步骤排序，未实现真实设备时钟或帧龄验证。
+
+ReleaseCapture在这里是所有权交接，不能据此确认算法已完成或清除处理器结果。
+
+## 5. InspectionPipeline与测量API
+
+为两份固定配方各创建一个容量1处理器；端口只保留一个周期，所以最多有一个未确认的处理结果。工作器按原实现长期运行，不逐帧Task.Run。
+
+```csharp
+InspectionSubmission submitted = pipeline.TrySubmit(captureResult);
+if (submitted.Admission != InspectionAdmission.Accepted || submitted.Result is null)
+    throw new InvalidOperationException("Inspection not accepted");
+
+InspectionResult result = await submitted.Result;
+```
+
+| API/属性 | 用途 |
+| --- | --- |
+| TrySubmit | 校验捕获数据并尝试转移，拒绝错误身份/重复冲突/满载 |
+| InspectionSubmission.Result | 原处理任务，结果可为Completed或Failed |
+| RetainedCount | 排队、运行及完成未确认的总保留数 |
+| Acknowledge(result) | 必须原本地结果对象，释放处理器容量 |
+| Complete()/Completion | 停止接收并等待工作器退出，不代表业务确认 |
+| Mono8Image.Measure(roi,threshold) | 计算ROI像素数、最小/最大、均值及亮/黑/白像素数 |
+
+Inspect完成后进一步核对原PipelineSession、CaptureRequest、FrameStamp、CameraEpoch、TriggerSequence和ProcessingRecipe，再计算判定。统计异常或NaN由处理器转成Failed，工位形成已结失败而不是Ng。
+
+Channel容量和背压的基础语义见[Microsoft Channels](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)；本例还有额外的未确认收据账本，不能只数通道排队长度。
+
+## 6. 固定配方与真实像素判定
+
+VisionRecipe包含Version、Region、Threshold、MinimumMean、MinimumBrightPixels。demo-ok-v1使用左侧2×2 ROI，demo-ng-v1使用右侧2×2 ROI；阈值200，均值至少200且至少3个亮像素才Ok。
+
+处理器收到的ProcessingRecipe包含ROI/阈值与采集配置修订1，判定规则由原VisionRecipe补充，整个固定目录在运行中不改变。
+
+连续两件使用同一个demo-ok-v1，第一张原图均值220得到Ok，第二张反相图均值35得到Ng。这说明结果来自像素，没有照搬原StationRecipe.Judgment或根据名字强制判定。
+
+规则只验证链路，不适用于真实产品验收。后续替换HALCON/OpenCvSharp/YOLO时，应保留身份、失败语义和收据生命周期，同时新增算法版本、数据集与资源验证。
+
+## 7. 重复、错帧与结果收据
+
+ExecuteAsync对同一步骤相同完整命令返回原Task；重复Capture不取第二帧，重复Inspect不重新运行算法。错误FrameId在进入处理器前拒绝，错误判定不会得到PublishResult模拟确认。
+
+ObserveAsync只读原步骤结果或null，不Acquire、不TrySubmit、不补发触发，也不会拿最新图替代旧图。
+
+正常结果保存后：
+
+```csharp
+await session.SaveResultAsync();
+await session.AcknowledgeVisionAfterSavedAsync();
+await session.SimulateReviewAndReleaseAsync(PeerResultDisposition.AcceptedByPeer);
+```
+
+这是已结正常周期片段。确认方法还要求没有活跃Task/Pending，保存并消费的是同Session/Cycle/Order的原终态。处理器确认使用原InspectionResult对象，不从JSON重建一份来冒充。
+
+当前本地StationLedger只保存工位FrameId、Outcome、Reason、Judgment，未保存ROI明细、FrameStamp或图片。这次确认不是“图片/算法报告已经持久化”；后续要留图时需增加对应成功回执。
+
+## 8. Vision诊断属性
+
+| 属性 | 看什么 |
+| --- | --- |
+| Open/ReadyForNextCycle/TaskActive | 源是否打开、周期槽是否可用、端口调用是否仍运行 |
+| CaptureOperation/Workpiece/RecipeVersion | 当前原采图操作、工件与配方 |
+| FrameId/FrameStamp | 工位帧GUID与原源帧对应 |
+| Measurement/Judgment/ProcessingError | 原算法统计、诊断判定或失败代码 |
+| FramesAcquired/OutstandingLeases | 是否重复取帧，借用是否归还 |
+| ProcessingSubmissions/MeasureCalls | 实际提交与测量次数 |
+| RetainedResults/PublishCalls | 未确认处理结果与模拟结果回执次数 |
+| CycleAcknowledged | 本地周期/处理收据已经明确确认，不表示数组已被GC |
+| Disposed | 源与工作器已经收尾 |
+| SimulatedMoveCalls/ExternalMoveHandoffs | 独立视觉模拟Move次数与外部完成证据交接次数，组合教程中说明 |
+
+迟到算法诊断可能有Ok，但工位终态仍Faulted。生产统计应使用被接受的工位终态，不把最新Measurement/Judgment直接记为正常产出。
+
+## 9. 关闭与异常
+
+DisposeAsync拒绝仍在运行的端口任务。正常宿主关闭会先等原任务与Pending及本地消费，随后Complete处理器、await工作器Completion、关闭回放源。
+
+关闭不会伪造Acknowledge。因此迟到处理场景中，Disposed=true时RetainedResults仍可能为1，CycleAcknowledged=false；结果尚未作为正常业务确认。对象最终GC与业务确认分开，重开仍有未Reviewed周期需要核对。
+
+原端口和帧绑定未跨进程保存，不恢复相机触发或旧Task。遇到坏帧关联只保留异常与未知，不自动重采；真实相机SDK、缓冲排空、原生算法、图片落盘、数据库/MES和现场安全仍待验证。
+
+## 10. 实测与后续
+
+Release零警告零错误，新47项检查通过，原309项工位/通信/运动/WPF回归通过，共356项。旧Mono8/缓冲63、单拍73、流水线71另行回归。
+
+实际Demo：
+
+```text
+Cycle 1: frame=1; mean=220.0; verdict=Ok; leases=0
+Cycle 2: frame=2; mean=35.0; verdict=Ng; leases=0
+Closed=True; processed=2; retained=0
+```
+
+检查另含错帧/采集代/源/完整性、重复、坏统计、处理异常、重启旧周期和迟到采图/处理关闭。所有图像均为仓库自有合成数据，没有真实相机/原生库或质量验收。
+
+理论见[自有帧、同帧处理与结果交接](/knowledge/industrial/host-computer/station/vision-task-owned-frames-and-inspection-handoff/)。继续[C#组合端口与唯一Move交接](/knowledge/industrial/host-computer/station/csharp-integrated-station-routing-and-single-move-handoff/)，再分批验证真实设备链路。

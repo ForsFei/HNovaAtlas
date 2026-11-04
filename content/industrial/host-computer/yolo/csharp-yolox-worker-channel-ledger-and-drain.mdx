@@ -1,0 +1,152 @@
+---
+id: industrial-csharp-yolox-bounded-worker
+title: C#实践：YOLOX复用会话、Channel账本与关闭排空
+description: 详解YoloInferenceWorker的Ready、准入、终态Promise、收据确认、故障停止和Completion，复用同一个CPU会话接入WPF并用门闩与实际模型验证。
+tags: [工业自动化, C#, YOLOX, WPF, Channel]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 130
+prerequisite: [industrial-yolox-bounded-worker]
+related: [industrial-csharp-yolox-wpf, industrial-csharp-yolox-images]
+---
+
+## 1. 项目与命令
+
+沿用`examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj`，新增YoloInferenceWorker.cs与WorkerChecks.cs；App和MainWindow增加复用入口。System.Threading.Channels来自.NET共享框架，不新增NuGet包、模型权重或驱动。
+
+从仓库根目录运行：
+
+```powershell
+dotnet restore examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj --locked-mode
+dotnet build examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-restore
+
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --pipeline-test
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --pipeline-native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+
+dotnet run --project examples/industrial-yolo-wpf/IndustrialYolo.Wpf.csproj -c Release --no-build -- --open-reused examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+最后一条打开复用会话窗口。原`--open`仍为每图创建会话的教学入口，原`--self-test`和`--native-test`保持各自范围。测试成功退出0，pipeline-test失败1，用法错误2，真实原生检查失败3；新检查不会自动打开可见窗口。
+
+窗口外观仍是打开图片、检测、清空。模型在后台初始化，Ready完成前禁用检测；初始化失败显示错误。GUI固定score>0.1/NMS0.45，低阈值0.01只用于原生检查的渐变数值参考。
+
+## 2. 最小完整调用链
+
+以下为应用调用片段，image是已经加载的ImageSnapshot：
+
+```csharp
+YoloInferenceWorker worker = new(modelPath, capacity: 2);
+try
+{
+    await worker.Ready;
+    YoloWork work = new(worker.Producer, 1, image);
+    YoloSubmission submitted = worker.TrySubmit(work);
+    if (submitted.Admission == YoloAdmission.Accepted)
+    {
+        YoloTerminal terminal = await submitted.Completion!;
+        // 检查Completed/Failed以及当前显示身份，处理本地结果。
+        bool consumed = worker.Acknowledge(terminal);
+        if (!consumed) throw new InvalidOperationException("收据不匹配");
+    }
+}
+finally
+{
+    worker.Complete();
+    await worker.Completion; // 包含会话释放，可能报告初始化/运行/释放异常。
+}
+```
+
+正式调用方需要同时观察单图终态和整体Completion。示例片段强调显式关闭；如果业务处理终态时抛异常而没有确认，账本会保留该项，不会自动当作消费成功。必须根据业务交接策略决定何时确认。
+
+## 3. 工作器属性与方法
+
+| 成员 | 用法与语义 |
+| --- | --- |
+| Producer / Session | 本实例的提交身份与终态会话标识 |
+| Capacity | 教学范围1～8，覆盖排队/运行/未确认终态 |
+| Ready | 初始化结果；成功不是永久健康保证 |
+| TrySubmit(work) | 不阻塞准入；Accepted才产生新任务 |
+| ReadTerminal(number) | 查询仍保留的终态，不确认也不重新运行 |
+| Acknowledge(terminal) | 原收据对象匹配才移除账本条目 |
+| Complete() | 幂等停止准入并完成输入端，不抢先Dispose |
+| Completion | 消费循环退出且释放会话后的Task，故障时异常 |
+| Snapshot | 锁内取得的当前计数及Ready/Closed/Faulted快照 |
+
+Snapshot包括Retained、Queued、Running、Unacknowledged和累计Accepted/Completed/Failed/Acknowledged。正常任一时刻可核对：
+
+```text
+Retained = Queued + Running + Unacknowledged
+Accepted = Queued + Running + Completed + Failed
+Retained = Accepted - Acknowledged
+```
+
+Completed与Failed是累计终态数，包含已经确认移除的项；不能把它们直接当当前未确认数量。Ready字段记录初始化是否成功，关闭后仍可能为true，必须结合Closed/Faulted判断状态。
+
+## 4. 账本与Channel的原子准入
+
+工作器使用Dictionary保存Entry，用Channel传递同一个Entry。Entry含Work、Stage、Terminal与TaskCompletionSource，Promise异步调度续体。
+
+TrySubmit在锁内依次检查关闭、初始化、重复对象/编号冲突、高水位与容量，再把新Entry加到账本并TryWrite。写入失败会移除该Entry，只有成功接收才推进high和accepted。编号不是任意重放键，调用方应使用单调递增long并在溢出前结束该实例。
+
+Channel配置的常用成员：
+
+| API/选项 | 本例设置 | 意义 |
+| --- | --- | --- |
+| Channel.CreateBounded | 与账本相同的容量 | 通道本身也有限 |
+| SingleReader | true | 只有一个逻辑消费循环 |
+| SingleWriter | false | 允许多提交线程，账本另外加锁 |
+| FullMode | Wait | 不用丢弃模式 |
+| AllowSynchronousContinuations | false | 避免生产/消费方在对方调用栈内续行 |
+| Writer.TryWrite | 准入时调用 | 即时转移或返回Full |
+| Reader.ReadAllAsync | 后台顺序读取 | 写端结束后读取已存在任务 |
+| Writer.TryComplete | Complete/故障时调用 | 停止继续写入 |
+
+容量的主要约束来自retained.Count，不是仅看Channel.Reader.Count。读取任务进入Running后仍占账本，完成Promise后也仍占账本。
+
+## 5. 真正的长寿命会话在哪里
+
+内部IYoloEngine只定义Process和Dispose；公共构造器固定创建真实ReusedYoloEngine，测试工厂构造器仅本程序集内部可用。没有原生失败后改走测试引擎的分支。
+
+ReusedYoloEngine在构造时创建YoloXNanoSession；每张图只进行Prepare、session.Run、ImagePostprocessor.Process和OverlayResult.FromReport。最后由WorkAsync的finally调用Dispose，一次消费循环不为每张图片Task.Run一次。
+
+```text
+UI/生产者：TrySubmit → 等待该任务的终态 → 消费 → Acknowledge
+逻辑消费者：初始化一次 → 顺序Process多次 → 最终Dispose
+```
+
+每个Run的OrtValue、RunOptions与输出集合仍是局部using，不因为会话长寿命就长期保存原生输出对象。跨线程传递的是冻结BitmapSource、自有BGR像素和只读OverlayResult。没有在UI线程直接访问工作器持有的session。
+
+消费循环await期间可能换线程，不可把“单逻辑消费者”解释为固定线程亲和性。如果后续SDK必须在固定STA或创建线程调用，需要专门的线程调度方案。
+
+## 6. 结果、故障与关闭
+
+WorkAsync将Entry标为Running，再调用engine.Process。成功后核对output.Image与任务Image为同一个Snapshot，再生成Completed终态。错图与其它处理异常均产生Failed，随后进入故障停止。
+
+故障停止会关闭准入、把仍在Channel中的已接收Entry逐项变成WorkerStoppedBeforeRun，最后释放引擎并让整体Completion失败。不会重新执行失败图片或假装队列中的任务已经成功。Dispose自身失败也会反映在Faulted与Completion中。
+
+正常Complete不产生这种故障终态：排队任务继续执行，已经完成但未确认的结果继续保留。Completion可能已结束而Retained仍大于0，这是“后台退出”和“消费者交接”两个不同事实。
+
+不要从外部同时调用Run和Dispose，也不要仅在Task外包一个取消令牌就声称已经取消原生调用。本工作器没有硬取消和关闭期限，初始化/推理卡住时等待仍可能很长。
+
+## 7. WPF怎么消费它
+
+`--open-reused`构造容量2的工作器，在Loaded异步观察Ready。检测时先使用DisplaySession.TryBegin捕获当前选择，再创建新的YoloWork并提交，等待其终态后让DisplaySession.Complete决定是否附着。
+
+窗口finally中明确确认已收到的终态：即使用户切图、清空或开始关闭，旧结果不再显示，也已经由本地消费者处理。若收据不匹配，窗口停止新任务并清空显示，不静默忽略账本异常。
+
+关闭顺序为：标记UI关闭/显示失效 → worker.Complete → 等初始化、读图和当前UI处理 → 等worker.Completion → 真正关闭。UI不抢占原生Dispose。这个手动界面仍最多一个检测请求，不把后台多任务队列变成额外操作控件。
+
+本轮自动检查覆盖DisplaySession与工作器交接，新增MainWindow入口编译通过；没有打开可见窗口做完整按钮、对话框和关闭时序人工验收。
+
+## 8. 实测结果
+
+新增49项门闩/账本/WPF交接检查与12项实际CPU/OpenCV/WPF检查。前者使用内部测试引擎，不调用模型；覆盖初始化中关闭、满载不转移、终态背压、同对象重复、复制冲突、32次并发重复只接收一次、迟到结果消费、故障停止与Dispose异常。
+
+真实检查在一个会话中执行3次Run，自有641×359 BGR渐变在score0.01下得到同一组5个可见行3439/3468/3462/3454/3420；两次结果数值相同但对象独立。第三次提交在未确认时被Full拒绝，确认后接收；关闭后剩余2份终态仍需显式确认。真实不存在的模型路径使Ready和Completion失败，未接收任务，也未回退。
+
+这些是短序列数值与生命周期证据，不是5个真实目标、模型质量或长期性能验收。下一批再把真实本地样本、标注格式和版本信息接入离线评价；GPU、相机/工件关联、持久化/PLC、人工窗口及长期资源分别记录。
+
+第八批已补[C#本地标注导入与评价报告](/knowledge/industrial/host-computer/yolo/csharp-local-label-import-inference-and-review-report/)，复用固定模型与原图框，真实质量单列；下一步部署与运行环境检查。
+
+理论回看[长寿命会话、有界准入与结果收据](/knowledge/industrial/host-computer/yolo/long-lived-session-bounded-admission-and-terminal-receipts/)。Channel行为依据[Microsoft官方文档](https://learn.microsoft.com/en-us/dotnet/core/extensions/channels)，线程交接沿用[WPF线程模型](https://learn.microsoft.com/en-us/dotnet/desktop/wpf/advanced/threading-model)。

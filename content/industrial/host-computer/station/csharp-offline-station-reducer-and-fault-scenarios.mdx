@@ -1,0 +1,136 @@
+---
+id: industrial-csharp-station-controller
+title: C#实践：离线工位状态机与可复现故障场景
+description: 使用纯.NET10事件归约器、TimeProvider与不可变命令回复，演示同工件流程、待结义务、超时后的迟到证据、本地消费和显式恢复API。
+tags: [工业自动化, C#, 状态机, 超时, 工位流程]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 10
+prerequisite: [industrial-station-flow]
+related: [industrial-host-computer-chapter-map, industrial-csharp-yolox-bounded-worker]
+---
+
+## 1. 项目与运行
+
+新增`examples/industrial-station/IndustrialStation.csproj`，纯.NET10控制台，无第三方依赖。它没有串口、网口、控制卡、相机、模型或硬件地址入口，不把模拟事件偷偷接到已有设备示例上。
+
+```powershell
+dotnet build examples/industrial-station/IndustrialStation.csproj -c Release
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station/IndustrialStation.csproj -c Release --no-build -- --demo
+```
+
+self-test执行57项确定性检查；demo打印一个正常NG周期与一个结果回执超时周期，再演示迟到回执、逻辑复位和关闭。成功退出0、异常1、用法2，只打印，不写入用户文件。
+
+| 文件 | 作用 |
+| --- | --- |
+| StationController.cs | 命令/回复/终态record、状态枚举、期限与状态转换 |
+| OfflineSimulation.cs | 手动时钟、显式测试回复、声明式恢复与demo |
+| StationChecks.cs | 身份、期限、并发转移、故障与关闭检查 |
+| Program.cs | CLI入口，不接实际设备 |
+
+## 2. 最小调用链
+
+```csharp
+StationController station = new(Guid.NewGuid());
+WorkOrder work = new(station.Producer, 1, "part-001", "recipe-v1");
+StartEvidence ready = new(true, true, true, true, true); // 这里只是离线声明
+Admission admission = station.TryStart(work, ready);
+
+StationCommand? command = station.TryTakeCommand();
+if (command is not null)
+{
+    StationReply simulated = OfflineSimulation.Reply(command);
+    ReplyDisposition disposition = station.Receive(simulated);
+}
+```
+
+重复取命令不会再次返回同一个实例；重复的旧步骤回复不能完成新步骤。上面的代码只处理第一步，完整四步循环见OfflineSimulation.Finish。不要把Snapshot.Pending直接当循环重发依据。
+
+生产者Producer在构造时固定，WorkOrder.Number必须正数并在本控制器中单调增加。相同对象重复TryStart返回AlreadyTracked，同编号新对象Conflict，已释放的旧编号Stale；新编号在非Idle时返回Busy，不建立隐藏队列。
+
+## 3. 常用属性与方法
+
+| API | 行为与注意点 |
+| --- | --- |
+| Snapshot | 锁内生成不可变状态快照及只读日志副本，不自动Tick |
+| TryStart(order,ready) | 捕获工件/配方，只在Idle且声明齐全时接收 |
+| TryTakeCommand() | 先检查期限，再转移一次命令执行责任 |
+| Receive(reply) | 检查期限、完整关联和载荷，再推进或排空迟到回复 |
+| Tick() | 显式期限检查，宿主以后负责定时驱动 |
+| Stop() | 软件锁存，禁止继续发正常命令，不等于设备已停 |
+| ConsumeTerminal(receipt) | 原本地终态对象只消费一次，不证明物理状态 |
+| ReleaseCompletedCycle(evidence) | 正常周期已消费且恢复声明齐全后回Idle |
+| Reset(evidence) | 仅故障/停止可复位，待结非空或声明不匹配则拒绝 |
+| RequestClose() | 停止新准入，等待转移命令收尾和终态消费 |
+
+所有状态修改由同一个lock保护，锁内不执行设备SDK、业务回调或await，仅采样注入的单调时钟。这样状态转换是短小同步操作，真实异步动作以后放在适配层；不在持锁期间等待运动、图像处理或PLC读写。
+
+## 4. 身份与载荷怎么校验
+
+OperationKey含Session、Cycle、Operation、Step。StationReply除Key外还需携带Workpiece、RecipeVersion、Success、FrameId与Judgment。
+
+| 步骤 | 有效终态载荷 |
+| --- | --- |
+| Move | FrameId与Judgment均为空 |
+| Capture成功 | FrameId非空且不是空Guid，Judgment为空 |
+| Capture失败 | FrameId/Judgment为空，明确表示已结束的失败观察 |
+| Inspect成功 | 与已采集FrameId相同，Judgment为有效Ok或Ng |
+| Inspect失败 | 同FrameId、Judgment为空 |
+| PublishResult | 同FrameId且回执判定等于发布判定 |
+
+关联字段不匹配时忽略，不修改当前步骤；当前命令关联正确但错帧/判定等载荷不正确时锁存故障，并保留Pending，因为错误数据不能证明正确操作已收尾。后续正确终态只能作为迟到证据结清，不能恢复正常推进。
+
+Success=false不应用来包装一个仍在运行SDK的等待超时。适配器只有观察到真实调用/动作已终结，才能生成对应终态；未知状态应保留待结义务，下一批会实现异步端口观察。
+
+## 5. TimeProvider和期限
+
+```csharp
+long issuedAt = clock.GetTimestamp();
+TimeSpan elapsed = clock.GetElapsedTime(issuedAt, clock.GetTimestamp());
+if (elapsed >= phaseBudget)
+{
+    // 锁存故障；已转移命令保留，不重发。
+}
+```
+
+StationController默认使用TimeProvider.System，默认四阶段预算2/1/3/1秒。StageBudgets允许正数且不超过2分钟的教学预算，不设置现场运动速度、停止距离或工艺允许时间。
+
+ManualStationClock仅用于测试：时间戳频率是TimeSpan.TicksPerSecond，Advance正向推进，ShiftWallClock只改墙上时间。测试证明墙上时间改变不会触发单调期限；恰好到期限即超时。
+
+Receive和TryTakeCommand也检查期限，所以已经晚到的回复不会因为宿主忘记Tick一次而正常通过。这个控制器没有后台计时器，连续运行需要下一层宿主循环主动驱动Tick。
+
+## 6. 超时、待结与本地收据
+
+发出命令后的超时会产生StationTerminal，Outcome=Faulted，但Pending仍在。没有取走的命令则撤回，避免适配器后来拿到过期动作。状态机不会自动发送Stop/Home或重试命令。
+
+终态是不可变本地记录，包含会话、周期、订单、原因、已知帧和判定。ConsumeTerminal要求原对象，复制record或重复消费都返回false。超时后的正确迟到回复只返回DrainedLate，日志记录其操作号、成功标志、帧和判定，原终态不被覆盖。
+
+demo的关键输出是：
+
+```text
+Cycle=1 Outcome=Completed Judgment=Ng
+Timeout=TimedOut:PublishResult; pending=PublishResult; reset=False
+LateAck=DrainedLate; outcome-still=Faulted
+Declared reset after drain=True
+Close=Closed
+```
+
+NG是已完成的模拟判定，发布超时则是流程异常。不要把LateAck到达后修改Outcome为Completed，否则异常周期历史会被抹掉；实际对端结果核对与本地流程异常可以同时成立。
+
+## 7. 恢复与关闭的双重条件
+
+RecoveryEvidence必须对应Session/Cycle/RecoveryVersion，并声明通信就绪、运动/视觉空闲、清料完成、结果通道已核对、许可就绪。CanRecover还要求本地Pending为空和终态已经消费，外部声明不能绕过这两个本地约束。
+
+恢复版本仅用于当前锁存身份，不是对外部观察新鲜度或真实性的认证。OfflineSimulation.DeclaredRecovery生成全true只为展示规则；不能将这个助手复制进真实设备代码当成现场检测。
+
+正常完成使用ReleaseCompletedCycle，故障/停止使用Reset，均不自动重跑上个WorkOrder。关闭则先RequestClose，若有已取走命令或未消费终态保持Closing；两者都结清才Closed，Closed不再Reset。
+
+## 8. 测试与后续边界
+
+Release零警告零错误；57项检查覆盖正常NG、请求来源/编号、32个并发取命令只转移一次、旧会话/工件/配方/步骤、同帧载荷、期限相等、墙上时钟变化、迟到回复、未发命令撤回、重复终态、复位声明和关闭。
+
+最近128条有界日志包含订单、周期、动作、已知帧和判定，超出后淘汰旧项。它只服务离线复现，没有落盘、PLC回执持久化、重启恢复或长期审计保证；也没有连接前批视觉库或运动SDK。
+
+继续[C#异步宿主、模拟端口与只读核对](/knowledge/industrial/host-computer/station/csharp-async-host-mailbox-ports-and-reconciliation/)，已提供任务收尾与关闭排空的可运行示例。理论见[周期身份、超时与恢复](/knowledge/industrial/host-computer/station/cycle-identity-states-timeouts-and-recovery/)。计时API依据[Microsoft TimeProvider概述](https://learn.microsoft.com/en-us/dotnet/standard/datetime/timeprovider-overview)，异步等待语义参考[Task.WaitAsync](https://learn.microsoft.com/en-us/dotnet/api/system.threading.tasks.task.waitasync?view=net-10.0)。

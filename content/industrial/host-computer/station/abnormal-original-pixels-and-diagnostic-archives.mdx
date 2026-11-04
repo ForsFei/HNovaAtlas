@@ -1,0 +1,74 @@
+---
+id: industrial-station-abnormal-pixels
+title: 异常留图：原始像素、迟到帧与故障证据
+description: 在确认视觉收据之前归档异常周期保留的Mono8原帧，区分原工位终态与诊断数据，处理无图、失败和迟到路径。
+tags: [工业自动化, 综合工位, 机器视觉, 数据追溯]
+difficulty: intermediate
+status: published
+updated: "2026-11-02"
+order: 240
+prerequisite: [industrial-station-abnormal-reconciliation]
+related: [industrial-station-image-evidence]
+---
+
+## 1. 从只有诊断明细到保留原始像素
+
+之前异常JSON明确标记DiagnosticOnly-NoPixels，只保存终态、帧身份、统计或处理错误。本批补充独立的异常像素归档：在原帧仍由视觉端口保留、实际任务已结清时导出原OwnedFrame，保存完整Mono8像素。
+
+归档是故障诊断材料，不把迟到OK写回工位，不补拍、不重新Inspect，也不自动解除启动阻止。没有合格帧的异常周期仍使用原诊断说明，不生成空白图或借用上一周期图像。
+
+## 2. 哪些情况能够留图
+
+| 场景 | 原工位终态 | 归档内容 |
+| --- | --- | --- |
+| 采图回复迟到 | Faulted，Terminal.FrameId可能为空 | 原端口帧、UnacceptedFrame诊断 |
+| 检测回复迟到 | Faulted，原工位判定可能为空 | 已接受原帧、诊断统计及处理器判定 |
+| 算法抛异常 | Faulted，不制造NG | 已接受原帧、ProcessingError，统计为空 |
+| 运动停止而未采图 | Stopped | 无像素归档，只保留异常说明 |
+| Task或Pending未结清 | 尚有原义务 | 拒绝导出，继续观察原任务 |
+| 已确认或资源已关闭 | 原Capture引用已释放 | 拒绝再次从端口导出 |
+
+“有图”与“检测完成”是两件事。保存失败算法的图像时不能为了补统计再运行一次算法；诊断统计为空就是应保留的事实。
+
+## 3. 为什么保存单份JSON
+
+本批采用单文档归档，包含Schema、用途、完整AbnormalEvidence、宽高、紧排Mono8像素和像素SHA-256。System.Text.Json将byte[]编码为Base64字符串；它不是JPEG，也没有缩放或有损压缩，编码行为见[Microsoft支持类型说明](https://learn.microsoft.com/en-us/dotnet/standard/serialization/system-text-json/supported-types)。
+
+采用单文件是为了让这份小型离线示例的诊断与像素一起发布，不需要额外的两文件提交标记。代价是体积与内存开销；本例沿用Mono8Image像素上限，归档最多1500000字节，不适用于直接承载大分辨率生产相机连续图像。
+
+Scope固定AbnormalPixels-DiagnosticOnly。内部Diagnostic.Kind依旧是原诊断说明的DiagnosticOnly-NoPixels；图像字节由外层归档提供，不能单独拿内部说明当图像已保存证明。
+
+## 4. 正确的顺序
+
+1. 等原任务、Pending结清，运动模型不再Busy。
+2. 导出同一周期异常诊断和原OwnedFrame。
+3. 保存异常像素归档，读回验证。
+4. 使用原异常保存工作流保存诊断/原终态，再确认视觉收据。
+5. 按原规则执行后续人工核对；归档不发设备动作。
+
+原SaveAbnormalThenAcknowledgeAsync仍采用诊断说明政策，没有被偷偷改成强制留图。需要像素时由同一合作所有者先执行新增归档步骤；不要同时调用确认或关闭，否则帧可能先被释放。
+
+异常像素写入失败时不应继续执行第4步。已发布图像而账本保存失败时，应保留所有材料，使用原诊断与原帧幂等重试；不要删除目录或重新采图。
+
+## 5. 原帧和身份校验
+
+视觉端口在自己的锁内检查本地Faulted/Stopped终态、Session/Cycle/Order、实际任务、Pending及保留帧。若原终态已接受FrameId，必须匹配当前保留帧；若尚未接受则允许保存同周期诊断帧，保持原Terminal.FrameId为空。
+
+存储层再次核对诊断FrameStamp和原帧Stamp。读取时验证Schema、Scope、尺寸、精确像素数和SHA；有诊断测量时用固定示例配方重算ROI并比较统计。处理失败而没有测量时，只校验像素和身份，不创造测量值。
+
+哈希检查数据一致性，不提供认证签名；拥有写权限的人仍能改写图像、诊断与哈希。回放源的身份关联也不等于真实相机曝光因果证明。
+
+## 6. 与旧对账器的关系
+
+异常像素归档应放在独立images目录。旧AbnormalEvidenceStore继续保存小型异常说明，原EvidenceReconciler只核对账本、正常图包和异常说明，不会自动把新增images算作已核验。
+
+需要查图时明确调用AbnormalImageArchive.Read，比较Diagnostic.Terminal与账本原终态，必要时再恢复Mono8Image。不得仅凭旧报告MatchedAbnormal推断像素完整。
+
+本批新增13项检查，原异常/对账52项合计65项通过，覆盖两类迟到、实际算法异常、幂等保存、像素恢复、无图/确认后拒绝、坏Schema、像素篡改与坏JSON。全部为离线模型和夹具。
+
+继续[C#异常原帧导出与归档API](/knowledge/industrial/host-computer/station/csharp-abnormal-frame-export-and-image-archive/)。
+
+
+## 续读：图像完整性核对
+
+新增[异常图像核对](/knowledge/industrial/host-computer/station/abnormal-image-inventory-and-evidence-completeness/)与 [C#图像报告](/knowledge/industrial/host-computer/station/csharp-image-inventory-report-and-readonly-query/)显式连接images目录；原对账器仍保持诊断语义。

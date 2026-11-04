@@ -1,0 +1,127 @@
+---
+id: industrial-station-operator-application
+title: 工位操作界面：配方捕获、应用编排与关闭收尾
+description: 将工位宿主和结果账本组合成最小WPF操作流程，说明配方版本、保存后消费、模拟核对放行和窗口关闭时的任务与资源收尾。
+tags: [工业自动化, 上位机, WPF, 配方, 应用编排]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 60
+prerequisite: [industrial-station-result-ledger, industrial-csharp-station-result-ledger]
+related: [industrial-csharp-station-operator-application, industrial-station-async-host]
+---
+
+## 1. 先让一条操作流程完整
+
+前三批已有状态机、异步宿主和文件账本，本批增加StationApplication应用层及独立WPF离线窗口，让它们按明确顺序协作。
+
+窗口只提供工件编号、固定配方、启动模拟、流程停止、保存结果、只读核对、模拟核对放行和关闭。没有设备管理器、配方编辑器或可拖拽流程图；先把一个工件从启动到结果保存、核对和退出讲清楚。
+
+运行链路是：
+
+```text
+WPF按钮 → StationApplication的一次应用请求
+                ↓ 后台保存周期Began
+          StationHost接收订单
+                ↓ 异步模拟端口
+          运动 → 采图 → 检测 → 结果回执
+                ↓ 本地终态
+          文件TerminalSaved → 本地消费
+                ↓ 显式模拟核对
+          文件Reviewed → 本地放行/复位
+```
+
+仍不连接PLC、雷赛、相机或视觉模型。界面的“模拟核对”是测试声明，不是实际设备Ready证明。
+
+## 2. 界面、应用层、宿主各管什么
+
+| 层 | 本批职责 | 不放在这里的工作 |
+| --- | --- | --- |
+| WPF窗口 | 收集输入、显示快照、启用按钮、处理Closing | 磁盘写入和设备调用 |
+| StationApplication | 新意图保存、结果保存后消费、核对后放行、关闭步骤 | 直接修改状态机内部字段 |
+| StationHost | 单所有者、期限、异步任务观察、待结命令和端口释放 | 同步文件I/O |
+| StationLedger | 周期意图、结果和显式核对的追加记录 | 自动恢复运动或重发结果 |
+| RecipeSimulationPort | 根据已捕获配方返回模拟回复 | 实机运动、拍照或检测 |
+
+应用层只允许一个已接收请求占用操作槽。磁盘I/O在后台请求里执行；第二个请求即时ApplicationBusy失败，不在后台积累一长串点击。
+
+UI禁用按钮只是减少误操作，真正的状态与并发限制仍由应用方法检查。测试直接绕过界面调用，运行中再次启动也会拒绝。
+
+## 3. 配方要捕获版本，而不是反复读取下拉框
+
+本批固定两份不可变StationRecipe：demo-ok-v1和demo-ng-v1，分别产生Ok/Ng模拟判定。每个步骤100ms延迟只为观察界面，不是设备或工艺时间预算。
+
+启动时将所选Version写入WorkOrder，再保存Began。后续命令沿用这个订单，模拟端口按命令携带的RecipeVersion查固定目录。不能在检测阶段重新读取界面当前选择，否则同一个工件可能用两份配方。
+
+运行和待核对期间，下拉框与工件输入禁用；完成保存、显式核对和放行后，才允许选择下一周期配方。下拉框展示“下一周期选择”，状态面板展示“本周期已捕获版本”，两者含义不同。
+
+真实配方还应固化曝光/触发、运动位置和速度、视觉阈值、模型/标定文件等完整内容及版本关系。只保存一个Version字符串要求对应配方内容始终可追溯；本例以编译进程序的固定目录满足教学条件，没有可变文件加载、哈希、权限或审批系统。
+
+## 4. 启动前先保存意图
+
+StationApplication独占宿主的周期准入。只有宿主Idle且账本CanStartNewCycle时，才计算本Session的下一Cycle和持久化来源Number，先执行Begin，再调用host.StartAsync。
+
+第一份意图成功发布前，宿主没有接到该订单，不会派发Move。保存失败则没有设备动作，应用记录错误并阻止继续。
+
+关闭可能恰好发生在文件写入过程中。RequestClose独立于应用操作槽，会立即提出关闭请求；写完Began后应用再次检查关闭标志，拒绝启动。此时文件里可能有一个从未实际派发的意图，必须保留，重开后核对，而不是偷偷删掉。
+
+即使最终Start被宿主拒绝，也不能撤销已经持久化的意图来假装这次操作不存在。这里保留保守的待核对状态。
+
+## 5. 结果保存与放行是两次操作
+
+“保存结果”先追加TerminalSaved，成功后才消费宿主的原本地终态。重复保存相同内容幂等，不重复生成事件。
+
+“模拟核对并放行”要求：
+
+1. 实际端口任务已结束。
+2. 待结命令为空。
+3. 本地终态已保存并消费。
+4. 明确选择模拟对端已接收，或确认未发布。
+
+应用追加Reviewed后，再根据本地状态调用ReleaseAsync或ResetAsync。Completed的NG也走正常放行，不应因为Ng就伪装成流程异常。
+
+这两步分别失败时都不会自动发下一件：文件Reviewed成功但本地放行被拒绝，界面仍显示未回Idle；文件准入和本地状态必须同时允许，启动才接受。默认不自动重试任何设备动作。
+
+重启时旧周期可能只有Began，没有Terminal。窗口显示Unknown；模拟核对只追加证据，不补造旧判定，也不往新宿主恢复旧Task或旧Session。
+
+## 6. 状态面板不要只有一个Busy
+
+本批分别展示：流程Stage、已捕获配方、TaskActive、Pending、NeedsReconciliation、本地终态、TerminalConsumed、文件准入与PortDisposed。
+
+| 组合 | 应怎样理解 |
+| --- | --- |
+| Faulted且TaskActive | 流程已经故障，但原异步调用仍在运行 |
+| NeedsReconciliation=true | Task已结束，仍缺少有效终态，需要只读核对 |
+| Completed且TerminalConsumed=false | 本地结论已出现，尚未完成结果保存与消费 |
+| TerminalConsumed=true且账本未核对 | 保存处理过结果，尚不允许新工件 |
+| Closed但PortDisposed=false | 不能据此宣布端口已成功清理，应观察宿主Completion错误 |
+
+窗口每200ms读取一次最新内存快照，不从UI线程读取账本文件，也不把每次刷新都追加成日志。刷新间隔不提供实时性保证；真正的阶段期限仍由宿主驱动。
+
+## 7. 关闭不是把窗口藏起来
+
+第一次Closing设置Cancel=true，提出关闭请求。窗口保留，定时执行有限的CloseStepAsync：
+
+```text
+提出关闭，禁止新动作
+  → 有本地终态则先保存，再消费
+  → 若实际Task/待结尚未结束，本次步骤返回false
+  → 必要时仍允许只读核对
+  → 宿主Completion完成，端口已释放
+  → 释放账本写锁
+  → 允许窗口真正关闭
+```
+
+关闭步骤不会占着应用槽无限等待一个未知Task。它只观察一次并返回，因此窗口仍可显示状态或发起必要的只读核对。
+
+关闭时保存了结果，不等于自动Reviewed；下次打开仍需处理该周期的核对。若没有实际派发、也没有本地终态，允许释放资源，同时保留未使用的Began或失败临时文件供重开检查。
+
+终态保存失败时不会跳到消费；窗口关闭收尾报错并保留窗口，不显示“退出成功”。本例没有强制关闭按钮，也没有硬杀驱动或安全停止实现。流程停止仍只是软件锁存，外部安全功能另行设计与验收。
+
+## 8. 验证范围与下一批
+
+新增44项应用检查，覆盖配方捕获、先写意图、先保存再消费、重复操作、重启高水位、忙时拒绝、关闭期间意图写入、停止仍保留实际任务以及迟到排空。WPF新增7项控件状态、离屏渲染和关闭检查；原164项回归通过，共215项。
+
+两个项目Release零警告零错误。实际执行正常NG应用演示，离屏PNG已检查，文字与控件布局清晰；尚未进行人工鼠标/键盘、多显示器、不同DPI或长时间窗口运行验收。
+
+继续[C#应用层API、WPF按钮与Closing实践](/knowledge/industrial/host-computer/station/csharp-wpf-station-application-and-recipe-capture/)。继续[通信任务映射与MC本机回环](/knowledge/industrial/host-computer/station/communication-task-mapping-and-readonly-reconciliation/)，已接通Move任务并验证断线后只读核对；再分批接运动和视觉。

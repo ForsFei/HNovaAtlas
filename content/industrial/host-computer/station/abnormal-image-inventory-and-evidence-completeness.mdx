@@ -1,0 +1,63 @@
+---
+id: industrial-station-image-inventory
+title: 异常图像核对：证据完整性与逐周期查询
+description: 将异常像素归档与账本和诊断说明联合核对，区分缺失、损坏、冲突、孤立及无图周期，保持原终态与恢复规则。
+tags: [工业自动化, 综合工位, 数据追溯]
+difficulty: intermediate
+status: published
+updated: "2026-11-02"
+order: 260
+prerequisite: [industrial-station-abnormal-pixels, industrial-station-abnormal-reconciliation]
+related: [industrial-station-image-evidence]
+---
+
+## 1. 为什么需要图像完整性列
+
+上一批已经能够保存异常原始像素，但旧对账器只读取账本、正常图包和异常诊断说明。MatchedAbnormal仍只表示说明与终态相符，不能证明异常图像文件存在或像素有效。
+
+本批新增独立ImageEvidenceReconciler，在原报告之外增加图像列。原EvidenceReconciler和正常工作流不变，不把旧调用静默升级为图像核验，也不新增操作界面。
+
+## 2. 两层结果分别表达什么
+
+第一层BaseReport保留原账本/诊断核对结果及ReviewRecorded。第二层Images说明每个相关周期的异常像素完整性；ImageStorageIssues单列根目录不可用、残留和未知文件。
+
+| 图像状态 | 含义 |
+| --- | --- |
+| Verified | 原像素校验通过，完整异常诊断与独立说明相同 |
+| Missing | 图像根目录可读，诊断有帧，但没有对应归档 |
+| StorageUnavailable | 根目录不可访问或超过教学扫描上限，不能证明文件缺失 |
+| Invalid | 对应归档损坏、尺寸/哈希/结构/文件名身份不合法，或比较时诊断不可用 |
+| DiagnosticConflict | 归档本身可读，但完整诊断与独立说明不同 |
+| BaseNotMatched | 有图像，但原账本/说明核对没有达到MatchedAbnormal |
+| NoFrameExpected | 说明中本来没有合格帧，且没有对应图像 |
+| Orphan | 图像身份没有对应的基础报告行 |
+
+Verified只意味着这份离线证据一致，不改变原Faulted/Stopped。若BaseReport存在存储问题，它可能是不完整报告；Orphan只描述本轮没有匹配的报告行，不能据此推断真实账本中永远没有该工件。
+
+## 3. 比较不能只看FrameId
+
+文件名必须是标准Session-Cycle.json，并与归档内终态身份相符。归档通过上一批Read检查像素、尺寸、SHA及可用ROI统计之后，还必须比较完整AbnormalEvidence。
+
+因此即便同一FrameId或像素哈希相同，只要处理错误、帧关联、原终态或统计说明不同，都不能显示Verified。两个结果不能由查询程序自动合并，更不能选一个覆盖另一个。
+
+正常完成周期不需要异常图像列；如果在该身份下出现异常归档，则显示BaseNotMatched。没有图像的停止周期可以是NoFrameExpected，这与“有帧却丢了图”的Missing不同。
+
+## 4. 扫描未完成材料
+
+只扫描指定images根目录，最多1000个条目，不递归目录、不创建路径、不跟随归档链接。.pending只列为问题，绝不按已发布图像读取；非标准文件名单列UnexpectedEntry。
+
+单个坏文件不会隐藏其它周期的有效核验结果；总体RequiresAttention仍保留坏文件或存储问题。上限或根目录错误必须先显示，不能把不完整扫描当成完整缺失清单。
+
+## 5. 只读不等于跨目录事务
+
+原账本/诊断核对完成后，再扫描图像和重新读取独立诊断。这不是跨存储快照，新增图像层没有统一写锁；应在同一合作所有者停止写入之后离线执行。
+
+读取期间若其它进程修改诊断或图像，结果可能反映不同观察时刻。需要在线强一致查询时，应另设计统一快照或数据库事务，而不是给当前报告加一个“生产可运行”布尔值。
+
+RequiresAttention合并基础报告、图像存储问题及非Verified/NoFrameExpected状态。即使图像Verified，尚未Review的周期仍提示关注；不调用Review、Release、Start或端口API。
+
+## 6. 本批验证
+
+新增15项文件与分类检查：已核验、缺失根目录、缺图、坏JSON、完整诊断冲突、.pending、未知文件、孤立身份、原文件内容不变及无图周期。测试使用离线夹具，不执行设备动作。
+
+继续[C#图像核对报告与查询API](/knowledge/industrial/host-computer/station/csharp-image-inventory-report-and-readonly-query/)。离线综合工位证据查询到此可以区分正常图包、异常说明和异常像素；实际SDK、跨进程任务绑定与现场验收仍单列。

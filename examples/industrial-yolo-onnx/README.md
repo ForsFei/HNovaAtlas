@@ -83,4 +83,4 @@ dotnet run --project examples/industrial-yolo-onnx/IndustrialYolo.Onnx.csproj -c
 - `/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/`
 - `/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/`
 
-下一批一般图片读取、模型专属缩放/填充和参考对照，再补WPF与真实样本评价。相机/工件、质量、GPU、FPS/长期资源未验收。
+第五批一般图片读取、模型专属缩放/填充和参考对照已在独立的[industrial-yolo-images](../industrial-yolo-images/README.md)交付，原r=1入口保留。本项目提取DecodeValues共享解码，新适配层先除r再进行原图空间加1 NMS，再裁剪可见框。后续WPF与真实样本评价；相机/工件、质量、GPU、FPS/长期资源未验收。

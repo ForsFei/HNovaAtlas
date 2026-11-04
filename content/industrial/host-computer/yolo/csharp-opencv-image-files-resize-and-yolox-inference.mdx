@@ -1,0 +1,155 @@
+---
+id: industrial-csharp-yolox-images
+title: C#实践：图片文件、OpenCV缩放与YOLOX离线推理
+description: 用固定OpenCvSharp和ONNX Runtime完成PNG/JPEG读取、BGR缩放填充、原图NMS与可见框，说明常用API、所有权及完整Python参考检查。
+tags: [工业自动化, C#, OpenCvSharp, YOLOX, ONNX Runtime]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 90
+prerequisite: [industrial-yolox-image-geometry]
+related: [industrial-csharp-yolox-postprocessing, industrial-csharp-yolo-onnx-session]
+---
+
+## 1. 项目和运行入口
+
+新增`examples/industrial-yolo-images/IndustrialYolo.Images.csproj`，.NET10/x64，通过ProjectReference复用既有ONNX会话与OpenCvSharp包。锁定OpenCvSharp4及runtime.win 4.13.0.20260627，实际OpenCV4.13.0，CPU ONNX Runtime1.27.0；不升级已有包、不新增模型下载，也不加入窗口。
+
+从仓库根目录运行，模型路径使用前批已校验的缓存：
+
+```powershell
+dotnet restore examples/industrial-yolo-images/IndustrialYolo.Images.csproj --locked-mode
+dotnet build examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-restore
+
+dotnet run --project examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-build -- --native-test examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+
+dotnet run --project examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-build -- --demo examples/industrial-yolo-onnx/.local/yolox_nano.onnx
+```
+
+`--self-test`执行35项托管几何/源空间NMS检查；`--native-test`执行30项真实编解码、缩放和模型检查；`--demo`新建自有渐变PNG并使用0.01分数阈值展示数值。测试夹具放在bin下唯一verification目录，缓存、Python参考和模型不随源码提交。
+
+已有可信本地图片可以运行：
+
+```powershell
+dotnet run --project examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-build -- --infer examples/industrial-yolo-onnx/.local/yolox_nano.onnx "D:/images/工件.png"
+```
+
+换成自己的路径。`--infer`使用0.1分数阈值、0.45 NMS阈值，不写检测图片；没有目标时正常返回空集合。模型缺失或损坏直接失败，需要首次取得模型时使用[第三批显式下载入口](/knowledge/industrial/host-computer/yolo/csharp-onnxruntime-session-ortvalue-and-lifetime/)。成功退出0、托管失败1、用法错误2、原生/图片/参考失败3。
+
+## 2. 核心调用只有四步
+
+```csharp
+LoadedImage source = OpenCvImageInput.Load(imagePath);
+PreparedImage prepared = OpenCvImageInput.Prepare(source);
+using YoloXNanoSession session = new(modelPath);
+YoloXRawOutput raw = session.Run(prepared.Tensor);
+ImageReport report = ImagePostprocessor.Process(
+    raw, prepared, new PostprocessSettings(.1f, .45));
+
+foreach (ImageDetection detection in report.Detections)
+{
+    int classId = detection.Candidate.NetworkRow.ClassId;
+    float score = detection.Candidate.NetworkRow.Score;
+    Box? original = detection.VisibleSource.Original;
+    // original为null时保留审计记录，跳过显示叠加。
+}
+```
+
+以上为调用片段，完整入口在Program.cs。`LoadedImage`含自有BGR像素、实际解码字节哈希、编码长度和源通道数；`PreparedImage`同时携带Source、Geometry与Tensor，构造受项目内部控制，避免公开随意拼接几何和输入。
+
+`raw`本身不认证来自哪张图片，调用者仍必须让一次Run的输入、输出和prepared对应。本批同步单图调用保证调用链清晰，以后接异步相机或WPF时还需要明确图像标识，不能仅用“尺寸相同”关联结果。
+
+## 3. OpenCV常用对象、属性和方法
+
+| API | 本批用途 | 使用时要确认 |
+| --- | --- | --- |
+| `Cv2.ImDecode(bytes, Unchanged)` | 从同一份文件字节解码 | 返回Mat，仍要检查为空及类型 |
+| `Mat.Empty()` | 检查解码失败 | 空结果不能送Resize |
+| `Cols` / `Rows` / `Dims` | 宽、高、维度 | 循环前缓存，访问可能涉及原生调用 |
+| `Type()` / `Channels()` | 检查CV_8UC3或CV_8UC1 | 通道数相同不代表深度相同 |
+| `Cv2.CvtColor(..., GRAY2BGR)` | 灰度明确扩展为三通道 | 不对三通道图再重复转换 |
+| `Cv2.Resize(..., Size, ..., Linear)` | 缩放到截断后的实际尺寸 | Size参数是宽、高 |
+| `new Mat(h,w,CV_8UC3, Scalar)` | 创建填114的416画布 | Scalar三个分量按BGR理解 |
+| `SubMat(Rect)` / `CopyTo()` | 目标左上区域视图及像素复制 | ROI是视图，需随用随释放 |
+| `Ptr(y)` / `Marshal.Copy` | 按行复制到自有托管缓冲 | ROI不一定连续，不把整个图当紧密内存 |
+| `Dispose()` / `using` | 释放Mat与视图 | GC不能替代明确释放原生资源 |
+
+`OpenCvImageInput.CopyBgr`先验证非空二维CV_8UC3，再逐行复制有效宽度；这样即使来源是父Mat中的非连续ROI，也不会读入行间无关像素。返回的Bgr24Image不借用Mat指针，父图和ROI释放后仍可使用。
+
+反向`ToMat`返回新的自有Mat，调用者负责Dispose。`Prepare`中的source、resized、canvas和ROI全部使用using，最后复制为托管输入数组，报告不引用这些已经释放的Mat。
+
+## 4. Prepare内部如何组织
+
+```csharp
+ImageGeometry geometry = ImageGeometry.Create(source.Bgr.Width, source.Bgr.Height);
+using Mat image = OpenCvImageInput.ToMat(source.Bgr);
+using Mat resized = new();
+Cv2.Resize(image, resized,
+    new Size(geometry.ResizedWidth, geometry.ResizedHeight),
+    0, 0, InterpolationFlags.Linear);
+using Mat canvas = new(416, 416, MatType.CV_8UC3,
+    new Scalar(114, 114, 114));
+using (Mat target = canvas.SubMat(
+    new Rect(0, 0, geometry.ResizedWidth, geometry.ResizedHeight)))
+    resized.CopyTo(target);
+```
+
+随后把画布复制成自有Bgr24Image，交给前批的`YoloXInput.PrepareNoResize`转BGR float32 CHW。本次传入的是完整416×416画布，因此Tensor原有SourceHeight字段表示画布高度416，不能拿它当原始图片高度；原图尺寸、理想r和有效缩放区域都在prepared.Geometry里。
+
+这层适配不修改第二批RGB预处理，也不把旧`ClipNoResize`改成万能映射。上一批r=1入口继续可用，新图片入口使用`ImagePostprocessor`处理一般尺寸。
+
+## 5. 后处理API和报告怎么读
+
+`YoloXPostprocessor.DecodeValues`共享全部3549行的float32网格解码与概率检查；`ImagePostprocessor.Process`在筛选后调用`Geometry.ToReferenceSource`，再按原图参考坐标进行跨类加1 NMS，最后调用`ToVisibleSource`。
+
+| 对象/成员 | 含义 |
+| --- | --- |
+| `ImageGeometry.Ratio` | 上游框还原使用的理想缩放比 |
+| `RasterScaleX/Y` | 实际整数尺寸与原图比例，用于解释取整差异 |
+| `ToNetwork(Box)` | 原图合法连续框乘r，用于几何检查 |
+| `ToReferenceSource(Box)` | 网络框除r，保留越界供NMS |
+| `ToVisibleSource(Box)` | 求有效栅格交集后还原，返回空或裁剪标志 |
+| `report.Rows` | 全部解码行的只读快照 |
+| `report.Candidates` | 严格大于分数阈值的候选，含网络框和参考框 |
+| `report.Suppressions` | 被哪条保留行以多大重叠抑制 |
+| `report.Detections` / `Visible` | NMS保留记录与其中可见框数量 |
+
+有限值、概率范围、正面积和教学算术边界继续校验；原图参考坐标也限制在±1e6，异常明确失败，不悄悄裁掉异常值。NMS最坏平方级且报告会分配对象，本批未把它作为高吞吐实现或硬实时方案。
+
+## 6. 完整Python参考如何重现
+
+参考脚本只读取本地固定模型和图片，输出三个新文件：`.input.f32`、`.output.f32`和`.json`；已有任何目标文件即拒绝，不覆盖。NumPy解码、源空间NMS和可见框步骤单独实现，OpenCV与ORT后端保持一致。
+
+可选参考环境在项目.local内创建，避免改动全局Python。以下与本轮实测一致：系统已有NumPy2.5.0和ORT1.27.0，虚拟环境用system-site-packages复用它们，只在该虚拟环境安装固定headless OpenCV。
+
+```powershell
+python -m venv --system-site-packages examples/industrial-yolo-images/.local/python-ref
+& examples/industrial-yolo-images/.local/python-ref/Scripts/python.exe -m pip install --no-deps opencv-python-headless==4.13.0.92
+```
+
+没有上述两个既有包的机器，应在独立虚拟环境安装对应固定版本；C#运行本身不需要Python。脚本不会自动安装、联网或训练。运行`--demo`后复制它打印的IMAGE路径到变量：
+
+```powershell
+$imagePath = "替换为demo打印的完整PNG路径"
+$referencePrefix = "examples/industrial-yolo-images/.local/my-reference-v1"
+& examples/industrial-yolo-images/.local/python-ref/Scripts/python.exe examples/industrial-yolo-images/reference_images.py examples/industrial-yolo-onnx/.local/yolox_nano.onnx $imagePath $referencePrefix
+
+dotnet run --project examples/industrial-yolo-images/IndustrialYolo.Images.csproj -c Release --no-build -- --compare examples/industrial-yolo-onnx/.local/yolox_nano.onnx $imagePath $referencePrefix
+```
+
+重复时换一个未使用的prefix。比较器要求519168输入值严格一致；原始输出使用前批容忍公式；JSON限2MiB/深度16，必需字段和未知字段严格检查，核对模型、编码字节、输入哈希、尺寸、缩放和阈值。全部3549行原图参考xyxy、类别/分数、候选集合、保留顺序和可见性逐项对照。
+
+坐标容忍为`1e-4 + 2e-5*abs(reference)`，分数与原始输出为`1e-5 + 1e-4*abs(reference)`，类别和行号严格一致。来源字段只是记录，不是签名；换一套CPU/OpenCV构建后若不一致，应定位解码、插值、布局还是推理差异，不直接放宽所有容忍值。
+
+## 7. 实测结果和后续
+
+Release零警告零错误，锁模式还原通过。新增35+30项检查，原有69+76+31+17+66+12项回归全部通过，合计336项C#检查；完整数组比较另列，不把每个数组元素当一个测试案例。
+
+自有641×359图得到416×232有效栅格，输入SHA256为`E4964C41C78FA76F8EF08D8AE0120C600209788B12F040140BF05F62BD750907`。score0.01下32个候选，保留行3439/3468/3462/3454/3420，5项可见。519168输入逐值相同，301665原始值最大误差0，完整3549行及可见框最大坐标差约9.4047E-05像素。默认0.1阈值下此图为空，是正常结果。
+
+测试覆盖中文路径、文件签名、灰度扩展、JPEG可解码、alpha/16位拒绝、非连续ROI和释放后像素独立、缩放/填充、r=1历史输入哈希及真实模型。尚未验收真实标注图片的质量、EXIF/色彩管理、连续采集、GPU、长期资源和现场部署。接下来把这套已经验证的离线结果接到WPF原图显示与同图叠加，继续保留原图与参考几何。
+
+第六批已补[C# WPF查看器与同图叠加](/knowledge/industrial/host-computer/yolo/csharp-wpf-yolox-viewer-session-and-overlay/)，复用本篇离线输入与原图框；下一步再进入长寿命会话和有界处理。
+
+理论回看[一般图片与原图空间NMS](/knowledge/industrial/host-computer/yolo/image-decoding-model-letterbox-and-source-space-nms/)。API以项目锁定版本及[OpenCV4.13官方编解码文档](https://docs.opencv.org/4.13.0/d4/da8/group__imgcodecs.html)为依据，固定模型来源与许可证入口见示例THIRD_PARTY.md。

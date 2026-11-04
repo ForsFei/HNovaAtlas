@@ -1,0 +1,121 @@
+---
+id: industrial-station-result-ledger
+title: 工位结果追溯：周期意图、落盘顺序与重启核对
+description: 区分本地终态、结果落盘与对端接收，以追加记录保存周期意图和结果，在重启后阻止自动续跑并显式核对未结周期。
+tags: [工业自动化, 上位机, 结果追溯, 持久化, 重启恢复]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 40
+prerequisite: [industrial-station-async-host, industrial-csharp-station-async-host]
+related: [industrial-csharp-station-result-ledger, industrial-station-flow]
+---
+
+## 1. 为什么终态出现以后还要记录
+
+前两批已有状态机和异步宿主，但它们的周期、最近日志、终态消费标志都在内存里。进程退出后，这些信息不会自动存在。重启得到一个Idle对象，只能说明新对象尚未接收任务，不能说明设备空闲、工件已清理或结果没有发出去。
+
+本批增加纯.NET10本地追加记录示例。先保存周期意图，再执行离线模拟；先保存终态，再消费原本地终态。重开记录目录后列出未核对周期，阻止进入下一个工件，不从文件重新执行Move、Capture或PublishResult。
+
+这一批单独演示持久化顺序，没有将磁盘写入塞进上一批StationHost的状态所有者循环。后续界面/编排层再组合两者；真实设备和数据库事务仍需具体适配。
+
+## 2. 四个确认分别是什么
+
+| 事实 | 说明 | 不能据此推断 |
+| --- | --- | --- |
+| StationTerminal已产生 | 本地流程有不可变结论 | 文件已保存 |
+| TerminalSaved已发布到记录目录 | 本程序完成本次文件保存路径 | PLC/MES已经收到结果 |
+| ConsumeTerminal成功 | 原本地终态对象已被消费 | 已经落盘或跨进程确认 |
+| Reviewed已记录 | 调用方提交了明确的核对声明 | 程序实际做过回零、清料或设备安全验证 |
+
+例如PublishResult回执超时：上位机可以先记录“本周期回执超时”，但结果可能已经被对端接收。不能把本地超时结果当成对端没有收到的证据，然后再次发送。
+
+正常NG也是可追溯结果，Outcome=Completed、Judgment=Ng。故障终态可以没有判定和帧，不能为了报表完整而补造一个OK/NG。
+
+## 3. 三种追加记录
+
+本例每个事件一个JSON文件，按000001.json、000002.json顺序发布。文件名只来自内部序号，工件号与配方不拼入路径。
+
+| Kind | 何时写 | 主要内容 |
+| --- | --- | --- |
+| Began | 第一个命令转移/派发之前 | Session、Cycle、Producer、Number、工件与配方版本 |
+| TerminalSaved | 本地终态消费之前 | 原周期身份、Outcome、Reason、FrameId、Judgment |
+| Reviewed | 显式核对原周期之后 | 核对人、证据引用、观察时间、状态声明和结果渠道处置 |
+
+每条还有Schema与Sequence。读取时重放的是记录之间的约束：先Began，至多一个TerminalSaved，最后至多一个Reviewed。这里的“重放”只建立只读报告，不执行设备动作。
+
+若中断前只写了Began，重启报告保留Terminal=null。Reviewed可以封存这个已核对的未知周期，但不会把它改成Completed，也不会凭空补检测结果。
+
+## 4. 先写意图，再派发；先保存，再消费
+
+正常教学顺序：
+
+```text
+新控制器接收订单，命令仍未取走
+    → Began写入并发布成功
+    → 执行四个离线模拟步骤
+    → TerminalSaved写入并发布成功
+    → 消费原本地终态对象
+    → 显式核对并记录Reviewed
+```
+
+如果Began失败，停止这次编排，不进入命令派发。若保存结果失败，不消费本地终态，不放行新工件。示例RunNormal遇到异常直接退出；调用方不能捕获以后继续执行后面的动作。
+
+Began已写入、实际派发尚未发生时也可能崩溃。重启看到Began，只能保守认定“存在需要核对的周期”，不能区分“尚未派发”和“已派发但未留下后续记录”。这会增加核对工作，但避免静默重发。
+
+本批没有逐步骤的持久化派发账本，也没有将每个OperationKey保存为可续跑检查点。因此它实现的是周期级阻止与追溯，不能恢复到某个运动步骤继续执行。
+
+## 5. 文件保存为何使用临时文件
+
+本例在同一目录创建唯一.tmp文件，写完整UTF-8 JSON，调用Flush(true)，关闭流，再用不覆盖目标的File.Move发布为正式序号文件。临时文件存在期间，正式记录不应暴露半份JSON。
+
+| 故障位置 | 调用方处理 | 重开目录时的行为 |
+| --- | --- | --- |
+| 创建/写入/Flush失败 | 当前账本进入StorageUncertain，停止派发 | 若留下.tmp则拒绝加载 |
+| 已Flush、尚未Move | 保留临时证据，不自动删除 | 拒绝加载，要求检查存储 |
+| Move成功、调用返回前出错 | 调用方仍按失败处理 | 正式文件若完整，可重读并识别已保存内容 |
+| 正式JSON损坏或序号有缺口 | 不忽略坏记录，不当空目录 | 加载失败 |
+
+FileMode.CreateNew防止复用临时文件，File.Move的overwrite=false防止覆盖已有事件。文件锁只协调遵守同一规则的本地写者。
+
+Flush(true)和同目录发布降低正常进程故障留下半记录的风险，但本例没有目录元数据刷盘、真实断电试验、文件系统事务、备份或冗余。不能把这些调用说成任意存储设备下的断电零丢失保证。相关API见[FileStream.Flush](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush?view=net-10.0)和[File.Move](https://learn.microsoft.com/en-us/dotnet/api/system.io.file.move?view=net-10.0)。
+
+## 6. 重启先回答哪些问题
+
+只要有一个Began没有Reviewed，Report.CanStartNewCycle=false。结果已保存的周期同样阻止，避免把“保存过”当成“物理工位已复核”。存储写入不确定也会使这个属性为false。
+
+核对原Session/Cycle和工件/配方后，至少回答：
+
+1. 运动模块是否已经空闲？不是仅判断旧Task不存在。
+2. 视觉/采集是否没有遗留任务或缓存结果？
+3. 原工件已经如何处理，是否允许进入新件？
+4. 结果渠道是否核对完成？对端已接收，还是确认未发布？
+5. 证据来自哪里，由谁核对，观察时间是什么？
+
+RestartReview要求这些状态声明齐全，ResultDisposition只能是AcceptedByPeer或ConfirmedNotPublished。无法确认时，不提交Review；示例不提供“先标成未知再放行”的路径。
+
+这些布尔值和字符串只是调用方的显式声明，程序没有替你查询PLC/MES或判断安全条件。Observation时间用于追溯，不用于恢复旧单调时钟，也没有证据有效期或权限认证系统。演示中的全true是模拟声明。
+
+## 7. 身份、重复与持久化边界
+
+周期用Session+Cycle定位；订单用Producer+Number及工件/配方关联。每个Producer的Number高水位从已加载Began重建，换Session后仍拒绝该Producer的旧号。工件字符串本身不是全局唯一实体认证。
+
+同一身份和相同内容重复保存返回false，冲突内容报错；重复Begin的false只表示已有意图，绝不授权再次派发。Reviewed以后不能再补写之前缺失的终态，也不能修改核对证据。
+
+文件重读出的StationTerminal是数据，不是原进程中的本地收据对象，不能拿它调用新控制器的ConsumeTerminal来模拟消费。新控制器应有新Session；旧周期仅做核对，不能注入旧单调时间戳或恢复旧Task。
+
+## 8. 这个记录目录能保证什么
+
+它是可信本机目录里的有限教学日志：一个合作写者，最多1000条事件，每条最多65536字节。JSON拒绝未知/重复/缺失字段和不合法枚举，并校验记录间身份关系。满载直接停止新增，没有静默删除或自动轮转。
+
+它不是防篡改审计。没有签名、哈希链或独立可信末尾标记，删除最后几条甚至整个目录后，程序不能单凭剩余文件证明历史完整。管理员不得通过删除文件“清故障”；正式项目需要受控数据库、备份、审计和保留策略。
+
+本地文件保存与对端接收没有分布式事务。后续接MES/PLC时，需要稳定业务结果ID、幂等接收/查询和待发送账本，分别观察本地提交与对端确认。当前只保存本地周期记录，不把它称为可靠消息投递。
+
+## 9. 验证与续读
+
+新增59项实际文件/重开检查，既有57项状态机和48项异步宿主回归通过。覆盖正常NG、意图中断、持久化高水位、重复/冲突、写入前后注入失败、结果已发布但调用失败、残留.tmp、坏JSON、序号缺口及双写者。
+
+测试的注入异常不等于操作系统掉电或实际进程强杀试验；没有设备、模型、数据库、现场恢复和存储耐久性验收。
+
+继续[C# FileStream、JSON记录与重启报告实践](/knowledge/industrial/host-computer/station/csharp-file-ledger-and-restart-reconciliation/)。继续[操作界面、配方与应用编排](/knowledge/industrial/host-computer/station/operator-window-recipes-and-application-orchestration/)，已将宿主与账本组合成可运行的离线操作流程。

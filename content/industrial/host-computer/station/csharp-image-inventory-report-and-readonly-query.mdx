@@ -1,0 +1,134 @@
+---
+id: industrial-csharp-station-image-inventory
+title: C#实践：异常图像核对报告与只读查询
+description: 使用ImageEvidenceReconciler联合基础对账与异常像素归档，理解状态、完整诊断比较、存储问题与关注标志。
+tags: [工业自动化, C#, 综合工位, 文件IO]
+difficulty: intermediate
+status: published
+updated: "2026-11-04"
+order: 270
+prerequisite: [industrial-station-image-inventory]
+related: [industrial-csharp-station-abnormal-pixels, industrial-csharp-station-reconciliation]
+---
+
+## 1. 项目入口
+
+继续使用examples/industrial-station-evidence。新增ImageEvidenceReconciler.cs与ImageReconciliationChecks.cs，无新依赖、网络或设备。
+
+```powershell
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release -- --image-reconciliation-test
+```
+
+该入口执行新增15项检查，打印并保留独立临时目录。原--reconciliation-test和--self-test保留。
+
+## 2. 只读调用
+
+```csharp
+ImageEvidenceReport report = ImageEvidenceReconciler.Inspect(
+    ledgerDirectory, normalDirectory, abnormalDirectory, imageDirectory);
+foreach (string issue in report.BaseReport.StorageIssues)
+    Console.WriteLine(issue);
+foreach (string issue in report.ImageStorageIssues)
+    Console.WriteLine(issue);
+foreach (ImageEvidenceRow image in report.Images)
+    Console.WriteLine($"{image.Session}/{image.Cycle}: {image.State}");
+```
+
+先显示存储问题，再解释逐周期行。Inspect是同步IO，集成WPF时应在受控后台操作中执行；不要在每个状态刷新Tick中重新扫描整个目录。
+
+目录应来自可信站点配置，并在原写者停止后扫描。缺失目录返回问题而不创建它，读取不会发设备动作或写入账本。
+
+## 3. 返回数据
+
+| 属性 | 用途 |
+| --- | --- |
+| BaseReport | 原ReconciliationReport，不改变MatchedAbnormal含义 |
+| Images | 相关周期的ImageEvidenceRow，只保存身份、状态与说明，不持有图像像素 |
+| ImageStorageIssues | 图像根目录失败、.pending及未知条目 |
+| RequiresAttention | 基础待关注或新增图像问题的合并结果 |
+| ImageEvidenceRow.State | Verified/Missing/StorageUnavailable/Invalid/DiagnosticConflict/BaseNotMatched/NoFrameExpected/Orphan |
+
+查询列表不缓存全部图像；扫描时逐文件读取和验证，结果只留摘要。真正显示原图时再明确调用AbnormalImageArchive.Read/Restore，并再次核对身份，因为报告生成后文件可能已变化。
+
+## 4. 基础匹配是必要条件
+
+只有原行MatchedAbnormal时，才有资格进一步将图像归为Verified。方法重新读取该周期AbnormalEvidenceStore记录，再与归档内Diagnostic作完整记录相等比较。
+
+```csharp
+if (imageDocument.Diagnostic != independentDiagnostic)
+{
+    // DiagnosticConflict：保留原文件，不合并、不修复。
+}
+```
+
+归档存在而基础结果为缺终态、冲突、损坏或正常周期时，只报告BaseNotMatched。不会使用图像内的Terminal补填账本，也不会以恢复出来的图像重跑Inspect后制造一个新结果。
+
+文件名另经TryIdentity验证，要求标准GUID和补零周期格式。内部Terminal必须匹配文件名身份；单纯把别的周期归档复制改名不能成为Verified。
+
+## 5. 缺失与不可读取
+
+图像根目录可读但有帧无文件，是Missing；根目录失败或超过1000条，是StorageUnavailable并附ImageStorageUnavailable。未知文件和.pending保留在全局问题列表；坏文件与缺失文件分别归类。
+
+如果基础账本不可用，BaseReport.StorageIssues会使RequiresAttention保持true；此时图像层的孤立行只能理解为“本轮无基础行”，不能断言原记录不存在。
+
+NoFrameExpected要求独立诊断确实没有合格帧且不存在对应图像。这允许无图停止周期得到清楚说明，但尚未Review仍然需要关注。
+
+## 6. 演示数据与验证边界
+
+测试创建真实本地账本、异常说明和2×2 Mono8归档，然后注入截断JSON、不同ProcessingError、残留和改名文件。核对前后比较原归档字节，确认只读检查没有修改证据。
+
+这15项是图像索引分类检查，不冒充真实相机或长期运行验证。旧诊断核对与像素归档分别保留，在线一致性、索引数据库、原生设备任务绑定需要按后续现场需求设计。
+
+
+## 7. 从命令行生成 JSON 报告
+
+在仓库根目录运行，四个目录依次为账本、正常图包、异常诊断和异常图像。含空格的路径需加引号。扫描前停止这四个目录的写入。
+
+```powershell
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release -- --inspect-images ./ledger ./normal ./abnormal ./images
+```
+
+标准输出为一份 JSON，枚举使用名称。报告保留 `BaseReport`、`Images`、`ImageStorageIssues` 与 `RequiresAttention`。需要存档时可将标准输出重定向到证据目录之外的文件，以免下一次扫描将报告归类为未知条目。
+
+| 退出码 | 含义 |
+| --- | --- |
+| 0 | 扫描完成且报告没有待关注项，空目录集合也可能得到此结果 |
+| 3 | 已生成报告，至少一项需要关注 |
+| 2 | 参数数量不对或含空白目录参数，用法写到标准错误 |
+| 1 | 命令执行异常，异常信息写到标准错误 |
+
+脚本遇到退出码 3 时仍应保留并读取 JSON。先处理存储问题，再按 `Session` 和 `Cycle` 关联两层结果。每份图像读回后只保留诊断摘要，扫描过程中同时保留的像素量与单份归档的大小有关。
+
+
+## 8. 查询一个周期
+
+先从整批报告取得 `Session` 和 `Cycle`，再在四个目录参数后附上 `--cycle`。`Session` 使用原会话 GUID，`Cycle` 使用正整数。
+
+```powershell
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --inspect-images ./ledger ./normal ./abnormal ./images --cycle $session $cycle
+```
+
+单周期报告包含 `BaseRows` 和 `Images`，两组行都按指定身份筛选。`Found` 表示至少一组有匹配行，因此孤立图像也能查询。两组存储问题仍随报告输出，`BatchRequiresAttention` 保留整批判断。
+
+查询仍执行整批扫描。即使选中的图像已核验，整批存在待关注项时仍返回 `3`。找不到所选周期时，两组行为空，`Found` 为 `false`，同样返回 `3`。无效 GUID 或周期号返回 `2`。
+
+
+## 9. 从迟到检测到单周期报告
+
+运行 `--image-reconciliation-demo`，离线工位会让一次检测回复晚于期限。工位记录 `Faulted` 后等待原任务结清，随后保存原帧、异常诊断和终态，再确认视觉收据并关闭写者。演示将材料保存在本次新建的临时目录，并以 JSON 返回四个目录以及 `Session` 和 `Cycle`。
+
+```powershell
+$project = 'examples/industrial-station-evidence/IndustrialStation.Evidence.csproj'
+dotnet build $project -c Release
+if ($LASTEXITCODE -ne 0) { throw 'Build failed' }
+
+$demoJson = dotnet run --project $project -c Release --no-build -- --image-reconciliation-demo
+if ($LASTEXITCODE -ne 0) { throw 'Demo failed' }
+$demo = $demoJson | ConvertFrom-Json
+$roots = @($demo.Ledger, $demo.Normal, $demo.Abnormal, $demo.Images)
+
+dotnet run --project $project -c Release --no-build -- --inspect-images @roots
+dotnet run --project $project -c Release --no-build -- --inspect-images @roots --cycle $demo.Session $demo.Cycle
+```
+
+生成材料成功时演示返回 `0`。两条查询预期返回 `3`。在整批报告的 `BaseReport.Rows` 或单周期报告的 `BaseRows` 中，基础匹配状态为 `MatchedAbnormal`，`ReviewRecorded` 为 `false`。图像行应为 `Verified`。从 `$demo.Images` 打开归档还可以对照 `Diagnostic.Terminal.Outcome` 的 `Faulted` 与 `Diagnostic.DiagnosticJudgment` 的 `Ok`，前者记录工位终态，后者记录迟到的处理器结果。

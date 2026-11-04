@@ -1,0 +1,148 @@
+---
+id: industrial-csharp-station-reconciliation
+title: C#实践：异常说明保存与只读重启对账
+description: 使用AbnormalEvidence、AbnormalEvidenceStore、EvidenceWorkflow和EvidenceReconciler导出异常诊断，保存原终态并只读比较账本与图像证据。
+tags: [工业自动化, C#, 综合工位, 文件IO, 故障恢复]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 190
+prerequisite: [industrial-station-abnormal-reconciliation]
+related: [industrial-csharp-station-evidence, industrial-csharp-station-integrated]
+---
+
+## 1. 项目入口
+
+继续使用examples/industrial-station-evidence/IndustrialStation.Evidence.csproj，新增AbnormalEvidence.cs、EvidenceReconciler.cs和ReconciliationChecks.cs，无新包、原生SDK或网络。
+
+```powershell
+dotnet build examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --reconciliation-test
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --reconciliation-demo
+```
+
+上一批--self-test/--demo保留。成功0、异常1、用法2；新演示通过真实离线工位的停止路径，保存说明、关闭再核对，打印目录并保留证据。没有任意设备地址或自动恢复入口。
+
+## 2. AbnormalEvidence.Capture
+
+```csharp
+AbnormalEvidence record = AbnormalEvidence.Capture(
+    session.Snapshot, session.Devices);
+```
+
+这两个快照由同一合作所有者在实际Task和Pending结清后顺序读取。方法检查应用/端口无活动Task、模型不Busy、终态为Faulted或Stopped，Session/Cycle/Order一致。当前Cycle的CaptureOperation才允许附诊断；其它周期帧会被忽略。
+
+| 属性 | 类型 | 说明 |
+| --- | --- | --- |
+| Schema | int | 当前为1 |
+| Kind | string | 固定DiagnosticOnly-NoPixels |
+| Terminal | StationTerminal | 保留原终态，不把诊断结果写回 |
+| FrameState | AbnormalFrameState | 无关联帧、采图未合格、未接受帧或已接受帧 |
+| CaptureOperation | OperationKey? | 同周期Capture身份 |
+| DiagnosticFrameId | Guid? | 端口帧号，可能没有被工位接受 |
+| DiagnosticFrame | FrameStamp? | 源会话与帧序号 |
+| DiagnosticMeasurement | PixelStatistics? | 可用的处理器统计 |
+| DiagnosticJudgment | Verdict? | 诊断判定，不能当工位已接受判定 |
+| ProcessingError | string? | 处理失败代码，与成功测量互斥 |
+
+没有保存像素，也不持有相机借用缓冲。若图像帧存在，必须有合法Stamp/FrameId与匹配Capture操作；AcceptedFrame还必须匹配Terminal.FrameId。统计要求有限值、合法区域和像素计数，不能用NaN、负数或伪造NG遮盖异常。
+
+## 3. 异常文件存储对象
+
+```csharp
+using AbnormalEvidenceStore abnormal = new(abnormalDirectory);
+string publishedPath = abnormal.Save(record);
+```
+
+构造创建专用异常目录并独占.writer.lock。正常异常记录名为“GUID-十位补零周期.json”；工件名称不拼入路径。
+
+Save检查内容后，以CreateNew写同目录.json.pending文件，Flush(true)、关闭、不覆盖移动至最终JSON，再读回比较。同周期同内容幂等，冲突拒绝。写入或发布失败后进入failed状态并保留现场；再次Save拒绝，重开时.pending也会阻止新写者。
+
+JSON限制64KiB，要求构造参数完整、拒绝未知字段和整数枚举，设置AllowDuplicateProperties=false拒绝重复属性。该选项见[Microsoft官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.text.json.jsonserializeroptions.allowduplicateproperties?view=net-10.0)。
+
+Dispose关闭锁句柄，不删文件。异常记录是诊断材料，不提供图像、数字签名或突然断电保证。
+
+## 4. 保存工作流
+
+```csharp
+using EvidenceStore normal = new(normalDirectory);
+using AbnormalEvidenceStore abnormal = new(abnormalDirectory);
+EvidenceWorkflow workflow = new(session, port, normal);
+AbnormalEvidence saved =
+    await workflow.SaveAbnormalThenAcknowledgeAsync(abnormal);
+```
+
+正常周期继续SaveThenAcknowledgeAsync；异常周期使用新方法，两条路径共享同一个即时拒绝的saving标志。必须由同一合作所有者顺序操作，不能绕过工作流并发Review或关闭。
+
+新方法依次：Capture异常快照→后台保存异常JSON并读回→确认原本地Terminal对象未换→原SaveResultAsync→原AcknowledgeVisionAfterSavedAsync。
+
+运动失败未建立视觉周期时，最后一步返回false是合法情况，不创建虚构视觉收据。已经采图/处理的异常周期会在保存原异常终态之后确认原收据；这是“异常只保留诊断JSON”的显式政策，不可当作异常原图已经归档。
+
+仍有实际动作、实际Task或无法结清Pending时会拒绝。原工位停止不自动停止轴，示例在模型中另发普通停止并观察结清；真实设备停止和安全策略需单独实现。
+
+## 5. StationLedger.OpenReadOnly
+
+```csharp
+using StationLedger ledger = StationLedger.OpenReadOnly(ledgerDirectory);
+LedgerReport report = ledger.Report;
+```
+
+新增只读打开工厂，复用原严格Load和Report模型；使用已有目录及已有.writer.lock，以FileMode.Open/FileAccess.Read/FileShare.Read读取，不创建锁或目录。
+
+只读实例的Begin、SaveTerminal、Review一律抛ReadOnlyLedger。Dispose关闭读取句柄。原new StationLedger(directory)写模式不变，原账本验证、来源号高水位和启动阻止规则保留。
+
+Report.CanStartNewCycle是原本地账本字段，不是只读实例可以Start，也不是设备许可。对账报告不使用它生成自动恢复动作。
+
+## 6. EvidenceReconciler.Inspect
+
+```csharp
+ReconciliationReport report = EvidenceReconciler.Inspect(
+    ledgerDirectory, normalDirectory, abnormalDirectory);
+foreach (string issue in report.StorageIssues)
+    Console.WriteLine(issue);
+foreach (ReconciliationRow row in report.Rows)
+    Console.WriteLine($"{row.Session}/{row.Cycle}: " +
+        $"{row.Match}; reviewed={row.ReviewRecorded}; {row.Detail}");
+```
+
+这是同步、只读文件工作。在WPF里可由受控后台操作执行，不能逐帧排队，也不应拿UI线程等待大量磁盘文件。读取期间持有合作读锁，根目录最多1000份证据加一个锁文件；超过上限报告不可用，不自动截断成成功。
+
+| 返回成员 | 用途 |
+| --- | --- |
+| Rows | 每个Session/Cycle的归类，不含设备动作 |
+| Row.Match | 正常匹配、异常匹配、缺终态、缺证据、孤立、冲突、损坏或重复 |
+| Row.ReviewRecorded | 原账本是否已有Review |
+| Row.Detail | 本地归类说明，不暴露设备恢复命令 |
+| StorageIssues | 根目录不可用、.pending、未知条目等问题 |
+| RequiresAttention | 存储问题、非匹配归类或尚未Review时为true |
+
+账本不可用时返回LedgerUnavailable，停止归类；图像或异常根目录不可用时保留存储问题，继续生成可获得信息的部分报告。调用方必须先显示StorageIssues，不能把部分报告误当完整扫描。
+
+图像目录有.pending时仍逐个检查其它已发布图包：直接使用原ReadBundle的尺寸、哈希、ROI和判定校验，既不创建EvidenceStore写者，也不修复坏目录。
+
+## 7. 重启核对的关键分支
+
+```csharp
+if (record.Terminal is null && evidenceExists)
+{
+    // EvidenceWithoutTerminal: 保留原终态未知。
+    // 不调用SaveTerminal(evidence.Terminal)反向制造旧工位结果。
+}
+```
+
+Began与留图存在而原终态缺失，可能是留图成功后、账本落盘前退出；不能证明设备或原应用已经完成了后续步骤。类似地，证据存在但Began缺失、正常和异常材料占用同一周期、两边Terminal.Reason不同，都必须单独归类。
+
+对账器不调用Review、Release、Reset、Start或任何端口操作。RequiresAttention=false也只说明这份本地报告没有列出的待处理项；应用是否能运行仍由原会话、设备和工艺规则决定。
+
+## 8. 实际验证
+
+新增52项检查使用实际离线Task、文件和状态机：停止无图、采图回复迟到、检测回复迟到、真实测量委托抛异常、旧周期帧隔离、重复/错身份、坏文件、孤立/缺失/冲突和.pending。通过文件相对路径与内容哈希集合比较，确认Inspect前后文件名和内容未改。
+
+原留图52、账本59、应用44、组合49、视觉47共251项相关回归通过，新旧共303项。测试用程序集友元访问现有内部门闩和故障夹具，不把这些注入点变成面向设备的生产参数。Demo输出MatchedAbnormal、reviewed=False、attention=True，无自动复核或放行。
+
+下一步：[工业上位机分步目录](/knowledge/industrial/host-computer/chapters/)中的实机接入前验收与故障演练；当前仍没有真实雷赛、相机、PLC或模型调用。
+
+
+## 后续：接入前验收与运行簿
+
+第十一批已补[验收基线与故障演练](/knowledge/industrial/host-computer/station/field-commissioning-baselines-and-fault-rehearsals/)和 [C#运行簿与报告](/knowledge/industrial/host-computer/station/csharp-acceptance-book-and-offline-fault-drills/)。离线演练不填写现场通过记录，实际设备验收继续待执行。

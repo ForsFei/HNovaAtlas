@@ -1,0 +1,111 @@
+---
+id: industrial-yolox-deployment
+title: YOLOX部署：发布目录、运行环境与原生库自检
+description: 区分框架依赖与自包含发布、文件清点与实际原生探针，建立CPU模型/配置发布清单、阶段诊断、加载路径检查与目标机验收边界。
+tags: [工业自动化, YOLOX, 部署, ONNX Runtime, 运行环境]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 160
+prerequisite: [industrial-yolox-local-review, industrial-yolox-bounded-worker]
+related: [industrial-csharp-yolox-deployment, industrial-csharp-yolox-wpf]
+---
+
+## 1. 开发机运行与交付包验证
+
+前面的模型、图片、WPF、后台和评价代码已能运行。本批补交付前的部署清单与C#探针：发布到全新目录，固定配置和模型，记录目录内文件指纹，再从发布目录外启动该目录中的可执行文件，验证实际加载路径与CPU链路。
+
+自检结果只覆盖明确的Windows x64、.NET10、CPU ONNX Runtime1.27.0和OpenCV4.13.0。本轮实际验证当前开发主机上的独立发布目录，不写成“干净目标机已验收”，也没有验证GPU、相机、PLC、WPF可见窗口或长期资源。
+
+## 2. 发布方式先选清楚
+
+| 方式 | 目标机需要什么 | 本批范围 |
+| --- | --- | --- |
+| 框架依赖文件夹 | 合适的.NET运行时及原生依赖 | 实际构建、发布和验证 |
+| 自包含 | 随包携带.NET运行时，仍有平台和其它原生依赖 | 仅说明区别，未构建验证 |
+| 单文件 | 一种打包方式，可与上述模式组合 | 本批关闭，未验收原生提取路径 |
+| 裁剪/AOT | 另有兼容性和发布约束 | 本批不启用 |
+
+项目显式固定win-x64、SelfContained=false、PublishSingleFile=false、PublishTrimmed=false，不让读者根据输出里有exe就猜测运行时是否被打进包。
+
+本轮发布的控制台探针使用Microsoft.NETCore.App，当前实际运行环境为.NET10.0.12。WPF查看器另需Windows Desktop运行环境及窗口人工验收；探针成功不等于WPF显示器、字体、DPI和关闭流程都已测试。
+
+目标机通常不需要SDK来运行框架依赖程序，但必须能先启动.NET宿主。若缺少运行时、架构不符或宿主加载失败，C# Main可能根本没进入，自检器也无法生成正常诊断JSON，应先查看宿主错误和`dotnet --list-runtimes`。
+
+发布方式依据[Microsoft .NET发布概述](https://learn.microsoft.com/en-us/dotnet/core/deploying/)。
+
+## 3. 不只复制一个exe
+
+交付目录需要保留完整publish输出，包括应用程序集、deps.json、runtimeconfig.json、依赖程序集和原生DLL。本例还加入外置固定模型、deployment-settings.json和第三方来源说明。
+
+```text
+release-folder/
+  IndustrialYolo.Deployment.exe
+  IndustrialYolo.Deployment.dll
+  IndustrialYolo.Deployment.deps.json
+  IndustrialYolo.Deployment.runtimeconfig.json
+  其它publish程序集/原生库/符号及说明文件
+  deployment-settings.json
+  model/yolox_nano.onnx
+  release-profile.json
+```
+
+本次实测清点44个文件，约119.5MB，不把这个数量或大小写成永久契约。目录清单记录每个实际文件的相对路径、字节数和SHA256，release-profile.json本身除外。多一个未声明文件、少一个文件或同路径内容变化，都会导致清点失败。
+
+模型仍固定前批官方Nano哈希；不是把随意找到的onnx放进目录就能通过。部署配置固定pipeline/labelSet，包含settingsVersion、scoreThreshold和nmsThreshold。修改配置后也必须作为新发布产物重新验证，不能只在现场改一个数而继续沿用旧指纹。
+
+## 4. 清点通过不等于原生调用通过
+
+工具区分两种结果：
+
+| 模式 | 成功状态 | 能说明什么 |
+| --- | --- | --- |
+| --inspect | InventoryPassed | 当前主机环境、清单、文件、配置和模型检查通过，原生阶段NotRun |
+| --probe | ProbePassed | 还执行了固定图像编解码、预处理、CPU推理、解码和原生加载路径核对 |
+
+inspect可以由开发目录中的检查器清点另一个发布目录；probe则要求正在运行的检查器AppContext.BaseDirectory正是被核对的发布目录。拿开发目录的exe检查发布目录，不能替代真正的发布程序执行。
+
+本批报告同时记录AppBase与WorkingDirectory。脚本从源码目录启动发布exe，二者实际不同；模型与配置按清单所在目录解析，不依赖“当前工作目录刚好等于exe目录”。服务、计划任务或快捷方式启动时尤其需要区分这两个位置。
+
+## 5. 原生探针究竟测了什么
+
+使用自有416×208 BGR夹具，经过OpenCV PNG内存编码/解码、固定模型缩放填充与NCHW转换，核对整个输入数组的历史SHA256。随后实际运行CPU模型，检查形状、全部原始值有限、20个固化Python输出样点，再解码全部3549行。
+
+本次得到301665个原始值，20样点通过，3549行解码通过；默认score>0.1下保留0项是正常结果。原始输出长度不代表301665个值都与完整参考文件逐项对照；完整参考对照仍见第三至第五批工具，本批探针只使用20个固化样点。
+
+最后通过Process.Modules取得已经加载的onnxruntime.dll和OpenCvSharpExtern.dll，要求各一个，并且路径与清单中的对应文件一致。本次两者均从发布目录根部加载。
+
+SHA清单主要检测意外缺失、混包和改动，不是签名或对恶意篡改的认证。应用本身启动、托管依赖解析和原生库加载已经涉及执行代码；这不是“先验证所有代码再执行”的安全启动机制，也不是对并发修改文件系统的完整隔离。
+
+## 6. 故障按阶段定位
+
+| 阶段 | 常见原因 | 首先核对 |
+| --- | --- | --- |
+| Environment | 进程架构/运行时与本工具范围不符 | Windows、x64、.NET10；宿主能否先启动 |
+| Profile | JSON缺字段、未知字段、版本/路径契约错误 | 是否使用对应发布清单 |
+| Inventory | 文件缺失、未声明文件、配置被修改 | publish目录是否完整且未混包 |
+| Settings | 类别/处理版本、阈值不符，读取字节变化 | 配置和清单是否来自同一发布 |
+| Model | 长度或固定SHA不符 | 正确来源与模型产物 |
+| ExecutionRoot | 用另一目录的程序做原生探测 | 启动被核对目录自己的exe |
+| CpuPipeline | 原生依赖、实际运行版本、输入指纹或推理样点异常 | 异常类型、运行版本与同图参考 |
+| NativeOrigins | 加载了其它目录的同名库 | 报告与实际DLL加载位置 |
+
+某阶段失败后后续阶段记为NotRun，不把没有执行的项目当通过。Windows原生依赖缺失可能表现为DllNotFoundException，位数或格式不符可能表现为BadImageFormatException，外层也可能包成类型初始化异常。
+
+ONNX Runtime官方说明Windows构建需要Visual C++运行库；应按对应包与目标平台准备。工具不根据某个注册表项就断言全部原生依赖齐备，而是调用实际功能；也不会自动安装运行库、下载DLL、改PATH或配置CUDA。参阅[ONNX Runtime安装说明](https://onnxruntime.ai/docs/install/)。
+
+原生硬崩溃、启动前宿主错误或挂起可能让诊断文件根本没有写出。调用方必须同时检查进程退出和报告是否存在；本例不提供原生调用的强制超时或硬取消。
+
+## 7. 发布、更新和回退记录
+
+推荐每次产生全新发布目录和ReleaseId，复制经过校验的模型后封存清单，再执行静态清点与原生探针。工具拒绝覆盖已有清单；诊断报告写在目录外，避免报告本身污染文件指纹。
+
+本例脚本只在自己的bin新目录构建和复制已有本地模型，不向其它机器分发，也不修改已安装程序。实际更新应保留旧版本和对应报告，明确切换与回退步骤；新模型若不再符合固定契约，需要新的适配与评价，而不是手工替换清单哈希。
+
+上线前还需核对真实标注集效果、生产参数、人工窗口与DPI、设备/工件关联、关闭排空、日志磁盘、长期资源和操作权限，并整理实际交付所需的第三方通知。本探针只覆盖其中的CPU部署基础。
+
+## 8. 本批证据与后续
+
+26项清单/配置/诊断检查通过，另有8项实际publish/独立子进程场景：正常清点、错误执行根、真实原生探针、配置内容改动、原生文件缺失、报告目录保护、重复封存保护及还原后清点。
+
+下一篇是[C#发布目录清点与CPU自检实践](/knowledge/industrial/host-computer/yolo/csharp-release-inventory-publish-and-cpu-probe/)。第11步YOLO基础教学主线至此已交付，第12步已补[综合工位离线流程与状态机](/knowledge/industrial/host-computer/station/cycle-identity-states-timeouts-and-recovery/)；真实质量、干净目标机和现场验收继续单列。

@@ -5,7 +5,7 @@ description: 工业上位机课程的十二步交付目录，明确通信、雷�
 tags: [工业自动化, 上位机, 学习路线, 雷赛, 机器视觉]
 difficulty: beginner
 status: published
-updated: "2026-10-27"
+updated: "2026-10-28"
 order: 10
 prerequisite: [industrial-host-computer-learning-path]
 related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat-pdo]
@@ -13,7 +13,7 @@ related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat
 
 ## 目录状态与阅读方式
 
-本页是[工业上位机路线](/knowledge/industrial/host-computer/overview/)的分步目录。通信基础链路与握手、E3032主线/脉冲对照/六轴通用基础及第8步视觉基础教学已分批交付，HALCON与OpenCvSharp基础教学主线已交付，当前YOLO已交付数据评价、教学预处理和固定模型CPU推理/解码NMS。教程、接口编译、离线检查和原生/实机验证分别记录，不因编译通过而标成现场完成。每步可以分多轮交付，基础概念、C#常用对象与方法、工程边界和面试追问放在同一专题内。
+本页是[工业上位机路线](/knowledge/industrial/host-computer/overview/)的分步目录。通信基础链路与握手、E3032主线/脉冲对照/六轴通用基础及第8步视觉基础教学已分批交付，HALCON与OpenCvSharp基础教学主线已交付，YOLO基础主线已交付，当前进入第12步综合工位的离线流程与状态机。教程、接口编译、离线检查和原生/实机验证分别记录，不因编译通过而标成现场完成。每步可以分多轮交付，基础概念、C#常用对象与方法、工程边界和面试追问放在同一专题内。
 
 | 步骤 | 主题 | 计划产出 | 状态 |
 | --- | --- | --- | --- |
@@ -27,8 +27,8 @@ related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat
 | 8 | 视觉基础与图像采集 | 离线图像流程与采集适配示例 | [通用教学主线已交付，实机待验收](/knowledge/industrial/host-computer/vision/imaging-exposure-pixels-and-acquisition/) |
 | 9 | HALCON 与 C# 集成 | 定位、测量或检测的小案例 | [基础教学主线已交付，原生与人工UI待验收](/knowledge/industrial/host-computer/halcon/wpf-background-execution-frame-results-and-shutdown/) |
 | 10 | OpenCvSharp 图像处理 | 可解释的传统视觉处理流水线 | [基础主线已交付，现场/长期待验收](/knowledge/industrial/host-computer/opencvsharp/bounded-measurement-preview-and-resource-observation/) |
-| 11 | YOLO 的 C# 部署 | 模型推理、结果解析与效果评估示例 | [CPU推理/后处理已交付，一般图片/质量待交付](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/) |
-| 12 | 综合检测工位与工程实践 | 通信、运动、视觉联动的渐进式案例 | 计划中 |
+| 11 | YOLO 的 C# 部署 | 模型推理、结果解析与效果评估示例 | [基础主线及部署自检已交付，目标机/质量/现场待验收](/knowledge/industrial/host-computer/yolo/image-decoding-model-letterbox-and-source-space-nms/) |
+| 12 | 综合检测工位与工程实践 | 通信、运动、视觉联动的渐进式案例 | [离线主链、留图与异常对账已交付，实机待验收](/knowledge/industrial/host-computer/station/cycle-identity-states-timeouts-and-recovery/) |
 
 ## 第 1 步：设备角色与通信数据契约
 
@@ -220,7 +220,17 @@ related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat
 
 第四批已交付：[网格解码、分数、NMS与源图框](/knowledge/industrial/host-computer/yolo/yolox-grid-decoding-scores-nms-and-source-boxes/)及 [C#后处理/抑制记录/完整参考](/knowledge/industrial/host-computer/yolo/csharp-yolox-postprocess-suppression-ledger-and-reference/)。新增66项手写/12项真实CPU检查，低阈值渐变夹具36候选/33抑制/3保留，完整NumPy对照通过；这些不是三个真实目标或质量证据。明确严格分数阈值、跨类+1 NMS、稳定并列与NMS后r=1裁剪，未做一般resize/真实照片。
 
-后续分批：一般图像接入/模型专属缩放填充与参考评价 → WPF/有界处理及部署验收。不承诺用一套解析代码支持所有YOLO任务和代际。
+第五批已交付：[一般图片解码、模型缩放与原图NMS](/knowledge/industrial/host-computer/yolo/image-decoding-model-letterbox-and-source-space-nms/)及 [C#图片读取、OpenCV缩放与离线推理](/knowledge/industrial/host-computer/yolo/csharp-opencv-image-files-resize-and-yolox-inference/)。独立图片适配项目复用固定包/模型，35项托管与30项真实OpenCV/CPU检查；641×359夹具实际缩到416×232，全部519168输入值严格一致，301665原始输出最大误差0，3549行及候选/NMS/可见框完整对照通过。理论明确理想r与栅格比例差异，先除r再做加1 NMS，裁剪单独作为显示策略。渐变响应不是物体质量验收。
+
+第六批已交付：[WPF原图显示、坐标与同图结果](/knowledge/industrial/host-computer/yolo/wpf-original-image-overlay-and-result-identity/)和 [C#查看器、会话与框叠加](/knowledge/industrial/host-computer/yolo/csharp-wpf-yolox-viewer-session-and-overlay/)。新增38项WPF/手写与10项真实OpenCV/CPU/WPF检查，后台冻结BGR图片，原图/框共享Uniform映射，显示代次隔离切图、清空及关闭后的结果；96/144 DPI离屏检查通过。GUI只含打开、检测、清空；可见窗口人工交互和多显示器继续待验收。
+
+第七批已交付：[长寿命会话、有界准入与终态](/knowledge/industrial/host-computer/yolo/long-lived-session-bounded-admission-and-terminal-receipts/)和 [C# Channel账本、复用与关闭](/knowledge/industrial/host-computer/yolo/csharp-yolox-worker-channel-ledger-and-drain/)。49项门闩/账本检查与12项真实CPU/OpenCV/WPF检查，一次会话实际执行3次Run；容量覆盖排队/运行/未确认终态，原收据确认才释放槽。故障关闭准入并为已接收队列保留失败，正常关闭排空后释放会话；新增--open-reused入口，仍保持三个操作。人工UI、真实质量与长期资源继续未验收。
+
+第八批已交付：[本地样本、标注与误检漏检](/knowledge/industrial/host-computer/yolo/local-dataset-label-contracts-and-operating-point-review/)和 [C#批量推理与评价报告](/knowledge/industrial/host-computer/yolo/csharp-local-label-import-inference-and-review-report/)。独立CLI复用固定模型/包，一次会话顺序处理清单；43项手写与12项实际CPU/OpenCV/报告检查，五列归一化标注、负样本、版本/哈希、逐图/类别/分组及不覆盖报告发布通过。固定工作点，不是AP/mAP或真实质量结论。
+
+第九批已交付：[部署目录、环境与原生诊断](/knowledge/industrial/host-computer/yolo/deployment-contract-runtime-and-native-library-diagnostics/)和 [C#发布清单、实际CPU探针](/knowledge/industrial/host-computer/yolo/csharp-release-inventory-publish-and-cpu-probe/)。26项非原生检查与8项实际publish/子进程场景，框架依赖win-x64新目录封存、模型/配置指纹、加载路径及分阶段错误通过；不是干净机、人工UI或现场质量验收。
+
+第11步YOLO基础教学主线已交付，下一阶段第12步综合工位离线流程和状态机，再分批连接通信、运动、视觉结果。用户真实标注质量、长期资源、GPU/相机、目标机与现场继续单列，不承诺通用解析所有YOLO任务和代际。
 
 - 检测、分类、分割等任务的区别，数据划分、标注、漏检与误检。
 - 模型训练与 ONNX 导出的必要工具；C# 应用以 ONNX Runtime 推理为计划主线。
@@ -232,6 +242,36 @@ related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat
 
 ## 第 12 步：综合检测工位与工程实践
 
+首批已交付：[周期身份、状态机、期限与恢复](/knowledge/industrial/host-computer/station/cycle-identity-states-timeouts-and-recovery/)及 [C#离线工位与故障场景](/knowledge/industrial/host-computer/station/csharp-offline-station-reducer-and-fault-scenarios/)。独立纯.NET10，57项确定性检查；一次命令转移、同工件/配方/帧关联、NG正常完成、超时锁存/迟到排空、原终态消费、显式恢复和关闭通过。它只生成模拟命令，不调用PLC/雷赛/相机/模型，也没有真实停止或安全许可证明。
+
+第12步第二批：[异步端口、任务寿命与关闭排空](/knowledge/industrial/host-computer/station/async-ports-task-lifetime-and-host-draining/)和 [C#宿主、邮箱与只读核对](/knowledge/industrial/host-computer/station/csharp-async-host-mailbox-ports-and-reconciliation/)已交付。新增48项异步检查，原57项状态机回归通过；任务异常保留待结，显式只读核对，关闭等实际任务退出后释放端口。仍为模拟端口，下一批结果记录、持久化与重启核对。
+
+第12步第三批：[周期意图、结果落盘与重启核对](/knowledge/industrial/host-computer/station/result-recording-durable-intent-and-restart-review/)和 [C#文件记录、JSON与重启报告](/knowledge/industrial/host-computer/station/csharp-file-ledger-and-restart-reconciliation/)已交付。新增59项文件/重开检查，原105项回归通过；先保存意图再模拟派发，先保存结果再消费，未核对周期阻止新工件。文件重开不续跑设备，下一批操作界面、配方与应用编排。
+
+第12步第四批：[操作界面、配方捕获与应用编排](/knowledge/industrial/host-computer/station/operator-window-recipes-and-application-orchestration/)和 [C#应用层API与WPF工位窗口](/knowledge/industrial/host-computer/station/csharp-wpf-station-application-and-recipe-capture/)已交付。新增44项应用和7项WPF检查，原164项回归通过；启动前保存意图、结果保存后消费、显式模拟核对放行及窗口关闭收尾已串联。固定OK/NG配方，不连接设备；下一批已有通信任务适配，先模拟/本机回环。
+
+第12步第五批：[通信任务映射、MC回环与只读核对](/knowledge/industrial/host-computer/station/communication-task-mapping-and-readonly-reconciliation/)和 [C#通信端口与回环会话API](/knowledge/industrial/host-computer/station/csharp-mc-station-port-and-loopback-session/)已交付。新增51项真实TCP本机回环检查，原215项工位回归通过；Move复用已有MC邮箱，断线查询原Ticket、不重发，结果保存后显式释放远端槽。其余步骤仍模拟，下一批运动模块离线适配。
+
+第12步第六批：[运动参考、反馈到位与停止边界](/knowledge/industrial/host-computer/station/motion-task-reference-feedback-and-stop-boundaries/)和 [C#运动端口与工位会话](/knowledge/industrial/host-computer/station/csharp-motion-station-port-and-qualified-feedback/)已交付。新增43项运动集成检查，原266项工位回归通过；复用单轴模型与动作观察器，显式连接/使能/回零、稳定反馈到位后交接，超时迟到只排空。无原生SDK或实轴，下一批采图与图像处理适配。
+
+第12步第七批：[自有帧、同帧处理与结果交接](/knowledge/industrial/host-computer/station/vision-task-owned-frames-and-inspection-handoff/)和 [C#视觉端口与处理收据API](/knowledge/industrial/host-computer/station/csharp-vision-station-port-and-frame-receipts/)已交付。新增47项视觉集成检查，原309项工位回归通过；借用先归还、同帧ROI统计、保存后确认原结果，迟到图/结果只排空。运动和结果发布仍模拟，下一批组合运动与视觉的离线端到端工位。
+
+第12步第八批：[运动到原帧检测的离线端到端工位](/knowledge/industrial/host-computer/station/integrated-offline-station-motion-to-image-and-result/)和 [C#组合端口与唯一Move交接](/knowledge/industrial/host-computer/station/csharp-integrated-station-routing-and-single-move-handoff/)已交付。新增49项组合检查，原356项回归通过；模型唯一定位、合格证据交接、同帧处理、保存/确认/核对与关闭已串通。两周期Move2次、视觉模拟Move0次，下一批结果留图与测量明细追溯。
+
+第12步第九批：[原始图像、测量明细与周期追溯](/knowledge/industrial/host-computer/station/original-image-measurement-evidence-and-publication/)和 [C#证据存储与保存工作流](/knowledge/industrial/host-computer/station/csharp-image-evidence-store-and-save-workflow/)已交付。正常OK/NG周期保存原始P5/Mono8图、FrameStamp、配方和实际ROI统计，读回校验后保存终态并确认原视觉收据。写盘失败保留原帧，下一批异常周期证据与重启对账。
+
+第12步第十批：[异常周期、迟到诊断与重启对账](/knowledge/industrial/host-computer/station/abnormal-cycle-diagnostics-and-restart-reconciliation/)和 [C#异常说明与只读对账API](/knowledge/industrial/host-computer/station/csharp-abnormal-evidence-and-readonly-reconciliation/)已交付。新增52项检查；异常JSON明确不含像素，原终态与诊断数据分开，核对缺失/孤立/冲突/损坏及.pending。只读检查不自动复核或放行，下一步实机接入前验收与故障演练。
+
+第12步第十一批：[实机接入前验收与故障演练](/knowledge/industrial/host-computer/station/field-commissioning-baselines-and-fault-rehearsals/)和 [C#运行簿与基线指纹](/knowledge/industrial/host-computer/station/csharp-acceptance-book-and-offline-fault-drills/)已交付。八个专题分别记录模拟/现场观察，三项离线演练与34项检查通过；报告明确8项现场证据缺失。下一批部署交付包、现场参数模板与运行维护记录。
+
+第12步第十二批：[部署交付、现场参数与运行维护](/knowledge/industrial/host-computer/station/deployment-handover-site-parameters-and-maintenance/)和 [C#资料清单与参数Review](/knowledge/industrial/host-computer/station/csharp-handover-manifest-parameters-and-maintenance-records/)已交付。新增30项检查，工具实际win-x64发布及仓库外运行通过。资料包文件匹配仍保留14项模板提示、8项现场证据缺失；下一步异常周期原始图像归档。
+
+第12步第十三批：[异常原始像素与迟到帧归档](/knowledge/industrial/host-computer/station/abnormal-original-pixels-and-diagnostic-archives/)和 [C#原帧导出与恢复](/knowledge/industrial/host-computer/station/csharp-abnormal-frame-export-and-image-archive/)已交付。新增13项检查，旧异常对账入口合计65项；原帧先保存校验再确认，失败和迟到不改原终态。像素归档与旧诊断目录分开，旧对账器不自动核验图像。
+
+第12步第十四批：[异常图像完整性与逐周期查询](/knowledge/industrial/host-computer/station/abnormal-image-inventory-and-evidence-completeness/)和 [C#只读图像核对报告](/knowledge/industrial/host-computer/station/csharp-image-inventory-report-and-readonly-query/)已交付。新增15项检查，区分已核验、缺失、损坏、冲突、孤立和无图周期，图像匹配不自动复核或放行。
+
+后续分批：真实SDK与跨进程设备绑定 → 现场工艺与长期运行验证；跨进程绑定、原生雷赛/相机及真实设备恢复继续单列。
+
 - 按“到料、运动到位、触发采图、检测判定、结果交接、记录追溯”逐步扩展小型工位。
 - 工件标识、请求标识与动作状态，处理迟到响应、重复请求、超时和取消。
 - 手动/自动切换、互锁、报警、复位与恢复条件，以及参数/配方的应用时机。
@@ -242,4 +282,4 @@ related: [wpf-dashboard-integration-and-testing, ethercat-introduction, ethercat
 
 ## 交付节奏
 
-每一种通信采用“理论与协议 → 常用 C# 对象/库 → 配置属性 → 连接、关闭、读取、写入 → 完整示例与异常”的查用结构。当前按第11步分批建设YOLO，下一批一般图片与模型专属缩放/填充；已交付基础主线的长期资源、原生依赖与现场验收继续分别记录。具体设备、SDK、模型与运行环境按专题固定；已有的 C#、WPF 与 EtherCAT 文章保留原地址。
+每一种通信采用“理论与协议 → 常用 C# 对象/库 → 配置属性 → 连接、关闭、读取、写入 → 完整示例与异常”的查用结构。第11步YOLO基础主线已交付，第12步离线运动到视觉/结果的端到端主链已交付，正常周期留图与测量明细已交付，异常诊断与只读对账也已交付，验收方法与离线运行簿已交付，部署资料、参数与维护模板已交付，异常原图独立归档已交付；已交付基础主线的长期资源、原生依赖与现场验收继续分别记录。具体设备、SDK、模型与运行环境按专题固定；已有的 C#、WPF 与 EtherCAT 文章保留原地址。

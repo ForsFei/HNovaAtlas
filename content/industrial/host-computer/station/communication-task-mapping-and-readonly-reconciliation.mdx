@@ -1,0 +1,133 @@
+---
+id: industrial-station-communication-adapter
+title: 工位通信适配：任务身份、MC回环与只读核对
+description: 将工位Move命令映射到已有MC单命令邮箱，在真实TCP回环中区分提交确认、动作终态、本地保存、远端结果释放及断线只读核对。
+tags: [工业自动化, 上位机, MC协议, 任务握手, 异常恢复]
+difficulty: intermediate
+status: published
+updated: "2026-10-28"
+order: 80
+prerequisite: [industrial-station-operator-application, industrial-device-command-handshake-idempotency]
+related: [industrial-csharp-station-communication-adapter, industrial-csharp-mcpx-read-write]
+---
+
+## 1. 先接一条通信任务
+
+本批复用已有industrial-handshake项目的MC单命令邮箱，把工位的Move步骤接到真实TCP本机回环。客户端实际使用McpX 0.13.0发MC报文；接收端只在127.0.0.1随机端口监听，用模拟扫描推进Accepted、Running、Done。
+
+Capture、Inspect、PublishResult仍由原RecipeSimulationPort模拟；正常工位NG仍是模拟检测结果。没有PLC、雷赛、相机、模型或MES接入，也没有实际运动。
+
+本批新增独立控制台例子，不改变上一批WPF窗口默认的纯模拟端口，也不增加窗口按钮。先在有限流程中验清楚通信和工位的交接。
+
+```text
+StationApplication先保存Began
+    → StationHost转移Move
+    → 适配器建立OperationKey ↔ Ticket
+    → MC暂存参数、提交Control=1
+    → 查询同一Ticket的终态
+    → 返回对应StationReply
+    → 后续采图/检测/结果发布仍模拟
+    → 保存本地终态并消费
+    → 显式释放远端邮箱结果
+    → 显式模拟核对及本地放行
+```
+
+## 2. 两套身份怎样对应
+
+| 层 | 身份与载荷 | 用途 |
+| --- | --- | --- |
+| 工位 | Session/Cycle/Operation/Step，WorkOrder工件与配方 | 防跨周期、跨步骤回复 |
+| 邮箱 | BootId/RequestId，Operation/Target/Version | 同一启动代内请求去重与终态保留 |
+| 适配绑定 | 原StationCommand加原Ticket | 将网络观察还原到原工位操作 |
+
+适配器先读空闲邮箱，用HighWater+1创建Ticket，在尝试Submit之前保存绑定。提交后即使网络异常，也保留原Ticket；不会重新分配RequestId再试。
+
+同一工位Operation再次调用Execute时，只返回已有终态或null，不重复提交。相同Operation改工件或配方拒绝；旧周期、旧操作以及另一个Session也不能在当前端口上重新分配请求。
+
+本例把demo-ok-v1映射到Target=300、demo-ng-v1映射到Target=600，仅作参数锁存示例，没有毫米、脉冲或轴位置含义。Ticket.Version=1是邮箱协议版本，和字符串RecipeVersion不是同一个概念。
+
+工件字符串、配方字符串和工位GUID没有写入这个六字邮箱。远端只认识Ticket载荷，工位关联依靠本地绑定，不等于PLC已验证了同一实体工件。实际项目需要扩展已约定的PLC数据契约。
+
+## 3. Recorded不等于动作完成
+
+| 邮箱观察 | 工位适配行为 |
+| --- | --- |
+| 提交Known且Reply=Recorded | 继续只读等待原Ticket，不当作Move到位 |
+| 同Ticket Done | 返回Success=true的Move终态 |
+| 同Ticket Rejected/Faulted | 返回Success=false，义务已经终结 |
+| Unknown/WaitTimeout | 返回null，工位故障并保留Pending |
+| EpochChanged | 旧代历史不可用，保留未知，不创建新请求 |
+| NotRetained | 没有原保留结果，不能推断未执行或已成功 |
+| 载荷冲突/不匹配 | 不生成对应工位终态 |
+
+已知业务失败与通信未知不同。互锁拒绝不会启动模拟动作；执行故障则可能已经开始。两者都可形成已结的失败回复，但不能把一个断线、取消或本地等待超时伪装成这样的失败终态。
+
+正常路径的远端业务等待预算为1秒，MC请求期限800ms。它们与宿主默认Move阶段2秒分别负责不同范围；网络构造和在途I/O可能让实际等待超过业务预算，均不是硬实时保证。
+
+## 4. 提交回执丢失后只读做什么
+
+演示在模拟邮箱处理Control=1之后断开TCP，使客户端收不到写入回复。此时设备已经接收了请求，上位机观察Unknown。
+
+宿主锁存Faulted，保留Move的Pending；适配器保留BootId/RequestId。显式ReconcileAsync启动ObserveAsync，只查询原Ticket，不再写候选区，不提交Control=1，也不自动写Control=0。
+
+如果后来读到同Ticket的Done，宿主只DrainedLate：清除原待结义务，但保留最初Faulted终态，不继续采图和检测，更不会把原故障周期改成Completed。
+
+测试不仅检查提交计数仍为1，也检查Control仍保持1、发布Revision未变化，证明这个核对路径没有偷偷复位或释放邮箱。
+
+## 5. 本地保存和远端释放是两件事
+
+远端Done以后仍保留结果槽，避免下一个请求覆盖尚未处理的终态。工位本地Completed也不会自动释放它。
+
+本批显式顺序：
+
+1. SaveResultAsync落盘并消费本地原终态。
+2. 如果提交Control仍保持，显式ResetObservedControlAsync确认并写0归零。
+3. ReleaseRemoteAfterSavedAsync提交Control=2释放原Ticket的结果槽。
+4. 确认远端槽与控制通道已归零，再显式模拟核对和本地放行。
+
+释放方法校验同Session/Cycle/Order、无活跃Task/Pending，以及相同本地终态已保存并消费。会话门面还把远端ReadyForNextCycle作为下一次启动和本地放行的额外条件。
+
+Control=0仅复位邮箱通道，Control=2仅释放保留结果；它们都不是设备停止、故障清除、CPU复位或回零。
+
+## 6. 释放回执丢失也不能直接重发
+
+释放命令可能已经清掉远端结果，但写入回复丢失。只读Query原Ticket此时可能是NotRetained，这个事实本身不证明哪个操作清除了它。
+
+本例保存ReleaseAttempted，禁止再发第二次Control=2。ObserveReleaseAsync只读核对以下同一发布快照：
+
+- BootId仍为原代。
+- HighWater与ReplyId都对应原RequestId。
+- 状态Idle且Reply=Released。
+- 控制通道为0/0或仍保持2/2。
+
+这是本例单发布者教学协议中的释放证据。若仍为2/2，ReleaseObserved=true但ReadyForNextCycle仍false；之后显式写0并确认，才允许新周期。
+
+若证据缺失、重启或已被其他发布者覆盖，不推断释放成功，也不自动重试。这个有限例子没有通用的远端日志恢复算法；需要外部诊断及具体协议提供的可靠证据。
+
+## 7. 连接、关闭与资源所有权
+
+每次MC操作复用旧HandshakeClient：在后台构造McpX、执行一组请求，using释放该次连接；下一次查询会新建TCP连接。重连只改变连接实例，不能改变请求身份。
+
+StationApplication.OpenWithPortAsync接收端口所有权；正常关闭由宿主先等待实际Task和本地Pending结清，再Dispose端口。这个适配器同时拥有本机模拟监听器和扫描任务，Dispose会等待两者结束。
+
+关闭不会偷偷释放远端结果槽。测试中阶段超时后请求关闭，原网络Task继续运行；迟到Done只排空，没有采图、重发、Release或自动核对。
+
+本机模拟服务器随端口关闭而结束，不代表实际PLC会被上位机Dispose关闭或停止。真正适配PLC时应只释放客户端资源，保留并核对真实远端的执行状态。
+
+## 8. 持久化与现场边界
+
+本地Began/TerminalSaved/Reviewed仍会保存，但OperationKey到Ticket的绑定目前仅在内存里。程序重启后不能从结果JSON恢复原Ticket，更不能重新分配编号自动续跑；未核对的本地周期仍阻止新工件。
+
+此外，模拟BootId只在同一服务器对象Reboot时递增，重新创建服务器会从1开始。它没有可靠跨进程设备启动身份。正式项目还需持久化绑定、可信设备启动代、受控单发布者、PLC扫描锁存与多字发布验证。
+
+MC标准只定义通信访问；这里的D200/D240邮箱、Control和动作状态是自定义教学协议，不能直接写到任意真实PLC地址。
+
+## 9. 实测与下一步
+
+新增51项实际TCP回环/工位集成检查通过，原215项工位/WPF回归通过，共266项；旧邮箱55项另行回归通过。Release零警告零错误，正常NG、已知拒绝/故障、丢提交/释放回执、重启、结果缺失、关闭排空均已覆盖。
+
+演示中提交写入1次、模拟动作1次，断线后只读核对原请求；故障终态保持，保存后显式归零与释放1次，最终关闭成功。没有真实设备、实时性或安全验收。
+
+继续[C#工位通信端口、会话API与回环实践](/knowledge/industrial/host-computer/station/csharp-mc-station-port-and-loopback-session/)。继续[运动模块离线适配](/knowledge/industrial/host-computer/station/motion-task-reference-feedback-and-stop-boundaries/)，已复用单轴模型和动作观察器；跨进程通信绑定、真实PLC/机械和现场恢复仍单列待补。
+
+库依据[McpX 0.13.0](https://www.nuget.org/packages/McpX/0.13.0)，监听器基础见[Microsoft TcpListener](https://learn.microsoft.com/en-us/dotnet/api/system.net.sockets.tcplistener?view=net-10.0)。

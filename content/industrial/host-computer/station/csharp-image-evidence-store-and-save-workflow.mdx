@@ -1,0 +1,166 @@
+---
+id: industrial-csharp-station-evidence
+title: C#实践：原图导出、证据存储与保存工作流
+description: 使用VisionEvidence、EvidenceStore和EvidenceWorkflow保存本周期Mono8原图及ROI统计，掌握构造、保存、读取、释放和失败保留API。
+tags: [工业自动化, C#, 综合工位, 文件IO, 机器视觉]
+difficulty: intermediate
+status: published
+updated: "2026-10-29"
+order: 170
+prerequisite: [industrial-station-image-evidence]
+related: [industrial-csharp-station-integrated, industrial-csharp-station-vision-adapter]
+---
+
+## 1. 项目与运行
+
+新增examples/industrial-station-evidence/IndustrialStation.Evidence.csproj，net10.0，引用原组合工位项目，没有新增NuGet包或原生SDK。
+
+```powershell
+dotnet build examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --self-test
+dotnet run --project examples/industrial-station-evidence/IndustrialStation.Evidence.csproj -c Release --no-build -- --demo
+```
+
+程序只接受这两个入口；退出码成功0、异常1、用法错误2。Demo创建唯一系统临时目录，保留账本、两份PGM与JSON，并打印实际路径。模型定位与图像来自离线夹具，无设备地址参数。
+
+## 2. VisionEvidence：导出原周期
+
+```csharp
+VisionEvidence evidence = port.ExportEvidence(session.Snapshot);
+```
+
+组合端口把导出交给原视觉端口。视觉端口在自己的锁内检查：没有活动Task、关闭或已确认；工位Completed，没有Pending；工位Session/Cycle/Order、终态FrameId/Judgment与保留结果一致；Capture和成功InspectionResult仍存在。
+
+| 属性 | 类型 | 用途 |
+| --- | --- | --- |
+| Terminal | StationTerminal | 原工位终态；工作流后续检查本地对象未换 |
+| FrameId | Guid | 工位图像关联号 |
+| Frame | OwnedFrame | 原FrameStamp与不可变Mono8Image |
+| Inspection | InspectionResult | 原处理请求、处理会话、统计与配方 |
+| Recipe | VisionRecipe | 固定版本ROI、阈值、判定参数 |
+
+导出不会触发Move、Acquire、Inspect或Publish。OwnedFrame内的Mono8Image拥有私有数组，外部CopyPixels返回副本；导出对象共享不可变原图，无需Dispose。外部持有导出对象时，其图像仍可继续被引用；确认视觉收据只释放端口自己的Capture引用，不承诺立即GC。
+
+停止、超时、处理失败或尚未完成时抛InvalidOperationException，不生成成功证据。确认之后再次导出也拒绝，提醒调用方在释放前完成保存。
+
+## 3. EvidenceStore的对象生命周期
+
+```csharp
+using EvidenceStore store = new(evidenceDirectory);
+EvidenceReceipt receipt = store.Save(evidence);
+EvidenceReceipt reread = store.Read(
+    evidence.Terminal.Session, evidence.Terminal.Cycle);
+```
+
+| 对象或成员 | 行为 | 关键约束 |
+| --- | --- | --- |
+| new EvidenceStore(directory) | 创建目录，持有.writer.lock独占句柄 | .pending残留拒绝打开；专用可信本地目录 |
+| Save(VisionEvidence) | 编码PGM、校验身份、写入并读回 | 同周期同内容返回已有证据；有差异拒绝覆盖 |
+| Read(Guid,long) | 读取固定目录、校验文件和统计 | 无设备调用、无状态机推进 |
+| Dispose() | 关闭Store及写者锁 | 不删除证据，可重复调用；之后Save/Read拒绝 |
+| EvidenceReceipt.DirectoryPath | 已验证最终目录 | 本地定位信息，不是数据库事务凭证 |
+| EvidenceReceipt.Manifest | 解析并校验的记录 | 含Schema、格式、尺寸、SHA与完整结果 |
+
+Save/Read是同步文件IO，内部锁串行执行。本例用Task.Run放到工作流后台，避免把FileStream同步写入直接塞进WPF点击事件。没有逐帧无限Task.Run，也没有后台无界保存队列。
+
+## 4. P5编码和哈希
+
+```csharp
+byte[] pixels = evidence.Frame.Image.CopyPixels();
+byte[] header = Encoding.ASCII.GetBytes(
+    FormattableString.Invariant($"P5\n{width} {height}\n255\n"));
+byte[] pgm = new byte[header.Length + pixels.Length];
+header.CopyTo(pgm, 0);
+pixels.CopyTo(pgm, header.Length);
+string sha = Convert.ToHexString(SHA256.HashData(pgm));
+```
+
+width/height取原图尺寸。使用Invariant格式避免环境文化改变数字，换行固定LF。保存像素没有额外行填充，也不按文件扩展名推断数据类型；Encoding字段明确为Mono8-P5-255。
+
+读取时先验证尺寸与上限，再检查PGM完整头、精确长度和哈希。解码器只接受本项目写出的最小格式，像素中的换行、空格或0值仍是普通二进制数据，不会被按文本跳过。参考[PGM规范](https://netpbm.sourceforge.net/doc/pgm.html)。
+
+## 5. FileStream如何开启、写入、刷新与关闭
+
+```csharp
+using FileStream stream = new(path,
+    FileMode.CreateNew, FileAccess.Write, FileShare.None);
+stream.Write(bytes);
+stream.Flush(flushToDisk: true);
+```
+
+CreateNew在目标文件已存在时失败，避免覆盖；FileAccess.Write限制句柄用途；FileShare.None拒绝合作进程同时打开。using退出时关闭句柄，关闭后再发布整个目录。
+
+读取使用FileMode.Open、FileAccess.Read、FileShare.Read。先检查Length，再分配有上限的数组，ReadExactly取得预期字节，随后ReadByte必须返回-1以检查读时增长。保存前后的目录要求仍是可信单写者，不把这些检查宣称为对抗任意并发恶意修改。
+
+[Flush(true)官方说明](https://learn.microsoft.com/en-us/dotnet/api/system.io.filestream.flush?view=net-10.0)涉及中间文件缓冲刷新；目录发布与账本保存之间没有数据库事务。进程崩溃或突然断电后的整体一致性需要额外恢复设计与实际存储验证。
+
+## 6. 工作流：留图成功后才确认
+
+```csharp
+EvidenceWorkflow workflow = new(session, port, store);
+EvidenceReceipt receipt = await workflow.SaveThenAcknowledgeAsync();
+await session.SimulateReviewAndReleaseAsync(
+    PeerResultDisposition.AcceptedByPeer);
+```
+
+调用前沿用上一批的显式准备与Start/Pump，等工位Completed且实际Task结束。SaveThenAcknowledgeAsync内部顺序为：
+
+```csharp
+var evidence = port.ExportEvidence(session.Snapshot);
+EvidenceReceipt receipt = await Task.Run(() => store.Save(evidence));
+if (!ReferenceEquals(session.Snapshot.Host.Station.Terminal,
+    evidence.Terminal))
+    throw new InvalidOperationException("Local cycle changed during save");
+if (!await session.SaveResultAsync())
+    throw new InvalidOperationException("Terminal was not saved");
+if (!await session.AcknowledgeVisionAfterSavedAsync())
+    throw new InvalidOperationException("Original result was not acknowledged");
+```
+
+实际类用Interlocked设置即时拒绝的saving标志，在finally清除，阻止同一工作流实例重入。它不是整个应用的全局操作锁：同一所有者必须顺序调用会话，不能创建多个工作流并同时操作底层会话。
+
+如果证据已经发布但终态保存失败，原视觉收据尚未确认。仍在原进程、同一周期的情况下，可检查错误后重试：Store先验证已有文件并比较完整内容。它不会重拍、重算或覆盖已有不同内容。
+
+当Store在写文件或发布阶段失败，会进入failed状态并保留.pending/最终材料，后续Save拒绝。示例验证显式选择新目的目录后仍能保存原帧；它不自动修复旧目录。
+
+## 7. JSON与测量校验
+
+JSON使用字符串枚举、拒绝未知字段，要求构造参数完整；反序列化之前遍历对象检查重复属性名，避免同一字段出现两次。最大JSON为64KiB，空文件拒绝。
+
+持久化模型包含原InspectionResult与VisionRecipe。读取时从固定配方表核对版本和全部参数，比较FrameStamp、工件、触发与处理身份；随后：
+
+```csharp
+PixelStatistics actual = image.Measure(
+    manifest.Recipe.Region, manifest.Recipe.Threshold);
+if (manifest.Inspection.Measurement != actual)
+    throw new InvalidDataException("Pixels/statistics/verdict mismatch");
+```
+
+验证包含ROI、像素数、最小值、最大值、均值和亮点/黑点/白点数，不只比较Mean。判定仍按该版本配方的MinimumMean和MinimumBrightPixels计算。这里是确定性示例统计，若换成真实模型或非确定性算法，不能简单把“重跑数值完全相同”当所有算法的通用契约。
+
+## 8. 重开与账本查询
+
+```csharp
+using EvidenceStore reopened = new(evidenceDirectory);
+EvidenceReceipt receipt = reopened.Read(terminal.Session, terminal.Cycle);
+if (receipt.Manifest.Terminal != terminal)
+    throw new InvalidDataException("Ledger/evidence mismatch");
+```
+
+terminal来自已读取的原结果账本。Read完全不依赖运动、相机、原处理器或原Task；读取成功也不会调用Review或解除启动阻止。
+
+本批保留两个独立存储：账本保存工位事件，证据目录保存原图/明细。没有把图片塞进原账本，也没有改动老项目默认启动路径。后续批量对账应把缺证据、有证据无终态、坏文件和.pending分别列出。
+
+## 9. 验证与使用边界
+
+测试包含两周期真实夹具统计220/OK与75/NG、非法路径字符工件、同身份重试、不同元数据冲突、写盘失败保留、确认前后导出、停止无图、重开读取和损坏注入。保存失败后帧数/测量次数保持1，证明没有通过重拍掩盖保存问题。
+
+运行--demo后可查看PGM和manifest.json；程序保留打印出的目录，不自动删除。当前无新界面、设备网络、原生SDK或实际曝光。故障周期的无图说明、迟到证据分类和跨文件重启对账留给下一批。
+
+
+本批实际验证：新增52项证据检查、原组合49项与视觉47项回归通过；Release零警告零错误，Demo两周期保存原图/明细后关闭。
+
+
+## 后续：异常说明与只读对账
+
+第十批已补[异常周期与重启对账](/knowledge/industrial/host-computer/station/abnormal-cycle-diagnostics-and-restart-reconciliation/)及 [C#诊断记录与只读核对](/knowledge/industrial/host-computer/station/csharp-abnormal-evidence-and-readonly-reconciliation/)。正常留图入口保留；异常JSON明确不含像素，不用迟到数据改写原终态。

@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "dependencies": {
+    "net10.0": {
+      "McpX": {
+        "type": "Direct",
+        "requested": "[0.13.0, )",
+        "resolved": "0.13.0",
+        "contentHash": "2aYkvCZOaQE58oxcdPkkWW5Buyg1rRGGm3/73luZ+U5MPerwN5jOFHaTIHVvvKMsIcIULmVcs7+fk9inTXIS7Q=="
+      },
+      "industrialstation": {
+        "type": "Project"
+      }
+    }
+  }
+}
