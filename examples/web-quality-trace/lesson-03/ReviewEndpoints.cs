@@ -46,7 +46,8 @@ static class ReviewEndpoints
 
     public static void MapReviewEndpoints(this WebApplication app)
     {
-        var accounts = new Dictionary<string, (byte[] Secret, string Role)>(StringComparer.Ordinal)
+        bool managed = app.Configuration.GetValue<bool>("Management:Enabled");
+        var accounts = managed ? null : new Dictionary<string, (byte[] Secret, string Role)>(StringComparer.Ordinal)
         {
             ["alice"] = (ReadSecret(app.Configuration, "Alice"), Reviewer),
             ["bob"] = (ReadSecret(app.Configuration, "Bob"), Reviewer),
@@ -75,24 +76,39 @@ static class ReviewEndpoints
         api.MapGet("/session", (HttpContext http, IAntiforgery antiforgery) => TypedResults.Ok(new
         {
             user = http.User.Identity?.Name,
-            canReview = http.User.IsInRole(Reviewer),
+            canReview = http.User.IsInRole(Reviewer) || http.User.IsInRole("admin"),
             csrf = antiforgery.GetAndStoreTokens(http).RequestToken
         })).WithName("GetSession").ProducesProblem(403).ProducesProblem(500);
 
-        api.MapPost("/session/login", async Task<IResult> (Login input, HttpContext http) =>
+        var login = api.MapPost("/session/login", async Task<IResult> (Login input, HttpContext http) =>
         {
-            if (input.User is null || input.Password is null ||
-                !accounts.TryGetValue(input.User, out var account) ||
-                !CryptographicOperations.FixedTimeEquals(Hash(input.Password), account.Secret))
-                return Results.Unauthorized();
-
-            var identity = new ClaimsIdentity(
-                [new(ClaimTypes.NameIdentifier, input.User), new(ClaimTypes.Name, input.User),
-                 new(ClaimTypes.Role, account.Role)], CookieAuthenticationDefaults.AuthenticationScheme);
+            string role;
+            long? accountVersion = null;
+            if (managed)
+            {
+                var db = http.RequestServices.GetRequiredService<ManagementDb>();
+                var account = await ManagementEndpoints.AuthenticateAsync(db, input.User, input.Password);
+                if (account is null) return Results.Unauthorized();
+                role = account.Role; accountVersion = account.Version;
+            }
+            else
+            {
+                if (input.User is null || input.Password is null ||
+                    !accounts!.TryGetValue(input.User, out var account) ||
+                    !CryptographicOperations.FixedTimeEquals(Hash(input.Password), account.Secret))
+                    return Results.Unauthorized();
+                role = account.Role;
+            }
+            var claims = new List<Claim> {
+                new(ClaimTypes.NameIdentifier, input.User!), new(ClaimTypes.Name, input.User!), new(ClaimTypes.Role, role)
+            };
+            if (accountVersion is { } version) claims.Add(new("accountVersion", version.ToString(System.Globalization.CultureInfo.InvariantCulture)));
+            var identity = new ClaimsIdentity(claims, CookieAuthenticationDefaults.AuthenticationScheme);
             await http.SignInAsync(new ClaimsPrincipal(identity));
             return Results.NoContent();
         }).WithName("Login").Produces(204).ProducesProblem(400).ProducesProblem(401)
           .ProducesProblem(403).ProducesProblem(500);
+        if (managed) login.RequireRateLimiting("management-login");
 
         api.MapPost("/session/logout", async (HttpContext http) =>
         {
@@ -136,7 +152,7 @@ static class ReviewEndpoints
             }
 
             return Results.Created($"/api/inspections/{id}/review", review);
-        }).RequireAuthorization(policy => policy.RequireRole(Reviewer)).WithName("SubmitReview")
+        }).RequireAuthorization(policy => policy.RequireRole(Reviewer, "admin")).WithName("SubmitReview")
           .WithDescription("Requires reviewer role. Decision is confirmed-ng or false-reject; trimmed note length is 1..500. Only NG cycles accept one review. Existing review or OK result returns 409.")
           .Produces<InspectionReview>(201).ProducesProblem(400).ProducesProblem(401)
           .ProducesProblem(403).ProducesProblem(404).ProducesProblem(409).ProducesProblem(500);

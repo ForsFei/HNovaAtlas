@@ -15,7 +15,10 @@
     "build:live": "tsc --noEmit && vite build --mode live",
     "build:review": "tsc --noEmit && vite build --mode review",
     "build:storage": "tsc --noEmit && vite build --mode storage",
-    "build": "tsc --noEmit && vite build"
+    "build": "tsc --noEmit && vite build",
+    "dev:management": "vite --mode management",
+    "build:management": "tsc --noEmit && vite build --mode management",
+    "test:e2e:management": "npm run build:management && node verify-management-browser.mjs"
   },
   "dependencies": {
     "@microsoft/signalr": "10.0.11",

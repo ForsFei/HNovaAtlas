@@ -1,0 +1,99 @@
+---
+id: web-quality-trace-station-management
+title: "第 52 课 · 工位档案管理与并发编辑"
+description: 在追溯台中实现工位创建、编辑和停用，串起显式数据库升级、字段校验、唯一约束、乐观并发、管理表单与浏览器验收。
+tags: [Web, ASP.NET Core, React, EF Core, CRUD]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 520
+prerequisite: [web-quality-trace-stage-one]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 第一阶段交付](/knowledge/web/full-stack/stage-one-handover/)
+
+前五十课主要围绕检测记录。现在加入另一种数据：由管理员维护的工位档案。本课完成创建、编辑、停用、并发冲突和页面操作；下一课展开这里使用的持久化账号与授权。
+
+## 1. 档案与检测证据各自表示什么
+
+检测记录描述已经发生的周期，工位档案描述可维护的名称与管理状态。修改工位名称不会改写历史周期，停用也不会删除检测、复核或原始图片。
+
+本课的停用是档案状态，不会向设备发送停止指令，也没有自动禁止所有离线导入。设备调度与现场许可仍属于工业工位系统，不能用后台复选框替代。
+
+## 2. 启用新能力并显式初始化
+
+后端新增 `ManagementDb.cs` 与 `ManagementEndpoints.cs`，默认不启用。开发环境先设置：
+
+```powershell
+$env:Management__Enabled = 'true'
+$env:TraceDb = 'F:\TraceData\trace.db'
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Management:Migrate true
+```
+
+替换为自己的绝对数据路径。升级在同一 SQLite 文件中增加 StationProfiles、TraceAccounts、ManagementAudit 和 ManagementSchema，原有检测表保持不变。
+
+管理结构版本保存在 ManagementSchema，与第 23 课索引升级使用的 SQLite user_version 独立。升级在事务中创建表并写入版本 1，重跑不重复建表，未知版本拒绝处理；普通服务启动只检查结构，不自动升级。
+
+管理界面需要一个管理员。按示例 README 完成仅允许空账号表的 Bootstrap，启动 API，再运行 `npm run dev:management --prefix examples/web-quality-trace/lesson-02`。不要使用旧演示密码登录这个模式。
+
+## 3. 模型与接口
+
+| 字段 | 规则 |
+| --- | --- |
+| Code | 主键，1～64位小写字母、数字、连字符，首位须为字母或数字；创建后不可改 |
+| Name | 去掉两端空白后1～100字符，不包含控制字符 |
+| Enabled | 新建默认为启用，编辑时可以停用 |
+| Version | 从1开始，每次成功编辑增加1 |
+
+```http
+POST /api/management/stations
+Content-Type: application/json
+X-CSRF-Token: 从会话接口取得的令牌
+
+{"code":"station-c","name":"装配工位","enabled":true,"version":1}
+```
+
+读取为 GET `/api/management/stations`，修改为 PUT `/api/management/stations/station-c`。编码重复返回409，非法输入返回400，记录不存在返回404。创建与修改需要管理员角色。
+
+`/api/management/station-codes` 合并档案编码与已有检测记录的工位编码，用于管理模式下的追溯筛选和统计选择。这样旧证据的工位即使尚未建档，也仍然可查。
+
+## 4. 唯一性由数据库裁决
+
+即使页面先查重，两个管理员仍可能同时创建同一编码。StationProfiles 的主键约束是最终依据。服务捕获对应 SQLite 约束异常并返回409，而不是覆盖已有档案。
+
+档案变更与审计记录在同一次 SaveChanges 中保存。写入失败时不会留下“工位没创建、审计却说已创建”的半份结果。
+
+## 5. 用版本处理双人编辑
+
+实体的 Version 标记为并发令牌。服务先核对请求携带的版本，然后修改属性并增加版本；保存时 EF Core 还会用原版本参与更新条件，处理读取后再次被别人修改的情况。 [EF Core 乐观并发](https://learn.microsoft.com/en-us/ef/core/saving/concurrency)
+
+```json
+{"code":"station-c","name":"装配工位二号","enabled":false,"version":1}
+```
+
+若数据库已经是版本2，这份修改会返回409。前端保留名称草稿，显示请求编号与冲突信息，不会自动取得新版本再覆盖。
+
+用户可选择“放弃草稿并重读工位”，明确加载最新档案；核对后再编辑保存。这个操作确实会舍弃当前草稿，因此按钮名称直接说明后果。
+
+## 6. 前端怎样组成闭环
+
+`ManagementConsole.tsx` 在 management 构建模式中提供档案表和编辑表单，复用原有会话、CSRF 与错误响应。编码在编辑时禁用，名称和状态仍可修改；取消编辑回到新建表单。
+
+服务端仍独立检查编码是否与路由一致。禁用输入只是交互限制，直接发 HTTP 请求也不能改主键。
+
+管理模式追溯页通过 `ManagedStationFilter.tsx` 读取真实工位目录，替代早期固定两个工位的选项；停用工位依然保留，用于查询历史。
+
+## 7. 验收
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify-management.mjs
+npm run test:e2e:management --prefix examples/web-quality-trace/lesson-02
+```
+
+接口验收覆盖升级重跑、字段校验、重复编码、旧版本、停用和重启。浏览器使用两个独立登录上下文编辑同一工位：一个先保存，另一个收到409、保留草稿，再明确重读并保存。
+
+跟做时重点核对“页面看到的版本”和“数据库接受的版本”，而不只确认按钮能点。复习：为什么编辑名称时不允许顺便改主键？为什么停用不能删除历史证据？为什么页面查重不能替代数据库唯一约束？
+
+
+**下一课** → [53 · 持久化用户与角色](/knowledge/web/full-stack/persistent-users-and-role-revocation/)

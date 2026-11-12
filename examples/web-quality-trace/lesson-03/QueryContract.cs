@@ -10,6 +10,7 @@ static class QueryContract
         {
             options.ShouldInclude = description => (description.HttpMethod == "GET" &&
                 description.RelativePath is "api/inspections" or "api/inspections/{id}" or "api/inspections/{id}/image" or "api/inspections/{id}/evidence" or "api/inspection-events" or "api/inspection-pages") ||
+                (description.RelativePath?.StartsWith("api/management/", StringComparison.Ordinal) ?? false) ||
                 description.RelativePath is "api/session" or "api/session/login" or "api/session/logout" or "api/inspections/{id}/review";
             options.AddDocumentTransformer((document, context, ct) =>
             {
@@ -159,7 +160,7 @@ static class QueryContract
                         [new OpenApiSecuritySchemeReference("localSession", context.Document)] = []
                     });
                 }
-                if (context.Description.HttpMethod == "POST")
+                if (context.Description.HttpMethod is "POST" or "PUT" or "PATCH" or "DELETE")
                 {
                     operation.Parameters ??= [];
                     operation.Parameters.Add(new OpenApiParameter

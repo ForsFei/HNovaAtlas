@@ -1,0 +1,5 @@
+# Replace quality.example.com with your real DNS name before running Caddy.
+# Keep the backend bound to loopback; never publish its HTTP port externally.
+quality.example.com {
+    reverse_proxy 127.0.0.1:43111
+}

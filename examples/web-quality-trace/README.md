@@ -22,6 +22,7 @@ npm run verify:trace
 ```powershell
 npm run verify:trace -- --api
 npm run verify:trace -- --browser
+npm run verify:trace -- --deployment
 ```
 
 ## 本地运行
@@ -48,6 +49,39 @@ npm run dev:storage --prefix examples/web-quality-trace/lesson-02
 打开 http://127.0.0.1:43112 。这是教程示例的端口；知识库网站继续使用 43110。
 
 复核模式需设置 Review__Enabled=true，以及 Review__Alice、Review__Bob、Review__Viewer 三个至少 12 字符的本地练习密码，再使用前端 dev:review。实时模式还需 Live__Enabled=true，前端使用 dev:live。不要将真实账号密码写进 Git。
+
+## 管理模式（第 52～56 课）
+
+管理模式启用持久化账号，替代前三个演示密码，并要求所有 `/api` 查询登录（会话入口除外）。先指定一个数据文件，再执行显式初始化：
+
+```powershell
+$env:Management__Enabled = 'true'
+$env:TraceDb = 'F:\TraceData\trace.db' # 替换为自己的绝对数据路径
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Management:Migrate true
+$env:Management__User = 'admin'
+$env:Management__Password = Read-Host -MaskInput '设置至少12字符的初始管理员密码'
+dotnet run --no-build --project examples/web-quality-trace/lesson-03 -- --Management:Bootstrap true
+Remove-Item Env:Management__Password
+dotnet run --no-build --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+开发时另开终端运行 `npm run dev:management --prefix examples/web-quality-trace/lesson-02`，打开 43112。生产发布默认 Secure Cookie，需通过 HTTPS 入口访问，不适用这个 HTTP 开发启动方式。
+
+管理表版本独立保存在 ManagementSchema；第23课的索引升级仍使用 SQLite user_version。管理升级可安全重跑，未知版本拒绝启动。Bootstrap 只允许账号表为空时运行，不是重置管理员密码的后门。
+
+验收入口：
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify-management.mjs
+npm run test:e2e:management --prefix examples/web-quality-trace/lesson-02
+```
+
+工位档案是管理资料，停用不会删除历史检测，也不会向 PLC 或设备发送指令。工位编码不可编辑，编辑版本不匹配返回409。账号更新使旧 Cookie 失效；查询员只读、复核员可提交复核、管理员可维护配置与账号。
+
+## 独立发布和恢复
+
+详见 [部署运行簿](deployment/README.md)。发布必须使用新的目录，程序、数据和 Data Protection 密钥分开保管。`--deployment` 会在临时目录发布并执行 HTTPS、备份及升级回退演练，不安装系统服务、不改证书存储、不改真实数据。
 
 ## 课程检查点
 

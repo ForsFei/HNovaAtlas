@@ -1,0 +1,94 @@
+---
+id: web-quality-trace-persistent-users
+title: "第 53 课 · 持久化账号、角色与会话撤销"
+description: 将本地演示账号演进为持久化用户，使用密码哈希、Cookie、CSRF、角色授权和账号版本撤销旧会话，并实现管理员维护页面。
+tags: [Web, ASP.NET Core, 认证, 授权, 用户管理]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 530
+prerequisite: [web-quality-trace-station-management]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 工位档案](/knowledge/web/full-stack/station-profile-management/)
+
+前面的 alice、bob、viewer 来自环境变量，适合本地练习。本课在 Management:Enabled 开启时改用 TraceAccounts，实现管理员建用户、修改角色、停用和改密，并让旧会话及时失效。关闭该开关后，旧课程仍使用原演示模型。
+
+## 1. 三个角色的权限
+
+| 角色 | 查询、下载和统计 | NG复核 | 工位与用户维护、审计 |
+| --- | --- | --- | --- |
+| viewer | 允许 | 拒绝 | 拒绝 |
+| reviewer | 允许 | 允许 | 拒绝 |
+| admin | 允许 | 允许 | 允许 |
+
+管理模式要求 `/api` 下的数据入口登录，会话入口除外。静态页面可加载，但不代表取得数据权限。管理接口和会话写入仍限制为 loopback 请求，生产环境通过同机HTTPS代理进入。
+
+前端隐藏不允许使用的编辑区，后端 RequireAuthorization/RequireRole 才是授权依据。接口验收直接绕过页面发请求，验证查询员不能创建工位、复核员不能列出账号。
+
+## 2. 首个管理员如何产生
+
+升级后账号表为空，使用本机运维命令引导：
+
+```powershell
+$env:Management__User = 'admin'
+$env:Management__Password = Read-Host -MaskInput '设置12～256字符的密码'
+dotnet run --no-build --project examples/web-quality-trace/lesson-03 -- --Management:Bootstrap true
+Remove-Item Env:Management__Password
+```
+
+继续保留上一课的 Management__Enabled 与 TraceDb 环境配置。引导操作在事务中检查空表并创建管理员，重复执行会拒绝，不会重置现有密码。
+
+CLI 是本机运维入口，访问数据库和环境变量的系统权限必须受控。网站用户不能调用它绕过角色授权。
+
+## 3. 保存密码哈希，不保存密码
+
+TraceAccounts 保存用户名、PasswordHash、角色、启用状态和版本。创建与改密使用框架的 `PasswordHasher<TraceAccount>`；登录调用 VerifyHashedPassword。 [Identity 密码哈希配置](https://learn.microsoft.com/en-us/aspnet/core/security/authentication/identity-configuration?view=aspnetcore-10.0)
+
+密码要求12～256字符且不包含控制字符。HashPassword 自带格式和盐，不能把哈希当成可逆密文，也不要自行改成普通 SHA256。
+
+接口只返回 AccountSummary，包含用户名、角色、状态和版本，不返回 PasswordHash。前端新密码框在成功或取消后清空；编辑时留空表示不改密码。
+
+## 4. Cookie 为什么需要账号版本
+
+签发登录 Cookie 时，把账号 Version 写入 `accountVersion` 声明。每次验证 Cookie，OnValidatePrincipal 会读取当前账号，检查启用状态和版本。账号不存在、已停用或版本不同，就拒绝主体并登出。 [Cookie 主体验证](https://learn.microsoft.com/en-us/aspnet/core/security/authentication/cookie?view=aspnetcore-10.0)
+
+```text
+登录：账号版本1 → Cookie保存版本1
+管理员停用或改角色：账号版本2
+旧Cookie再次访问：1 ≠ 2 → 拒绝，返回未登录状态
+```
+
+这避免了“页面已经停用，旧Cookie却能继续使用一小时”的问题。账号更新后即使仍启用，也需要重新登录获取新角色；改自己的账号同样会撤销当前会话。
+
+每次请求查询账号会增加数据库读取成本，这是本示例选择的撤销及时性。以后优化缓存时，必须重新说明撤销可能延迟多久。
+
+## 5. 写入仍需要 CSRF 和并发检查
+
+登录前读取 GET `/api/session` 获取令牌与匹配的Cookie，登录后再次获取令牌。创建和编辑工位、账号均检查 X-CSRF-Token。
+
+管理账号使用与工位相同的版本保护。更新操作在事务中检查至少保留一名启用的管理员；服务不会提供删除最后管理员的快捷入口。
+
+管理登录使用进程级每分钟20次的固定窗口额度。这是本机教学入口的有限节流，不是完整的公网账号防护体系；部署在公共环境还应结合组织既有身份系统和访问策略。
+
+## 6. 接口与界面
+
+| 接口 | 用途 |
+| --- | --- |
+| GET `/api/management/me` | 当前账号和角色 |
+| GET/POST `/api/management/accounts` | 管理员列出、创建账号 |
+| PUT `/api/management/accounts/{user}` | 修改角色、启用状态或密码 |
+| GET `/api/management/audit` | 最近100条管理审计 |
+
+用户名不可改，编码规则同工位；审计记录操作者、动作、目标与UTC时间，不记录输入密码。普通API错误保留请求编号，便于关联日志。
+
+## 7. 验证权限与撤销
+
+`verify-management.mjs` 依次以管理员、查询员和复核员发真实HTTP请求；检查未登录401、角色不足403、CSRF拒绝、旧版本409、最后管理员保护、哈希存储、重启持久化和复核写入。
+
+浏览器验收中，管理员停用另一个已登录查询员，查询员刷新后回到登录界面。查询员页面中也没有工位保存和账号管理控件。
+
+复习：只在登录时读一次角色会遗漏什么？改角色后为什么旧Cookie不能继续使用？为什么给查询员隐藏按钮仍不足以保护写入接口？
+
+
+**下一课** → [54 · 质量统计与明细](/knowledge/web/full-stack/quality-statistics-and-detail-scope/)

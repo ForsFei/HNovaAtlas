@@ -66,7 +66,12 @@ flowchart TD
   AW["49 · 每页条数 / 参数校验与浏览恢复"]
   AX["50 · 清除筛选 / URL、表单草稿与恢复"]
   AY["51 · 阶段交付 / 环境、启动与完整验收"]
-  A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L --> M --> N --> O --> P --> Q --> R --> S --> T --> U --> V --> W --> X --> Y --> Z --> AA --> AB --> AC --> AD --> AE --> AF --> AG --> AH --> AI --> AJ --> AK --> AL --> AM --> AN --> AO --> AP --> AQ --> AR --> AS --> AT --> AU --> AV --> AW --> AX --> AY
+  AZ["52 · 工位档案 / 创建、编辑与停用"]
+  BA["53 · 用户权限 / 哈希、角色与会话撤销"]
+  BB["54 · 质量统计 / UTC口径与明细核对"]
+  BC["55 · 正式发布 / 数据分离与HTTPS"]
+  BD["56 · 恢复验收 / 快照、升级与回退"]
+  A --> B --> C --> D --> E --> F --> G --> H --> I --> J --> K --> L --> M --> N --> O --> P --> Q --> R --> S --> T --> U --> V --> W --> X --> Y --> Z --> AA --> AB --> AC --> AD --> AE --> AF --> AG --> AH --> AI --> AJ --> AK --> AL --> AM --> AN --> AO --> AP --> AQ --> AR --> AS --> AT --> AU --> AV --> AW --> AX --> AY --> AZ --> BA --> BB --> BC --> BD
 ```
 
 | 课次 | 接着上一课做什么 | 完成标志 |
@@ -122,6 +127,11 @@ flowchart TD
 | [49 · 选择每页条数](/knowledge/web/full-stack/selectable-page-size/) | 在两种分页模式中保存列表批次大小 | 修改后重新浏览，刷新和历史恢复一致 |
 | [50 · 清除筛选与表单草稿](/knowledge/web/full-stack/clear-filters-and-form-drafts/) | 清除查询条件并保留分页偏好 | URL、输入、校验错误与历史恢复一致 |
 | [51 · 第一阶段交付](/knowledge/web/full-stack/stage-one-handover/) | 集中运行说明，建立后续业务阶段的基线 | 能按说明安装、启动和完整验收 |
+| [52 · 工位档案管理](/knowledge/web/full-stack/station-profile-management/) | 工位创建、编辑、停用和版本冲突 | 接口、浏览器或发布演练可重复验证 |
+| [53 · 持久化用户与角色](/knowledge/web/full-stack/persistent-users-and-role-revocation/) | 账号哈希、权限与旧会话撤销 | 接口、浏览器或发布演练可重复验证 |
+| [54 · 质量统计与明细](/knowledge/web/full-stack/quality-statistics-and-detail-scope/) | 按工位和UTC导入范围核对统计 | 接口、浏览器或发布演练可重复验证 |
+| [55 · 独立发布与HTTPS](/knowledge/web/full-stack/publish-management-and-https/) | 程序数据分离、生产配置和运行簿 | 接口、浏览器或发布演练可重复验证 |
+| [56 · 备份升级与交付](/knowledge/web/full-stack/managed-backup-upgrade-and-delivery/) | 快照、未知版本拒绝与回退演练 | 接口、浏览器或发布演练可重复验证 |
 
 每一课都交付一个能运行的检查点，后续课从上一课的结果开始。跟做时可以先跑通示例，再按教程逐步改动。复习时可以用每课末尾的问题检验自己能不能解释代码里的选择。
 

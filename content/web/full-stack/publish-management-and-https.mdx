@@ -1,0 +1,98 @@
+---
+id: web-quality-trace-managed-deployment
+title: "第 55 课 · 独立发布、HTTPS 与运行配置"
+description: 把管理模式发布为程序和数据分离的版本目录，使用生产配置、持久密钥与HTTPS代理入口，并建立可复查的部署运行簿。
+tags: [Web, 部署, ASP.NET Core, HTTPS, PowerShell]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 550
+prerequisite: [web-quality-trace-statistics]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 质量统计](/knowledge/web/full-stack/quality-statistics-and-detail-scope/)
+
+前端、管理API和统计已经可以一起运行。本课把它们整理成一个独立发布目录，明确程序、数据库、密钥和HTTPS入口的关系。具体脚本与完整步骤放在 `examples/web-quality-trace/deployment/README.md`。
+
+## 1. 程序和可变数据分开
+
+```text
+TraceReleases/v1/       .NET程序、wwwroot、配置、脚本、哈希清单
+TraceData/trace.db      检测、图片、复核、账号、工位和审计
+TraceData/keys/         Data Protection密钥
+TraceBackups/           独立快照与受控密钥备份
+```
+
+换程序版本不应顺便覆盖数据库；清理旧发布目录不应删除密钥。发布脚本拒绝程序和数据目录互相包含，也拒绝覆盖已有发布目录。
+
+## 2. 一次可核对的发布
+
+在仓库根目录运行，替换为自己准备的新目录：
+
+```powershell
+pwsh -File examples/web-quality-trace/deployment/Publish-Trace.ps1 `
+  -Destination F:\TraceReleases\v1 -DataDirectory F:\TraceData
+```
+
+脚本先构建 management 前端，再执行 .NET Release 框架依赖发布，将静态文件放入 wwwroot，生成生产配置、运行脚本和 release-manifest.json。
+
+失败时目录保留 RELEASE-INCOMPLETE 标记，运行脚本拒绝启动。这里不会递归删除失败现场或覆盖旧版本，修复后应选择新的发布目录。
+
+清单保存文件相对路径与SHA256。运行脚本检查路径仍在发布目录之内，再核对文件哈希；它能发现意外修改，不是证明发布者身份的数字签名。
+
+## 3. 初始化与日常运行分开
+
+```powershell
+pwsh -File F:\TraceReleases\v1\Run-Trace.ps1 -Mode Migrate
+pwsh -File F:\TraceReleases\v1\Run-Trace.ps1 -Mode Bootstrap
+pwsh -File F:\TraceReleases\v1\Run-Trace.ps1 -Mode Serve -Port 43111
+```
+
+Bootstrap 前按运行簿在可信终端设置 Management__User 和 Management__Password，用完移除密码环境变量。生产配置不保存初始密码。
+
+Migrate 显式升级管理结构，Bootstrap 只负责空账号表，Serve 才启动HTTP监听。运行脚本传递固定的数据路径和内容根目录，不依赖调用者正好位于程序目录。
+
+发布目录配置进入了清单，因此需要变更路径等发布配置时，应重新发布，不要编辑清单绕过检查。
+
+## 4. HTTPS入口与loopback后端
+
+后端默认绑定 `http://127.0.0.1:43111`。生产访问使用同机反向代理终止TLS，再转发给它。发布包附带 Caddyfile.example：
+
+```text
+quality.example.com {
+    reverse_proxy 127.0.0.1:43111
+}
+```
+
+模板主机名必须替换为真实DNS地址，目标环境还需要确认DNS指向、端口和证书签发条件。Caddy支持按域名配置自动HTTPS。 [Caddy HTTPS说明](https://caddyserver.com/docs/quick-starts/https)
+
+生产会话Cookie和CSRF Cookie均配置Secure。浏览器必须从HTTPS入口登录，直接打开后端HTTP地址不能作为正常生产登录方式。
+
+当前管理与会话入口检查请求来自loopback；同机代理符合这个边界。不要未经调整就把代理搬到另一台机器并开放后端公网端口。
+
+应用仅从受信任的本机代理读取 X-Forwarded-Proto，让后端知道外部请求经过HTTPS。这里没有启用 X-Forwarded-For，连接对端仍是代理的loopback地址；否则原来的本机入口限制需要一起重新设计。测试代理也显式转发协议头，避免只测到Cookie属性却遗漏CSRF对安全请求的要求。
+
+## 5. 密钥也是持久化数据
+
+指定 Management:KeyDirectory 后，应用使用固定应用名称保存 Data Protection 密钥。换发布目录或重启后，现有Cookie才能继续按相同密钥验证。 [ASP.NET Core 密钥持久化](https://learn.microsoft.com/en-us/aspnet/core/security/data-protection/configuration/overview?view=aspnetcore-10.0)
+
+这个示例没有给显式文件系统密钥另配加密器，不能把目录当作普通静态文件发布。用服务账号和目录ACL限制访问，并将数据库与密钥一起纳入受控备份。跨机器迁移还需要验证身份、权限和目标密钥保护方案。
+
+## 6. 服务运行和健康探测
+
+Windows可使用已有服务管理器或计划任务，在系统启动后以固定的低权限账号执行运行脚本。程序目录只读，数据目录允许该账号写入；记录脚本退出码和进程日志。
+
+`/health/live` 表示进程存活，`/health/ready` 同时核查追溯数据与管理结构。就绪503时不应向这个实例分配新流量。任务自动重启不能代替故障分析，尤其不能不断重试未知结构升级。
+
+本轮没有替目标机器安装服务、修改系统信任或申请真实域名证书。交付的是发布工具、配置模板和可运行演练；目标机启动、网络和持续运行需要按运行簿现场核对。
+
+## 7. 实际验证了什么
+
+独立临时目录中的演练会真实执行发布、初始化、启动和HTTPS代理请求。测试证书只保存在该临时目录，不写入系统证书存储；Node客户端显式信任它，没有关闭全局TLS验证。
+
+这验证了静态页面、就绪入口、登录和Secure会话的完整链路，代理实现用于本机测试，并不是目标机Caddy安装验收。下一课继续验证在线备份与升级回退。
+
+复习：为什么不把数据库放进发布目录？为什么Cookie密钥丢失后数据库仍在却可能需要重新登录？为什么HTTP本机监听成功不能证明浏览器的HTTPS登录已经可用？
+
+
+**下一课** → [56 · 备份升级与交付](/knowledge/web/full-stack/managed-backup-upgrade-and-delivery/)

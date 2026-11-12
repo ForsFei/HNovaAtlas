@@ -17,3 +17,10 @@ dd { margin: 0; overflow-wrap: anywhere; }
 .time-range fieldset { display: flex; flex-wrap: wrap; gap: 0.75rem; margin-block: 1rem; }
 .time-range label { display: grid; gap: 0.25rem; }
 .time-range input { font: inherit; max-width: 100%; }
+
+.management form:not(.time-range) { display: grid; gap: 0.75rem; justify-items: start; margin-block: 1rem; }
+.management form:not(.time-range) label { display: grid; gap: 0.25rem; }
+.management input { font: inherit; max-width: 100%; box-sizing: border-box; }
+.management section { overflow-x: auto; }
+.management > button { margin: 0.25rem; }
+.management meter { width: 5rem; margin-right: 0.5rem; }

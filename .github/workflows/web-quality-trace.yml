@@ -65,6 +65,12 @@ jobs:
           New-Item -ItemType Directory -Path .local/ci-logs -Force | Out-Null
           npm run verify:trace -- --browser 2>&1 | Tee-Object -FilePath .local/ci-logs/browser.log -ErrorAction Stop
           exit $LASTEXITCODE
+      - name: Published release and recovery drill
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .local/ci-logs -Force | Out-Null
+          npm run verify:trace -- --deployment 2>&1 | Tee-Object -FilePath .local/ci-logs/deployment.log -ErrorAction Stop
+          exit $LASTEXITCODE
       - name: Upload failed acceptance logs
         if: failure()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7

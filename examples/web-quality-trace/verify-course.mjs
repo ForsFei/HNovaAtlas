@@ -3,10 +3,10 @@ import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { performance } from "node:perf_hooks";
 
-const modes = new Set(["--all", "--api", "--browser"]);
+const modes = new Set(["--all", "--api", "--browser", "--deployment"]);
 const args = process.argv.slice(2);
 if (args.length > 1 || (args.length === 1 && !modes.has(args[0]))) {
-  console.error("Usage: npm run verify:trace -- [--all|--api|--browser]");
+  console.error("Usage: npm run verify:trace -- [--all|--api|--browser|--deployment]");
   process.exit(2);
 }
 if (Number(process.versions.node.split(".")[0]) < 24) {
@@ -39,7 +39,8 @@ function frontendTask(name) {
 }
 
 run("Build ASP.NET Core example", "dotnet", ["build", "examples/web-quality-trace/lesson-03", "--nologo"]);
-if (mode !== "--browser") {
+if (mode === "--all" || mode === "--api") {
+  run("Persistent management API and statistics", process.execPath, ["examples/web-quality-trace/lesson-03/verify-management.mjs"]);
   run("Test server startup fault injection", process.execPath, ["examples/web-quality-trace/lesson-03/verify-server-startup.mjs"]);
   run("API scenarios with independent fixtures", process.execPath, [
     "examples/web-quality-trace/lesson-03/verify.mjs",
@@ -50,10 +51,15 @@ if (mode !== "--browser") {
   run("Composite index experiment", process.execPath, ["examples/web-quality-trace/lesson-03/explain-inspection-query.mjs"]);
   run("Cursor paging experiment", process.execPath, ["examples/web-quality-trace/lesson-03/compare-inspection-pagination.mjs"]);
 }
-if (mode !== "--api") {
+if (mode === "--all" || mode === "--browser") {
   frontendTask("check:contract");
+  run("Contract CRLF checkout regression", process.execPath, ["examples/web-quality-trace/lesson-02/verify-contract-line-endings.mjs"]);
   frontendTask("test:type-drift");
   frontendTask("test:e2e");
   frontendTask("test:e2e:live");
+  frontendTask("test:e2e:management");
+}
+if (mode === "--all" || mode === "--deployment") {
+  run("Published release, TLS, backup and rollback drill", process.execPath, ["examples/web-quality-trace/deployment/verify-deployment.mjs"]);
 }
 console.log(`\n[trace] PASS ${mode}: ${completed} stages in ${((performance.now() - started) / 1000).toFixed(1)}s.`);

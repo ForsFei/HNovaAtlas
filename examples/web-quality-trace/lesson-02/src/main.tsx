@@ -10,10 +10,13 @@ import { inspectionCursorUrl, inspectionUrl } from "./inspection-query";
 import { InspectionList } from "./InspectionList";
 import { InspectionDetail } from "./InspectionDetail";
 import { useInspectionNavigation } from "./useInspectionNavigation";
+import { ManagedStationFilter } from "./ManagedStationFilter";
+import { ManagementConsole } from "./ManagementConsole";
 import "./style.css";
 
 const liveMode = import.meta.env.MODE === "live";
-const reviewMode = liveMode || import.meta.env.MODE === "review";
+const managementMode = import.meta.env.MODE === "management";
+const reviewMode = managementMode || liveMode || import.meta.env.MODE === "review";
 const storageMode = reviewMode || import.meta.env.MODE === "storage";
 const pageSizes = [1, 10, 20, 50];
 
@@ -43,8 +46,11 @@ function App() {
   const csvUrl = inspectionUrl({ ...filters, format: "csv" });
 
 
+  if (managementMode && params.get("screen") !== "trace") return <ManagementConsole onTrace={(filters = {}) => navigate({ screen: "trace", ...filters })} />;
+
   return <main>
     <h1>工业工位质量追溯台</h1>
+    {managementMode && <button onClick={() => navigate({ screen: "" })}>管理与统计</button>}
     <section aria-labelledby="list-title">
       <h2 id="list-title">检测记录</h2>
       {liveMode && <p role="status">
@@ -56,12 +62,12 @@ function App() {
         })}>
           {pageSizes.map(size => <option key={size} value={size}>{size} 条</option>)}
         </select></label>
-        <label>工位 <select value={station} onChange={event => navigate({ station: event.target.value, page: "", id: "" })}>
+        {managementMode ? <ManagedStationFilter value={station} onChange={value => navigate({ station: value, page: "", id: "" })} /> : <label>工位 <select value={station} onChange={event => navigate({ station: event.target.value, page: "", id: "" })}>
           <option value="">全部</option>
           <option value="station-a">station-a</option>
           <option value="station-b">station-b</option>
           {station && !["station-a", "station-b"].includes(station) && <option value={station}>{station}</option>}
-        </select></label>
+        </select></label>}
         <label>结果 <select value={result} disabled={!!reviewStatus} onChange={event => navigate({ result: event.target.value, page: "", id: "" })}>
           <option value="">全部</option>
           <option value="OK">OK</option>
