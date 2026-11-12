@@ -1,0 +1,74 @@
+---
+id: web-quality-trace-diagnostics
+title: "第 10 课 · 从页面错误找到后端请求日志"
+description: 为查询和导出失败添加请求编号，用 Problem Details 和结构化日志定位输入错误、404 与服务器异常。
+tags: [Web, ASP.NET Core, React, 日志, Problem Details]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 100
+prerequisite: [web-quality-trace-csv]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：CSV 导出](/knowledge/web/full-stack/filtered-csv-export/)
+
+页面出现「查询失败」时，开发者需要知道服务器处理的是哪一次请求。这一课给请求分配编号，在查询和导出错误提示中显示它，再用同一个编号找到后端日志。
+
+## 1. 从找不到的周期开始
+
+继续启动前面的 API 和 React。数据库沿用原来的文件，自定义数据库需继续传同一个 `--TraceDb`。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [不存在的周期](http://127.0.0.1:43112/?id=missing)。页面应显示找不到记录及一串请求编号。在 Network 面板选中详情请求，检查响应头 `X-Request-Id` 和 JSON 的 `requestId`，再到 API 终端查同一串编号。
+
+一次页面访问可能同时查询列表和详情，实时模式还会进行定期补查，所以按请求编号检索比只看最近一条日志更准确。
+
+## 2. 请求编号怎样穿过服务器
+
+请求进入中间件时，服务端生成一个新的 GUID，将它设为本次 `HttpContext.TraceIdentifier`。响应开始发送时写入 `X-Request-Id`。请求结束时，日志记录编号、方法、路径、状态码和耗时。
+
+```text
+Request <编号> GET /api/inspections/missing returned 404 in <耗时> ms
+```
+
+编号由服务端生成，传入的同名请求头不会覆盖它。日志中的路径也不包含查询字符串。客户端通过响应头取编号，即使某个错误响应没有可解析的 JSON，也能保留关联依据。网络连接失败时则可能完全没有 HTTP 响应，界面只能显示网络读取失败。
+
+## 3. 用 Problem Details 表达失败
+
+后端注册 `AddProblemDetails`，并在自定义回调中加入 `requestId`。异常处理中间件把未处理异常转换为错误响应，状态码页中间件为尚无响应体的错误状态补充说明。代码里主动返回的 `Results.Problem` 也使用同一套编号。
+
+| 情况 | HTTP 状态 | 排查方向 |
+| --- | --- | --- |
+| 非法页码或时间范围 | 400 | 请求参数与 API 约定 |
+| 周期不存在或路由不匹配 | 404 | 周期编号和请求路径 |
+| 查询过程中发生未处理异常 | 500 | 用请求编号查询后端日志 |
+
+JSON 中的 `status` 和 HTTP 状态应一致。`title` 表达错误类别，扩展字段 `requestId` 关联本次请求。前端保留适合使用者的提示，在后面附上请求编号。详细异常信息留在服务端，便于排查数据库、文件或程序故障。 [ASP.NET Core API 错误处理](https://learn.microsoft.com/en-au/aspnet/core/fundamentals/error-handling-api?view=aspnetcore-10.0)
+
+## 4. 中间件顺序影响观察范围
+
+请求日志放在异常处理之前，所以异常处理转换完响应后，它能记录最终的 500。认证和授权也位于这层日志之内，以便观察拒绝访问的请求。
+
+如果响应已经开始发送后才发生异常，服务器可能无法再改写状态或响应体。排查下载中途失败时，应结合请求日志、异常日志和浏览器网络状态，检查失败发生在哪个阶段。
+
+## 5. 在独立测试库验证 500
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --diagnostics
+```
+
+脚本使用独立数据库，检查 400、404、请求编号及日志关联。它还会在 API 运行期间临时改名测试表，让一次查询触发 500，再恢复表名并确认查询恢复。响应里应有请求编号，终端日志里可以找到对应的失败请求。
+
+复习时说明为什么某次 HTTP 请求失败与工件 NG 是不同层次的结果，以及请求编号为何应该同时出现在使用者可复制的位置和服务端日志中。
+
+继续学习 [第 11 课 · 用真实浏览器验收整个追溯流程](/knowledge/web/full-stack/browser-acceptance-and-course-review/)。

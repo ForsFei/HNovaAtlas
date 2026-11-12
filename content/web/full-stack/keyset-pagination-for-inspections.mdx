@@ -1,0 +1,66 @@
+---
+id: web-quality-trace-keyset-pagination
+title: "第 24 课 · 用复合游标继续查检测记录"
+description: 比较 SQLite 页码分页和键集分页，验证深页、相同时间戳及翻页期间插入新记录的行为。
+tags: [Web, SQLite, 分页, 游标, 索引]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 240
+prerequisite: [web-quality-trace-index-migration]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：SQLite 版本升级](/knowledge/web/full-stack/versioned-sqlite-index-migration/)
+
+追溯台默认按入库时间从新到旧排列。操作员看到第 1 页时，工位又写入一条 NG，等他点下一页，原来第 1 页的最后一条可能再次出现。第 23 课已经把 `Station, Result, ImportedTicks, Id` 复合索引用于旧库升级。本课用同样的索引和排序做一个独立实验，观察查询如何从上一页的末尾继续。
+
+## 1. 先固定筛选与排序
+
+两个查询都固定工位和检测结果，并按 `ImportedTicks DESC, Id DESC` 排序。`ImportedTicks` 相同时，唯一的 `Id` 决定先后顺序。实验里刻意让匹配记录成对共享时间戳，再用奇数页大小制造跨页同刻记录。
+
+```sql
+-- 页码分页，第 2 页跳过 19 条
+SELECT Id, ImportedTicks
+FROM Inspections
+WHERE Station = ? AND Result = ?
+ORDER BY ImportedTicks DESC, Id DESC
+LIMIT 19 OFFSET 19;
+
+-- 键集分页，从上一页末条之后开始
+SELECT Id, ImportedTicks
+FROM Inspections
+WHERE Station = ? AND Result = ?
+  AND (ImportedTicks, Id) < (?, ?)
+ORDER BY ImportedTicks DESC, Id DESC
+LIMIT 19;
+```
+
+SQLite 按从左到右的顺序比较这对值。对于这两个降序列，下一页包含时间更早的记录，以及时间相同且 `Id` 更小的记录。使用严格小于会排除边界行本身。只用 `ImportedTicks < ?` 会漏掉与边界同刻的剩余记录。实验用 `BigInt` 读写 SQLite 整数，保留完整的 .NET ticks。 [SQLite 行值比较](https://www.sqlite.org/rowvalue.html) · [Node.js SQLite 整数读取](https://nodejs.org/docs/latest-v24.x/api/sqlite.html#statementsetreadbigintsenabled)
+
+## 2. 跑深页和写入实验
+
+在仓库根目录用 Node.js 24 运行。脚本创建 48,000 条合成记录，固定查询 `station-a` 的 NG。所有写入都发生在脚本自己的内存库中。
+
+```powershell
+node examples/web-quality-trace/lesson-03/compare-inspection-pagination.mjs
+```
+
+| 场景 | 看哪里 | 应该看到什么 |
+| --- | --- | --- |
+| 第 301 页 | `deepPage` | 两种方式返回相同的 19 条记录。页码查询从匹配范围开头跳过 5,700 条，游标查询使用已知边界缩小索引查找范围。 |
+| 边界有相同时间戳 | `sameTickSkippedByTicksOnly` | 脚本打印只使用时间作为游标时漏掉的那条 ID。 |
+| 读完首页再插入一条更晚的 NG | `insertAtHead` | 页码第 2 页重复首页末条，原第 2 页末条被推到后面。复合游标返回插入前的第 2 页。 |
+
+先看执行计划里游标查询是否把键边界用于搜索，再看脚本打印的耗时中位数。本机内存库测的是已有边界时取一页的代价，包含返回行的读取开销。为了公平比较，脚本提前找到深页前一条作为边界，把定位这条记录的成本放在计时之外。 [SQLite 分页示例](https://www.sqlite.org/rowvalue.html#scrolling_window_queries)
+
+## 3. 放回前后端时怎么设计
+
+如果追溯台以后加「加载更多」，后端可用 `LIMIT pageSize + 1` 检查有没有下一页，给客户端返回前 `pageSize` 条。还有下一页时，用**实际返回的最后一条**生成 `nextCursor`。若用多查出来的那一条当边界，它会被下一次的严格小于条件跳过。
+
+浏览器传回 `nextCursor` 时可把它当成字符串，避免将 ticks 转成会丢精度的 JavaScript `Number`。游标应对应固定的工位、结果、时间范围和排序方向。筛选变化时从首页重新读，服务端也要验证游标是否属于当前查询。页码仍适合用户需要直接跳到某一页的场景。本课把两种方式的对照放在独立脚本中，现有 React 列表仍通过原接口按页码请求。
+
+游标记录的是查询边界。新记录写到边界前面时，可刷新首页看到它。新记录写到边界后面时，后续查询仍可能读到它。删除、修改排序键或改变记录的筛选归属也会影响后续页。需要固定一批记录做导出时，要另外定义读取快照或固定数据范围。第 6 课的 MES 补读则按持久事件序号推进，两类游标的用途和顺序不同。 [MES 游标补读](/knowledge/web/full-stack/durable-inspection-events/)
+
+复习时试着把页大小改成 20，观察同刻跨页断言为何失败。再回答一个界面设计问题，如果操作员在第 3 页切换到另一工位，哪些分页状态要清空，为什么？
+
+[下一课 · 把复合游标接入 ASP.NET Core 查询](/knowledge/web/full-stack/inspection-cursor-api/)

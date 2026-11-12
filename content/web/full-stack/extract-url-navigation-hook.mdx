@@ -1,0 +1,123 @@
+---
+id: web-quality-trace-navigation-hook
+title: "第 46 课 · 整理 URL 导航与历史恢复"
+description: 沿着列表和详情的组件拆分，提取 URL 同步 Hook，解释 pushState、popstate、筛选合并与前进后退的恢复边界。
+tags: [Web, React, TypeScript, History API, URL]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 460
+prerequisite: [web-quality-trace-view-components]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 列表与详情组件](/knowledge/web/full-stack/extract-inspection-view-components/)
+
+上一课把列表和详情从入口移出后，`App` 中仍有一组浏览器同步代码：保存查询串、监听历史切换、修改地址栏。本课将它们提取为 `src/useInspectionNavigation.ts`，继续使用 `examples/web-quality-trace/lesson-02`。
+
+## 1. URL 与 React 为什么要同步
+
+工位、结果、页码、选中周期和时间范围都已经进入 URL。直接打开一个链接时，页面需要读取这些参数；用户改变筛选时，页面还要更新地址栏，方便刷新、分享和历史恢复。
+
+读取 `window.location.search` 本身不会订阅变化。React 需要一次状态更新，才能重新执行组件并计算对应查询。因此 Hook 保留一份用于渲染的查询串，并在两种路径中更新它。
+
+| 路径 | 地址栏如何变化 | React 如何获知 |
+| --- | --- | --- |
+| 页面内选择筛选或记录 | `navigate` 调用 `pushState` | 随后调用 `setSearch` |
+| 浏览器前进或后退 | 浏览器切换历史条目 | `popstate` 监听器调用 `setSearch` |
+
+直接调用 `pushState` 不会触发 `popstate`，所以不能只监听这个事件而省略页面内导航后的状态更新。 [MDN：popstate](https://developer.mozilla.org/en-US/docs/Web/API/Window/popstate_event)
+
+## 2. 提取后的调用方式
+
+入口通过一行代码取得当前查询串和导航函数：
+
+```typescript
+const { search, navigate } = useInspectionNavigation();
+const params = new URLSearchParams(search);
+```
+
+URL 参数解析仍在 `App` 中。例如页码是否合法、复核功能关闭时是否读取 `reviewStatus`、游标模式是否具备工位与结果条件，都属于当前追溯页面的规则。
+
+Hook 的输入输出保持简单：返回查询串，接收一组需要修改的参数。它没有把工位、结果、分页方式各自再复制成一个状态。
+
+## 3. 参数更新是合并而非整体替换
+
+Hook 中沿用原来的导航函数：
+
+```typescript
+function navigate(changes: Record<string, string>) {
+  const next = new URL(window.location.href);
+  for (const [name, value] of Object.entries(changes)) {
+    if (value) next.searchParams.set(name, value);
+    else next.searchParams.delete(name);
+  }
+  if (next.search === window.location.search) return;
+  window.history.pushState(null, "", next);
+  setSearch(next.search);
+}
+```
+
+从当前完整地址创建 `URL`，可以保留没有参与本次更新的参数，以及当前路径和片段。`searchParams` 负责参数编码，调用处不需要手工拼接 `&` 或处理空格。
+
+这里约定空字符串表示删除参数。字符串 `"0"` 仍是非空字符串，会正常保存。以后如果某个业务必须区分“参数不存在”和“参数为空字符串”，就需要调整这个约定。
+
+相同查询串会直接返回，避免重复增加历史条目。比较的是序列化后的查询串；它没有把参数顺序不同但语义相同的 URL 进一步归一化。
+
+## 4. 谁决定清除页码和详情
+
+业务调用仍留在父组件：
+
+```typescript
+// 切换工位：重新开始浏览并关闭旧详情。
+navigate({ station: value, page: "", id: "" });
+
+// 选择记录：保留原筛选和页码。
+navigate({ id: value });
+
+// 返回有效页码：保留详情，供用户核对已保存结果。
+navigate({ page: value === 1 ? "" : String(value) });
+```
+
+这延续了上一课对导航回调的划分。Hook 不会自动为每次导航清除 `id`，也不会把任意筛选变化都解释成返回第一页；调用处明确表达本次业务操作。
+
+## 5. 历史切换只恢复，不新增条目
+
+```typescript
+useEffect(() => {
+  const sync = () => setSearch(window.location.search);
+  window.addEventListener("popstate", sync);
+  return () => window.removeEventListener("popstate", sync);
+}, []);
+```
+
+前进后退时，浏览器已经切换到目标地址，监听器只读取当前查询串。此处再调用 `navigate` 会混淆“恢复旧条目”和“创建新条目”两种动作，因此保持单向读取。
+
+初次加载时，`useState(window.location.search)` 提供当前查询串；组件卸载时移除监听器。这个 Hook 面向当前独立 Vite 浏览器应用，会访问 `window`，不适合原样放进服务端渲染流程。
+
+目前只由 `App` 调用一次。每个 Hook 实例拥有自己的 React 状态，其他代码若绕过它直接执行 `pushState`，不会自动通知这里的状态。后续若加入完整路由库，应统一管理导航入口。
+
+## 6. 地址恢复能恢复哪些内容
+
+恢复的是 URL 表达的工位、结果、页码、详情 ID、时间范围与分页方式。列表和详情会基于这些条件重新查询。
+
+它不会恢复未保存的复核草稿、已累计加载的每一批游标记录、滚动位置，也不保证历史条目恢复时数据库结果仍与过去相同。其他复核员可能已经处理了记录，接口返回的仍是当前数据。
+
+因此页面继续需要第 38 课的失效页恢复，以及查询失败后的重试。历史恢复和数据恢复承担的是不同职责。
+
+## 7. 验证完整页面路径
+
+在前端目录依次运行：
+
+```powershell
+npm run test:e2e
+npm run test:e2e:live
+```
+
+普通验收覆盖筛选、翻页、URL 恢复、游标历史切换、末页恢复和复核联动。实时验收确认提取后通知提示、主动刷新和断线补查继续工作。
+
+手动跟做时，可以先选择工位与 NG，再打开详情，切换分页方式，然后使用前进后退，观察控件和请求 URL 是否同时恢复。不要只看地址栏变化就判断页面已同步。
+
+复习时想一想：为什么 `pushState` 后仍要调用 `setSearch`？如果后退监听器再次增加历史条目，会怎样影响继续后退？把所有参数分别放进独立状态后，哪些地方需要额外同步？
+
+
+**下一课** → [把项目验收接入 GitHub Actions](/knowledge/web/full-stack/github-actions-acceptance/)

@@ -1,0 +1,75 @@
+---
+id: web-quality-trace-openapi
+title: "第 12 课 · 用 OpenAPI 明确前后端查询契约"
+description: 为现有查询接口生成可验证的 OpenAPI 文档，理解参数、响应模型、CSV 媒体类型与兼容性。
+tags: [Web, ASP.NET Core, OpenAPI, API设计]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 120
+prerequisite: [web-quality-trace-browser-acceptance]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：浏览器验收](/knowledge/web/full-stack/browser-acceptance-and-course-review/)
+
+前面的页面已经能查询、复核和导出。但如果另一个前端开发者来接这些接口，他还需要知道参数放在哪里、返回字段是什么、失败有哪些状态。这一课把三个查询入口整理成 OpenAPI 文档，并用真实响应检验它。
+
+## 1. 打开生成的文档
+
+沿用现有数据库，从仓库根目录启动 API。开启契约配置后，文档入口位于 `/openapi/v1.json`，只允许本机回环请求。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Contract:Enabled true --urls http://127.0.0.1:43111
+```
+
+打开 [查询接口文档](http://127.0.0.1:43111/openapi/v1.json)。文档包含列表、周期详情和周期图片三个 GET 路径。可以把它交给支持 OpenAPI 的客户端，也可以先用 PowerShell 查看路径。
+
+```powershell
+$spec = Invoke-RestMethod http://127.0.0.1:43111/openapi/v1.json
+$spec.paths.PSObject.Properties.Name
+```
+
+仓库中的 `examples/web-quality-trace/lesson-03/queries.http` 保存了一组查询和错误请求。支持 HTTP 文件的编辑器可以直接发送，普通终端也可以按其中的 URL 调用。
+
+## 2. 从路由和元数据得到契约
+
+本例使用 `Microsoft.AspNetCore.OpenApi`。框架从处理函数里识别参数位置与类型，例如路径里的 `id` 和查询字符串里的 `station`、`page`。但返回类型写成 `IResult` 时，文档还需要明确声明成功响应的具体模型。
+
+因此列表引入 `InspectionPage`，集中描述 `items`、`total`、`page` 和 `pageSize`。端点用 `Produces<InspectionPage>()` 声明 JSON 结构，用 `ProducesProblem` 声明可能的错误响应。详情也明确描述自己的字段模型。
+
+| 文档元素 | 对接时回答的问题 |
+| --- | --- |
+| 路径与 HTTP 方法 | 请求发到哪里，用什么方法 |
+| 参数位置和类型 | 参数放在路径、查询还是请求体 |
+| 响应 schema | 成功之后有哪些字段和层次 |
+| 状态码 | 哪些情况需要纠正输入或处理失败 |
+| 媒体类型 | 响应是 JSON、CSV 还是图片 |
+
+本课文档范围集中在查询入口。复核涉及 Cookie、角色和 CSRF，事件补读又有流身份与游标规则，它们需要各自完整的契约描述。 [ASP.NET Core OpenAPI 生成](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/aspnetcore-openapi?view=aspnetcore-10.0)
+
+## 3. 同一接口的不同响应类型
+
+列表默认返回分页 JSON，`format=csv` 时返回文本文件。OpenAPI 的 200 响应中同时描述 `application/json` 和 `text/csv`。图片端点则描述 `image/bmp`。
+
+操作转换器为列表补上 CSV 媒体类型和业务说明，解释时间范围的包含关系、1000 条上限，以及导出时对分页的处理。这样客户端不会把 CSV 当作分页 JSON 解析。
+
+元数据描述接口，实际校验仍由处理函数执行。例如文档里写有 422，并不会自动阻止超量导出，真正的限制仍在数据库查询后的判断中。 [OpenAPI 文档转换器](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/customize-openapi?view=aspnetcore-10.0)
+
+## 4. 用测试防止文档和实现分离
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --contract
+```
+
+测试检查生成文档中的路径、参数、分页字段和媒体类型，再请求真实列表、CSV、非法页码与不存在的周期。它也确认关闭配置后文档入口返回 404。
+
+这类测试可以抓住把响应字段改名却忘记更新声明的情况。更完整的接口演进还应验证字段类型、可空性和业务语义，例如时间到底代表检测还是导入。
+
+## 5. 练习兼容性判断
+
+假设把 `total` 改名为 `count`，前端原来读取的字段会消失。给响应新增一个可选展示字段，影响则取决于客户端是否接受额外字段。又如字段仍叫 `importedAt`，却悄悄改成服务器本地时间，JSON 的结构可能完全一样，但跨时区筛选已经改变。
+
+尝试在本地分支做一次字段改名，观察契约检查和浏览器验收在哪一步失败。随后恢复字段，说明文档检查、接口测试和浏览器测试各自发现了什么。
+
+继续学习 [第 13 课 · 把登录与复核写入接口契约](/knowledge/web/full-stack/authenticated-write-contracts/)。

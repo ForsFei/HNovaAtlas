@@ -1,0 +1,76 @@
+---
+id: web-quality-trace-ng-review
+title: "第 04 课 · 给 NG 详情加上登录、授权和复核"
+description: 在上一课的 SQLite 与 React 页面上加入 Cookie 登录、CSRF 防护、一次性 NG 复核和审计记录。
+tags: [Web, ASP.NET Core, React, SQLite, 授权]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 40
+prerequisite: [web-quality-trace-sqlite]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：导入工位证据与 SQLite](/knowledge/web/full-stack/sqlite-inspection-storage/)
+
+上一课可以看到 NG 图像。这一课让复核员查看同一张图，再提交「确认 NG」或「误判」及说明。原始 NG 是机器当时的结果，复核结论作为独立记录保存，方便日后追溯。
+
+## 1. 用上一课的数据库开始
+
+先按上一课导入至少一条 NG 记录。关闭原先占用 43111 的 API，在仓库根目录的 PowerShell 7 终端设置三个本地练习密码，每个至少 12 个字符。
+
+```powershell
+$env:Review__Enabled = 'true'
+$env:Review__Alice = Read-Host 'alice 练习密码' -MaskInput
+$env:Review__Bob = Read-Host 'bob 练习密码' -MaskInput
+$env:Review__Viewer = Read-Host 'viewer 练习密码' -MaskInput
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+如果上一课使用了自定义数据库，启动时传入同一个 `--TraceDb`。启用复核时，应用在已有库中补建 `Reviews` 表。教学例只在本机回环地址练习，使用环境变量提供本地账号密码。
+
+另开终端，沿用上一课的 React 项目和代理。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:review
+```
+
+打开 [NG 列表](http://127.0.0.1:43112/?result=NG)，进入一条尚未复核的记录。先用 `viewer` 登录，确认页面显示复核区但没有提交表单。退出后用 `alice` 登录，填写说明并提交。再次刷新详情，检查保存的结论、说明、复核人和时间。
+
+## 2. 登录、授权和 CSRF 分别在哪里发生
+
+浏览器先请求 `GET /api/session` 获取当前会话和 CSRF 请求令牌。登录成功后，服务器签发 HttpOnly Cookie。浏览器通过同源代理访问 API 时会自动发送 Cookie，服务端据此恢复用户身份和角色。React 根据返回的角色决定是否显示表单，API 则用 `RequireAuthorization` 独立检查复核员权限。
+
+Cookie 会自动附带，所以登录、退出和提交复核这三个 POST 都需要配对的防伪 Cookie 和 `X-CSRF-Token` 请求头。登录或退出会改变身份，前端随后重新读取会话和令牌。API 仍要单独验证结论、说明长度和周期状态。
+
+| 请求结果 | 如何判断 |
+| --- | --- |
+| 401 | 需要登录，或提交的用户名和密码不匹配 |
+| 403 | 已登录，但当前角色不能提交复核 |
+| 400 | 防伪令牌校验失败，或结论与说明不符合要求 |
+| 409 | 周期已复核，或周期的原始结果并非 NG |
+| 201 | 本次复核已保存，响应带有审计字段 |
+
+本例用 Cookie 演示同源浏览器会话。API 客户端若使用通过 `Authorization` 显式发送的 bearer token，凭据的发送方式不同，仍要设计令牌存储、到期和权限检查。 [ASP.NET Core Cookie 认证](https://learn.microsoft.com/en-us/aspnet/core/security/authentication/cookie?view=aspnetcore-10.0) · [ASP.NET Core 防伪令牌](https://learn.microsoft.com/en-us/aspnet/core/security/anti-request-forgery?view=aspnetcore-10.0)
+
+## 3. 让数据库裁决两个提交
+
+用两个独立浏览器会话分别登录 `alice` 和 `bob`，打开同一个未复核的周期。两边都可以看到提交按钮。先提交的一方得到 201，另一方得到 409，页面会重新读取已保存的结论。使用普通窗口和 InPrivate 窗口可以隔离 Cookie。
+
+如果只在代码里执行「先查有无复核，再插入」，两个请求都可能查到空。这里用周期 ID 作为复核表主键，SQLite 只允许一条插入成功。API 捕获主键冲突并返回 409。成功写入的一行同时保存结论、说明、由服务端会话得到的复核人和服务器 UTC 时间，形成该周期的一次复核审计。复核表外键把这行关联到原检测记录。
+
+这个业务约定是一次性提交。若后续业务允许改判，就需要定义如何追加复核历史，以及用版本校验阻止旧页面覆盖较新的结论。 [EF Core 并发冲突](https://learn.microsoft.com/ef/core/modeling/concurrency)
+
+## 4. 用脚本验证权限与重启
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --review
+```
+
+脚本会生成独立的证据和数据库，模拟从第 03 课的表结构升级。它检查访客、只读用户、缺失或跨会话的 CSRF 令牌、非法说明、OK 周期拒绝，以及两位复核员并发提交。服务重启后再读一次审计记录，并确认原始 NG 结果仍可查询。
+
+练习时打开 Network 面板，比较登录前后 `/api/session` 的响应和提交结果。再试着解释为什么客户端传来的复核人不能作为审计来源，以及为什么界面禁用提交按钮只能改善交互，数据库主键才能处理跨会话竞争。
+
+[**下一课**](/knowledge/web/full-stack/live-inspections-and-local-publish/)会让新检测记录进入已有列表，并在断线重连后补查遗漏。

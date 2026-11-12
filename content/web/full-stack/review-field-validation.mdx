@@ -1,0 +1,70 @@
+---
+id: web-quality-trace-review-field-validation
+title: "第 34 课 · 把复核错误定位到具体字段"
+description: 为结论和说明提供前后端校验、结构化字段错误与键盘焦点，区分表单错误和 CSRF 拒绝。
+tags: [Web, React, ASP.NET Core, 表单校验, 无障碍]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 340
+prerequisite: [web-quality-trace-review-session-recovery]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 登录恢复与 CSRF](/knowledge/web/full-stack/recover-review-session-and-csrf/)
+
+上一课能处理登录失效和请求校验失败。操作员填写说明时，还需要知道具体哪一项需要修改。这一课让空白说明在提交前得到提示，并把服务端返回的字段错误显示在结论或说明旁边。
+
+## 1. 提交前检查，再由后端独立校验
+
+沿用第 4 课的复核环境，选择一条尚未复核的 NG。先在说明里只输入空格，点击提交。页面会提示有效说明的长度要求，把焦点移回说明输入框，这次操作不会发送 POST。 [启动复核练习](/knowledge/web/full-stack/ng-review-and-authorization/)
+
+前端检查结论是否为允许值，以及说明去除首尾 Unicode 空白后是否符合长度范围。修改某个字段时，该字段原来的错误提示会清除，重新提交时再校验。
+
+后端也独立检查同样的业务条件。数据库只会保存通过校验的结论与说明。说明仍由 .NET 去除首尾空白后保存，长度为 1 到 500 个 UTF-16 代码单元。JavaScript 的字符串长度也按 UTF-16 计数，例如某些 emoji 会占两个单元。页面输入框沿用 500 单元的输入上限。
+
+## 2. 用字段名返回错误
+
+当结论和说明同时有问题，后端会用 `Results.ValidationProblem` 一次返回两项错误，媒体类型为 `application/problem+json`。结构如下，其他 Problem Details 字段在这里省略。
+
+```json
+{
+  "status": 400,
+  "errors": {
+    "decision": ["请选择确认 NG 或误判。"],
+    "note": ["说明去除首尾空白后须为 1～500 个字符。"]
+  }
+}
+```
+
+前端先验证错误数据的结构，再把 `decision` 与 `note` 映射到对应控件。页面同时保留原草稿和请求编号，操作员可以修改后再提交。 [ASP.NET Core ValidationProblem](https://learn.microsoft.com/dotnet/api/microsoft.aspnetcore.http.results.validationproblem?view=aspnetcore-10.0)
+
+第 33 课的 CSRF 拒绝也可能返回 400，但它使用普通的 Problem Details。前端只有读到支持的字段错误时才展示字段提示，其他 400 继续更新会话和令牌。OpenAPI 因此将 `errors` 描述为可选属性，保留两类响应的实际形状。
+
+## 3. 让提示和控件关联起来
+
+每条错误都有文字说明，并通过 `aria-describedby` 与控件关联。控件的 `aria-invalid` 表示当前是否存在校验错误。提交失败后，页面把焦点移到第一个错误字段，方便键盘用户继续修改。控件从提交中的禁用状态恢复后，才执行焦点移动。 [W3C 表单错误通知](https://www.w3.org/WAI/tutorials/forms/notifications/)
+
+复核表单使用 `noValidate`，统一通过页面内的提示反馈问题。空说明和只包含空白的说明都由自定义校验处理。输入长度限制仍保留在输入框上，服务端也会核对从其他客户端直接发来的内容。
+
+## 4. 验证客户端和服务端两条路径
+
+在仓库根目录运行接口验收。
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --review
+```
+
+脚本发送非法结论、空白说明和超长说明，检查 400 中的字段错误、请求编号，以及校验失败后数据库仍没有复核记录。
+
+在前端目录运行浏览器验收。
+
+```powershell
+npm run test:e2e
+```
+
+Edge 会检查空白说明没有发出 POST，错误与输入框关联，焦点回到说明。随后把一条真实请求改成非法结论和超长说明，让后端实际返回字段错误，检查页面保留原输入、展示两个字段错误并定位到第一个字段。原有的 CSRF 拒绝与恢复也会一起验收。
+
+复习时想一想，页面已经检查过说明，为什么 API 仍要检查？两种 400 对操作员意味着什么，为什么要提供不同的处理入口？
+
+[下一课 · 查询超时后在原位置重试](/knowledge/web/full-stack/read-timeout-and-retry/)

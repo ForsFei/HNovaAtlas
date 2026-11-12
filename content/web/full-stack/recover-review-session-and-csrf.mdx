@@ -1,0 +1,61 @@
+---
+id: web-quality-trace-review-session-recovery
+title: "第 33 课 · 登录失效后继续完成复核"
+description: 保留 NG 复核草稿，处理 401、403 和 CSRF 校验失败，验证重新登录后取得新令牌继续提交。
+tags: [Web, React, Cookie, CSRF, 授权]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 330
+prerequisite: [web-quality-trace-review-response-loss, web-quality-trace-ng-review]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 核对丢失响应的提交](/knowledge/web/full-stack/reconcile-review-after-response-loss/)
+
+操作员可能打开一条 NG 很久，填写完说明才发现登录已经失效。也可能有人在同一浏览器的另一个标签页切换了账号，当前页面仍显示旧身份。这一课让复核区根据实际响应更新会话，同时保留用户已经填写的说明。
+
+## 1. 按实际响应恢复会话
+
+沿用第 4 课的三个练习账号和复核模式，选择一条尚未复核的 NG。 [启动登录与复核练习](/knowledge/web/full-stack/ng-review-and-authorization/)
+
+| 响应 | 页面提示与操作 |
+| --- | --- |
+| 401 | 提示登录已失效，重新读取会话后显示登录表单 |
+| 403 | 提示账号没有复核权限，读取当前身份并按实际角色显示操作 |
+| 400 | 提示请求校验失败，更新会话和令牌后，由用户检查内容并重试 |
+| 更新会话时再次失败 | 保留原错误及请求编号，提供「刷新登录状态」入口 |
+
+在本例中，401、403 和 400 都有明确的服务端拒绝路径。第 32 课的网络异常与 5xx 则进入提交结果核对流程。用户可以从提示判断接下来该登录、切换账号、检查内容，还是查询保存结果。 [ASP.NET Core API 的 401 与 403](https://learn.microsoft.com/aspnet/core/security/authentication/api-endpoint-auth?view=aspnetcore-10.0)
+
+## 2. 重新登录后保留填写内容
+
+说明和结论由当前详情组件保存。登录表单出现时，这份草稿继续留在组件里。重新登录成功后，前端先读取 `/api/session`，拿到当前身份、角色和 CSRF 请求令牌，再读取该周期的复核记录。
+
+如果已经有保存结果，页面展示保存结果。如果尚未复核且账号有权限，表单恢复原来的结论与说明，等待用户再次提交。登录成功后的会话查询完成，才会恢复可操作状态。
+
+「刷新登录状态」也能用于页面身份与实际 Cookie 不一致的情况。它只读取会话和已保存复核，便于用户确认当前身份。
+
+## 3. 注意同一浏览器中的账号变化
+
+同一浏览器上下文里的标签页共享 Cookie。在另一个标签页退出、登录 viewer 后，原页面可能仍显示 alice，但发送请求时会带 viewer 的 Cookie。服务端按这次请求的实际身份检查权限，返回 403。原页面读取最新会话后，也会显示 viewer。
+
+CSRF 请求令牌还需要与防伪 Cookie 和当前身份配对。身份变化或令牌失效时，旧页面里的令牌可能无法通过检查。因此，登录和退出后，前端都会重新取得令牌。400 也可能来自结论或说明校验，操作员仍需检查表单内容。 [ASP.NET Core 防伪令牌与多标签页](https://learn.microsoft.com/aspnet/core/security/anti-request-forgery?view=aspnetcore-10.0)
+
+## 4. 验证三种失败后的恢复
+
+在前端目录运行验收。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm run test:e2e
+```
+
+验收先移除浏览器中的登录 Cookie，模拟提交时缺少有效登录会话。服务器返回 401，页面保留说明；输错一次密码后，再正确登录，原草稿仍可继续填写。
+
+随后，脚本在同一个浏览器上下文的新标签页切换到 viewer。旧页面提交得到真实的 403，并更新为只读身份。切回复核账号后，说明仍然保留。最后，脚本把一条请求的 CSRF 令牌改成无效值，验证真实的 400。重新取得会话后，用户再次提交才保存成功。
+
+这份验收通过移除 Cookie 验证缺少会话时的恢复过程。实际登录有效期仍由后端的 Cookie 认证配置管理。草稿仍保存在当前详情内，关闭详情或刷新页面后结束。
+
+复习时想一想，页面上显示的用户名和本次请求携带的身份，为什么可能不同？界面恢复提交按钮前，需要重新确认哪些会话信息？
+
+[下一课 · 把复核错误定位到具体字段](/knowledge/web/full-stack/review-field-validation/)

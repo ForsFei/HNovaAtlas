@@ -1,0 +1,78 @@
+---
+id: web-quality-trace-read-rate-limit
+title: "第 36 课 · 收到 429 后按提示等待重试"
+description: 为质检查询配置固定窗口限流，返回 Retry-After，并在 React 中显示等待提示和原查询重试入口。
+tags: [Web, ASP.NET Core, React, 限流, HTTP]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 360
+prerequisite: [web-quality-trace-read-timeout-retry]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 查询超时与重试](/knowledge/web/full-stack/read-timeout-and-retry/)
+
+上一课处理读取一直没有完成的情况。有时服务器会很快返回拒绝，告诉客户端这段时间已经收到了足够多的查询。这一课用 429 表示查询额度耗尽，让页面显示等待提示，再通过原查询的重试按钮继续操作。
+
+## 1. 开启一个容易观察的查询额度
+
+示例默认关闭查询限流。先用已经导入证据的数据库，在仓库根目录启动 API。本次练习把额度调为每 10 秒 2 次。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --ReadLimit:Enabled true --ReadLimit:PermitLimit 2 --ReadLimit:WindowSeconds 10 --Contract:Enabled true --urls http://127.0.0.1:43111
+```
+
+在另一个 PowerShell 7 窗口连续请求。
+
+```powershell
+$url = 'http://127.0.0.1:43111/api/inspections?pageSize=1'
+1..3 | ForEach-Object {
+    $response = Invoke-WebRequest $url -SkipHttpErrorCheck
+    [pscustomobject]@{
+        Status = $response.StatusCode
+        RetryAfter = $response.Headers['Retry-After']
+    }
+}
+```
+
+如果三个请求在同一个窗口内完成，前两个返回 200，第三个返回 429。窗口推进后额度恢复。省略额度和窗口配置时，启用后的默认值为每 10 秒 20 次。
+
+| 请求入口 | 如何计算额度 |
+| --- | --- |
+| 页码列表、游标列表、筛选 CSV | 共享名为 `inspection-reads` 的固定窗口额度 |
+| 单条详情、图片、原始附件、健康检查 | 使用各自现有处理流程 |
+
+这份额度保存在单个 API 进程中，由访问这些查询入口的客户端共同使用。服务重启后重新建立窗口，多进程部署时各进程分别计数。
+
+## 2. 从限流器拿到等待时间
+
+`ReadRateLimit.cs` 注册 ASP.NET Core 的固定窗口策略。窗口内取得的许可耗尽后，因为队列长度设为 0，新查询会直接被拒绝。拒绝回调读取限流器提供的 `RetryAfter`，向上取整成秒写入 `Retry-After`，再返回带请求编号的 Problem Details。 [ASP.NET Core 限流中间件](https://learn.microsoft.com/aspnet/core/performance/rate-limit?view=aspnetcore-10.0)
+
+固定窗口按边界补充整份额度。它允许窗口内集中发出多次请求，所以「每 10 秒 20 次」描述的是窗口预算。窗口结束前后连续请求，也可能在较短时间内分别用到两个窗口的额度。
+
+`Retry-After` 表示服务器建议等待的时间。等待后，仍要看下一次响应，因为其他客户端也可能使用新的额度。
+
+## 3. 在原筛选下继续查询
+
+前端 `readJson` 识别 429，读取示例服务器返回的整数秒数，显示「查询过于频繁，请在若干秒后重试」，并附上可用的请求编号。缺少有效秒数时，显示稍后重试提示。
+
+操作员等待后，仍使用第 35 课的「重新加载记录」按钮。工位、结果、时间范围和页码继续沿用。游标续页遇到拒绝时，也保留已有行和原游标，允许再次点击「加载更多」。
+
+在实时模式中，首页检查也会消耗这份查询额度。检查失败时，页面继续保留上一次已确认的更新提示。可以结合 Network 面板观察广播、首页检查与查询次数的关系。
+
+## 4. 验证拒绝与恢复
+
+在仓库根目录运行 API 验收。
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --read-limit
+```
+
+脚本开启一份较小的窗口额度，先查询页码列表，再请求游标列表，检查后者收到 429。它核对等待秒数、请求编号，以及限流期间详情和健康检查仍能读取。按提示等待后，再验证游标查询恢复，CSV 也参与共享额度。
+
+前端目录中的 `npm run test:e2e` 会为浏览器返回一条带等待秒数的 429，检查提示和请求编号，再验证原筛选下的手动重试。OpenAPI 同时列出两个列表接口的 429 和 `Retry-After` 响应头。
+
+复习时想一想，同一操作员从页码列表切到游标列表，为什么仍可能收到 429？如果 API 开成两个进程，这份内存额度会怎样计数？
+
+[下一课 · 从待复核列表完成一次处理](/knowledge/web/full-stack/pending-review-workbench/)

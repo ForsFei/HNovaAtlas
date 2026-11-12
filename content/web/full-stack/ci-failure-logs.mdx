@@ -1,0 +1,103 @@
+---
+id: web-quality-trace-ci-logs
+title: "第 48 课 · 保存 CI 失败日志并保留退出码"
+description: 在自动验收工作流中记录控制台输出，失败时上传日志，并用故障命令验证 PowerShell 管道没有掩盖原始失败。
+tags: [Web, GitHub Actions, PowerShell, 故障排查]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 480
+prerequisite: [web-quality-trace-ci]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · GitHub Actions 自动验收](/knowledge/web/full-stack/github-actions-acceptance/)
+
+上一课将本地检查接入了 CI，但 runner 上的临时路径不能在任务结束后直接打开。本课给全栈任务增加控制台日志保存和失败时上传，让维护者可以下载验收输出，按同一条命令在本机复现。
+
+## 1. 先明确收集范围
+
+本课修改的仍是 `.github/workflows/web-quality-trace.yml`，记录两个验收步骤：
+
+| 文件 | 内容 |
+| --- | --- |
+| `.local/ci-logs/api.log` | 接口组的构建、启动故障注入、HTTP 场景与数据库实验输出 |
+| `.local/ci-logs/browser.log` | 浏览器组的构建、契约对照、类型漂移及浏览器场景输出 |
+
+这是命令输出记录，没有收集临时 SQLite 库、Cookie、截图或完整的后台 API 日志。浏览器验收失败时打印的临时 `api.log` 路径仍只是 runner 内的路径，它的文件内容不会因此自动进入下载包。
+
+接口组失败后浏览器步骤按默认规则跳过，所以下载包可能只有 `api.log`。读日志时先判断失败阶段，不能把缺少后续步骤的日志理解成上传遗漏。
+
+## 2. 一份输出同时显示和保存
+
+工作流显式使用 PowerShell，接口步骤改为：
+
+```powershell
+New-Item -ItemType Directory -Path .local/ci-logs -Force | Out-Null
+npm run verify:trace -- --api 2>&1 | Tee-Object -FilePath .local/ci-logs/api.log -ErrorAction Stop
+exit $LASTEXITCODE
+```
+
+`2>&1` 将标准错误合并到输出流，`Tee-Object` 一边写入文件，一边继续把内容交给控制台。这样 Actions 页面仍能实时显示进展，文件里也能保留错误信息。 [PowerShell Tee-Object](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.utility/tee-object)
+
+浏览器步骤使用相同结构，将模式改为 `--browser`，输出到 `browser.log`。目录每次按需创建，单个日志文件由该步骤写入。
+
+## 3. 日志写成功不等于验收成功
+
+管道最后一个操作是保存日志，但我们关心的是 `npm` 对应的验收退出码。工作流在管道后立即执行：
+
+```powershell
+exit $LASTEXITCODE
+```
+
+`$LASTEXITCODE` 保存最近一次原生命令的退出码。这里的 `Tee-Object` 是 PowerShell cmdlet，不是另一个用于替换验收结果的原生进程。后面不要再插入其他原生命令后才读取这个值。 [PowerShell 自动变量](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_automatic_variables#lastexitcode)
+
+`-ErrorAction Stop` 使日志写入失败也能终止当前脚本。这样磁盘或路径问题不会变成“日志没写出，但步骤正常结束”。当前做法针对工作流中的 PowerShell 环境，不能把 Bash 的管道规则直接套过来。
+
+## 4. 只在失败时上传
+
+新增步骤的核心配置是：
+
+```yaml
+if: failure()
+uses: actions/upload-artifact@v7
+with:
+  name: web-quality-trace-logs-${{ github.run_attempt }}
+  path: .local/ci-logs/*.log
+  include-hidden-files: true
+  if-no-files-found: warn
+  retention-days: 7
+```
+
+前面步骤失败时，这个条件允许上传步骤继续执行。artifact 名称包含重跑编号，日志保留七天；可用保留期还受仓库和组织策略约束。 [GitHub artifact 配置](https://github.com/actions/upload-artifact)
+
+`.local` 属于隐藏路径，因此显式允许包含隐藏文件，并把匹配范围限定到该目录下的日志文件。不要为了方便而把路径扩大成整个仓库或整个临时目录。
+
+如果安装依赖就失败，两个验收步骤可能都没有创建日志。`if-no-files-found: warn` 让上传步骤报告缺少文件，原先安装失败的任务状态仍然保留。
+
+## 5. 怎样验证失败没有被吞掉
+
+不需要故意破坏复核接口或删除业务数据。可以在独立临时目录中，把步骤里的验收命令替换为一个小型原生命令：先输出标记，再以指定退出码结束。
+
+分别检查两个情况：
+
+| 模拟命令 | 预期日志 | 预期 PowerShell 退出码 |
+| --- | --- | --- |
+| 输出标记并 `process.exit(0)` | 包含标记 | 0 |
+| 输出标记并 `process.exit(7)` | 包含标记 | 7 |
+
+同时让模拟命令向标准错误写一条标记，确认错误输出也进入文件。测试时应使用与工作流相同的 PowerShell 管道块，避免只验证一个与实际配置不同的示意脚本。
+
+这个检查证明本机管道能保存输出并传播失败。它没有验证 GitHub artifact 上传、远程存储或下载权限；这些仍需工作流进入 GitHub 后实际运行。
+
+## 6. 失败后的排查顺序
+
+先看失败的步骤和最后一个 `[trace]` 阶段，再从运行页面的 artifacts 区域下载日志。找到错误断言和对应命令后，在本机运行同一验收组。
+
+正常成功时不上传这份日志包，控制台记录仍由 Actions 提供。取消、runner 故障或任务超时也不能保证最后的上传步骤一定完成，因此 artifact 是补充诊断资料，不能替代控制台记录。
+
+以后如果增加截图或后台日志，应为它们定义明确路径与收集规则，并核对内容。本课不通过 `continue-on-error` 放过验收失败，日志存在也不会把失败任务变成成功任务。
+
+复习时想一想：为什么不能仅根据 `Tee-Object` 写入成功就判断接口通过？为什么安装依赖失败时允许日志文件不存在？如果后台 API 日志只打印了路径，下载控制台日志后能否看到它的全部内容？
+
+
+**下一课** → [选择每页条数并恢复浏览状态](/knowledge/web/full-stack/selectable-page-size/)

@@ -1,0 +1,108 @@
+---
+id: web-quality-trace-ci
+title: "第 47 课 · 把项目验收接入 GitHub Actions"
+description: 在前后端结构整理后，用 Windows runner、Node.js 24 和 .NET 10 自动运行现有内容、接口、契约与浏览器验收。
+tags: [Web, GitHub Actions, CI, 项目验收]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 470
+prerequisite: [web-quality-trace-navigation-hook]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · URL 导航与历史恢复](/knowledge/web/full-stack/extract-url-navigation-hook/)
+
+前几课整理了后端模块和前端组件，改动后都能在本机验收。本课将同一组命令写入 `.github/workflows/web-quality-trace.yml`，让 GitHub 在提交和 PR 时自动执行。课程从“本机能验证”推进到“仓库能持续验证”。
+
+## 1. 工作流与验收脚本的边界
+
+工作流负责准备运行环境、安装依赖和调度命令；业务断言继续保留在原有脚本里。这样本机复现失败时，可以运行同一条命令，而不用把 GitHub YAML 中的断言重新翻译一遍。
+
+| 任务 | 运行内容 | 关注的问题 |
+| --- | --- | --- |
+| Knowledge content | 内容生成与知识库测试 | 元数据、目录、引用和已有内容能力是否正常 |
+| API and browser acceptance | API 场景、数据库实验、契约、类型漂移和两个浏览器模式 | 前后端组成的项目是否符合已有行为约定 |
+
+两个任务可独立运行，各自检出代码和安装依赖。它们不共享本机的 `node_modules`、数据库或构建目录。
+
+## 2. 从触发条件看一次执行
+
+```yaml
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+```
+
+推送和 PR 更新会触发检查，手动入口用于需要时重新执行。本次没有按文件路径过滤，避免修改共享工位证据项目时遗漏全栈验收。工作流是否能运行，还取决于仓库的 Actions 设置和可用额度。 [GitHub 工作流语法](https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax)
+
+工作流文件需要先进入 GitHub 仓库才会由平台执行。只在本机创建 YAML，不会产生远程运行记录。手动运行通常还要求工作流已存在于默认分支。
+
+## 3. 为什么明确指定运行环境
+
+当前工作流使用 `windows-2025`，并通过 setup actions 安装 Node.js 24 和 .NET 10 SDK。接口脚本使用 Node 的 SQLite 能力，项目目标框架为 `net10.0`，所以需要明确这两个版本系列。
+
+浏览器脚本通过 Playwright 的 `channel: "msedge"` 启动 Edge。所选 Windows runner 镜像提供 Microsoft Edge，保持了与本机验收一致的浏览器渠道。镜像与浏览器补丁仍会更新，因此这不是一个永久冻结的操作系统快照。 [Windows runner 软件清单](https://github.com/actions/runner-images/blob/main/images/windows/Windows2025-Readme.md)
+
+```yaml
+- uses: actions/setup-node@v7
+  with:
+    node-version: '24'
+- uses: actions/setup-dotnet@v6
+  with:
+    dotnet-version: '10.0.x'
+```
+
+版本系列让环境跟随补丁更新；若后续需要复现特定运行时问题，可以再按实际验证结果固定更具体版本。SDK 的安装参数由 setup-dotnet 提供。 [setup-dotnet](https://github.com/actions/setup-dotnet)
+
+## 4. 两份 npm 依赖都要安装
+
+仓库根目录用于内容流水线与统一命令入口，前端教程目录拥有独立的 `package.json` 和锁文件，所以全栈任务分别执行两次 `npm ci`：
+
+```yaml
+- run: npm ci
+- run: npm ci
+  working-directory: examples/web-quality-trace/lesson-02
+```
+
+根目录安装完成不代表前端目录的 Vite、Playwright 和 TypeScript 已经存在。两份锁文件也都进入 npm 缓存键。
+
+setup-node 缓存的是包管理器缓存，后面仍然执行 `npm ci`；缓存命中不会代替依赖安装。 [setup-node 缓存说明](https://github.com/actions/setup-node/blob/main/docs/advanced-usage.md#caching-packages-data)
+
+本课没有打开 NuGet 锁文件缓存。后端仍由 `dotnet build` 按项目引用恢复包；不能把这理解为所有传递依赖都已通过锁文件冻结。
+
+## 5. 沿用统一入口，并保留失败位置
+
+全栈任务分为两步：
+
+```powershell
+npm run verify:trace -- --api
+npm run verify:trace -- --browser
+```
+
+第一步包含构建、测试服务故障注入、接口场景及数据库实验。第二步包含构建、OpenAPI 对照、类型漂移测试，以及普通与实时浏览器验收。两步按顺序执行，第一步失败就不会继续后面的正常步骤。
+
+这会重复一次后端构建，但调度代码直接复用已有入口，方便本机复现。浏览器的两种构建仍在脚本内部顺序执行，避免共用的 `.local/dist` 被并发覆盖。
+
+任务分别设置 10 分钟和 25 分钟上限。运行超时意味着要检查环境、启动过程或等待条件，不能等同于某项业务断言失败。
+
+## 6. 并发与访问权限
+
+同一工作流和同一 ref 的更新会取消旧执行，把资源留给新的代码版本。push 与 PR 的 ref 可能不同，所以同一次提交仍可能分别出现两次运行。
+
+工作流仅声明 `contents: read`，检出时不保留 Git 凭据。当前检查不需要发布、写入仓库或访问真实工位数据，也没有配置部署步骤。
+
+测试使用生成的证据、独立临时库和测试登录凭据。将来接入真实环境时，应单独设计集成边界，不要直接把生产数据库路径填进此工作流。
+
+## 7. 看到红色检查后怎么定位
+
+先找到失败的任务和步骤，再查看统一入口最后输出的 `[trace]` 阶段名。安装依赖失败、后端构建失败、契约漂移、浏览器断言失败需要分别处理。
+
+本机可先运行失败步骤对应的命令，保留日志中的临时目录用于检查。当前工作流没有上传临时数据库或 API 日志；远程 runner 中打印的路径在任务结束后不能作为本机文件打开，定位首先依赖 Actions 控制台日志。
+
+内容任务通过也不等于静态站点已完成生产构建；本课只接入 YAML 中列出的检查。远程 runner 首次执行成功前，也不能把本机命令通过写成“GitHub CI 已通过”。
+
+复习时想一想：为什么根目录和教程前端分别需要安装依赖？缓存命中后为什么仍要执行 `npm ci`？若契约检查失败，本机应该先运行哪条命令，而不是直接重新生成类型掩盖差异？
+
+
+**下一课** → [保存 CI 失败日志并保留退出码](/knowledge/web/full-stack/ci-failure-logs/)

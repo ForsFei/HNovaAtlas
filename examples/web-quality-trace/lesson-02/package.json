@@ -1,0 +1,35 @@
+{
+  "name": "quality-trace-lesson-02",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate:contract": "node generate-contract.mjs",
+    "check:contract": "node generate-contract.mjs --check",
+    "test:type-drift": "node verify-type-drift.mjs",
+    "test:e2e": "npm run build:review && node verify-browser.mjs",
+    "test:e2e:live": "npm run build:live && node verify-browser.mjs --live-cursor",
+    "dev": "vite",
+    "dev:storage": "vite --mode storage",
+    "dev:review": "vite --mode review",
+    "dev:live": "vite --mode live",
+    "build:live": "tsc --noEmit && vite build --mode live",
+    "build:review": "tsc --noEmit && vite build --mode review",
+    "build:storage": "tsc --noEmit && vite build --mode storage",
+    "build": "tsc --noEmit && vite build"
+  },
+  "dependencies": {
+    "@microsoft/signalr": "10.0.11",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "4.6.5"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "6.2.1",
+    "openapi-typescript": "7.13.0",
+    "typescript": "~5.9.3",
+    "vite": "8.3.5"
+  }
+}

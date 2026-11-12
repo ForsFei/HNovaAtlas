@@ -1,0 +1,68 @@
+---
+id: web-quality-trace-csv
+title: "第 09 课 · 把当前筛选结果导出为 CSV"
+description: 沿用时间、工位和结果筛选，完成后端 CSV 编码、下载响应和 React 文件下载。
+tags: [Web, ASP.NET Core, React, CSV]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 90
+prerequisite: [web-quality-trace-time-range]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：时间范围查询](/knowledge/web/full-stack/time-range-query-and-url-state/)
+
+上一课已经可以查询一个时间段里的记录。现在把同一组筛选结果交给质量人员，用 CSV 保存周期、工位、UTC 导入时间、判定和 ROI 均值。你会从页面按钮跟到下载响应，并检查导出的范围是否和查询条件一致。
+
+## 1. 导出刚刚筛选的记录
+
+沿用前几课的数据库启动 API，另开终端启动 React。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [检测记录列表](http://127.0.0.1:43112/)，先筛选 NG，再点击「导出当前筛选结果 CSV」。下载的 `inspections.csv` 应只包含匹配的 NG。接着清除结果筛选、切到第 2 页再导出，文件应包含全部匹配记录。
+
+日期框中的草稿只有在点击「应用时间范围」后才进入 URL。导出读取的是已应用条件，所以先确认列表结果，再下载。
+
+## 2. 复用查询条件
+
+请求仍使用 `GET /api/inspections`，多传一个 `format=csv`。前端从当前 URL 复制工位、结果和时间范围，移除页码、页大小和当前详情编号。API 在建立同一个筛选查询后，按导入时间与周期 ID 排序，再投影导出字段。
+
+普通列表分支执行分页，CSV 分支读取筛选后的全部记录。两者都使用已经定义好的开始包含、结束排除规则。实时模式还会带上 `newest=true`，文件也按从新到旧的方向排序。
+
+单次导出最多 1000 条。超过时 API 返回 422，前端提示缩小筛选范围。零条记录会生成只有表头的 CSV。每次导出是独立的一次查询，列表加载后若有新记录入库，文件可能包含更新的数据。
+
+## 3. CSV 编码与字段边界
+
+直接把字段用逗号连接，遇到工位名里有逗号就会错列。示例把每个字段放进双引号，字段内的双引号写成两个双引号，并用 CRLF 分隔记录。数字使用固定文化格式，UTC 时间使用往返格式。
+
+例如工位名 `工位,"A"` 的字段内容会编码成 `"工位,""A"""`。生成结果前加 UTF-8 BOM，便于常见桌面表格软件识别中文。 [RFC 4180](https://www.rfc-editor.org/info/rfc4180/)
+
+电子表格还可能把以等号等字符开头的文本解释为公式。面向表格查看的导出会给这些文本加一个单引号前缀，再执行 CSV 引号转义。因此这类字段下载后包含一个展示用前缀。不同表格软件的解释规则有差异，重新保存后的文件也应检查实际单元格类型。 [OWASP CSV Injection](https://community.owasp.org/attacks/CSV_Injection)
+
+## 4. 从 HTTP 响应到浏览器文件
+
+后端返回 `text/csv; charset=utf-8` 和带文件名的 `Content-Disposition`。React 用 `fetch` 读取响应，先判断状态码，成功后调用 `blob()`。随后创建临时对象 URL，让一个带 `download` 属性的链接触发保存，最后撤销对象 URL。
+
+下载期间按钮禁用，切换筛选会取消旧的下载请求。服务失败或导出超过上限时，页面显示错误。你可以在 Network 面板对照请求参数、Content-Type 和响应体，说明是筛选阶段失败还是已经生成了 CSV。
+
+## 5. 验证文件内容
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --csv
+```
+
+脚本使用独立数据库，检查 NG 筛选、整组导出、空结果、无效时间、中文与双引号、公式前缀、UTF-8 BOM，以及超过 1000 条时的响应。
+
+最后手动比较同一组条件下的列表总数和 CSV 数据行数，注意 CSV 字段本身也可能包含换行。解释为什么逐行拆文本不能作为通用 CSV 解析方式，以及为什么前端先检查 HTTP 状态再调用下载逻辑。
+
+继续学习 [第 10 课 · 从页面错误找到后端请求日志](/knowledge/web/full-stack/request-diagnostics-and-problem-details/)。

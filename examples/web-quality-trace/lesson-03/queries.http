@@ -1,0 +1,31 @@
+@base = http://127.0.0.1:43111
+
+### OpenAPI document
+GET {{base}}/openapi/v1.json
+
+### First page
+GET {{base}}/api/inspections?page=1&pageSize=1
+
+### NG filter
+GET {{base}}/api/inspections?station=station-a&result=NG
+
+### Cursor page, pass nextCursor as after on the next request
+GET {{base}}/api/inspection-pages?station=station-a&result=NG&pageSize=1
+
+### CSV for the entire filtered result
+GET {{base}}/api/inspections?result=NG&format=csv
+
+### Invalid page, expect 400 and requestId
+GET {{base}}/api/inspections?page=0
+
+### Unknown cycle, expect 404 and requestId
+GET {{base}}/api/inspections/missing
+
+### Requires --Events:Enabled true; resume using nextAfter
+GET {{base}}/api/inspection-events?after=0&limit=1
+
+### Process liveness
+GET {{base}}/health/live
+
+### Inspection query readiness
+GET {{base}}/health/ready

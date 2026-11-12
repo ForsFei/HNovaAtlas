@@ -1,0 +1,104 @@
+---
+id: web-quality-trace-page-size
+title: "第 49 课 · 选择每页条数并恢复浏览状态"
+description: 在现有页码与游标列表上加入每页条数选择，通过 URL 保存设置，处理参数校验、页码重置、详情关闭及历史恢复。
+tags: [Web, React, 分页, URL, 浏览器验收]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 490
+prerequisite: [web-quality-trace-ci-logs]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · CI 失败日志](/knowledge/web/full-stack/ci-failure-logs/)
+
+前面的演示固定每页一条，方便观察分页和待办减少。真正连续浏览时，用户可能希望一次看更多记录。本课在同一个追溯台加入“每页条数”选择，并沿用第 46 课的 URL 导航，让刷新和前进后退都能恢复设置。
+
+## 1. 先定义一个完整操作
+
+提供 1、10、20、50 四个选项，未指定时仍使用 1。修改条数后，保留工位、结果、时间范围、复核状态和分页方式，清除页码及选中记录。
+
+| 状态 | 修改条数后的处理 | 原因 |
+| --- | --- | --- |
+| 工位、结果、时间、复核状态 | 保留 | 用户仍在浏览同一范围 |
+| 页码 | 回到第一页 | 新的每页数量改变了页边界 |
+| 已打开的详情 | 关闭 | 本次操作重新开始列表浏览 |
+| 游标累计结果 | 从首页重新加载 | 新请求使用新的批次大小 |
+| CSV 导出范围 | 保持当前筛选 | CSV 仍导出完整筛选结果 |
+
+这个操作会卸载详情，对应未保存的复核草稿也会结束。与切换工位和普通翻页一样，本课没有增加草稿持久化或确认弹窗。
+
+## 2. 从 URL 严格读取允许值
+
+`main.tsx` 中原来的固定值变为允许选项：
+
+```typescript
+const pageSizes = [1, 10, 20, 50];
+```
+
+页面读取 URL 时，先检查字符串是否属于允许集合，再转成数字：
+
+```typescript
+const requestedSize = params.get("pageSize") ?? "1";
+const pageSize = pageSizes.some(size => String(size) === requestedSize)
+  ? Number(requestedSize)
+  : 1;
+```
+
+这会拒绝 `0`、`999`、`10.5`、`abc`，也不会把 `1e1` 自动接受成 10。允许值不仅是“能转成整数”，还是当前界面明确支持的选项。
+
+非法值在页面中回退到 1，实际 API 查询也使用 1；地址栏仍保留用户输入的原字符串。本课不自动重写历史条目。
+
+后端已有的 `pageSize` 范围检查继续保留。浏览器下拉框只约束页面行为，不能替代服务端对直接 HTTP 请求的验证。
+
+## 3. 用受控下拉框表达当前选择
+
+```tsx
+<label>每页条数 <select value={pageSize} onChange={event => navigate({
+  pageSize: event.target.value === "1" ? "" : event.target.value,
+  page: "",
+  id: "",
+})}>
+  {pageSizes.map(size => <option key={size} value={size}>{size} 条</option>)}
+</select></label>
+```
+
+`value` 来自 URL 解析结果，`onChange` 通过已有导航函数更新 URL 与 React 状态，因此下拉框没有独立的选择状态。受控选择框需要同步更新其绑定值。 [React select](https://react.dev/reference/react-dom/components/select)
+
+选择默认的 1 条时，传空字符串删除 URL 参数，使默认链接保持简短；其他选项则以 `pageSize=10` 等形式保存。
+
+## 4. 同一个值进入哪些位置
+
+普通列表的查询 URL 和 `InspectionList` 的 `pageSize` prop 都使用同一个已校验值。后端按它返回记录，组件按它计算总页数；早期数组模式也按它执行本地切片。
+
+游标首页 URL 同样接收这个值。URL 变化后，`CursorInspectionList` 原有的 `key` 随之变化，旧实例卸载，新实例从首页开始。旧请求继续由原来的取消逻辑结束，避免把不同批次大小的结果混在一起。
+
+这里没有把条数改变后的旧 `after` 游标直接用于续页。当前选择是重新浏览；这属于页面操作规则，不是在声明服务端游标必须绑定每页条数。
+
+CSV 查询继续通过 `filters` 构建，没有加入列表的 `page` 或 `pageSize`。这保持了第 09 课“导出当前筛选范围”的含义。
+
+## 5. 刷新与前进后退
+
+第 46 课提取的导航 Hook 已经监听 `popstate`，本课不需要再增加监听器。历史条目恢复后重新解析 `pageSize`，控件、查询 URL 和列表一起更新。
+
+回退到旧条目可能重新打开旧详情，因为旧 URL 中仍有对应的 `id`。这恢复的是记录选择，不是此前未保存的草稿。列表会重新请求当前数据库，不保证与过去看到的结果完全相同。
+
+## 6. 用浏览器检查整个变化
+
+`verify-browser.mjs` 新增 `verifyPageSize`，在原有场景之前运行，复用初始两条证据，不修改业务数据。
+
+它检查：从第二页打开详情，选择 10 条后显示两条记录，清除页码和详情但保留工位；刷新与前进后退恢复选择；切换游标条数后请求新的首页；五种非法 URL 值均回退为一条。
+
+该场景在普通和实时构建中都会执行。前端目录的命令仍为：
+
+```powershell
+npm run test:e2e
+npm run test:e2e:live
+```
+
+随后继续跑原有复核、下载、末页恢复、超时和实时通知检查，确认新增控件没有改变旧链接的默认行为。这些浏览器检查覆盖 review 与 live 模式；早期数组模式仍由类型检查覆盖其构建关系，没有因此增加独立浏览器场景。
+
+复习时想一想：为什么页码和总页数计算必须使用同一个条数？为什么修改条数后不继续追加旧游标列表？如果 CSV 也带上 `pageSize=10`，使用者可能对“导出当前范围”产生什么误解？
+
+
+**下一课** → [清除筛选与尚未应用的表单草稿](/knowledge/web/full-stack/clear-filters-and-form-drafts/)

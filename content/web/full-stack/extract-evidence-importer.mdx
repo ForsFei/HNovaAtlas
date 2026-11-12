@@ -1,0 +1,135 @@
+---
+id: web-quality-trace-evidence-importer
+title: "第 42 课 · 把证据导入整理成独立用例"
+description: 接着整理启动入口，将离线证据校验与入库提取到独立模块，理解数据库作用域、事务、重复导入和冲突边界。
+tags: [Web, ASP.NET Core, EF Core, 重构, 数据导入]
+difficulty: intermediate
+status: published
+updated: "2026-11-10"
+order: 420
+prerequisite: [web-quality-trace-endpoint-module]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 检测接口模块](/knowledge/web/full-stack/extract-inspection-endpoint-module/)
+
+上一课集中整理了 HTTP 路由。现在打开 `Program.cs`，仍能看到一段完整的业务流程：解析证据目录、读取归档、核对已导入记录、保存数据。本课把这段流程集中到 `EvidenceImporter.cs`，让启动入口负责选择命令，导入模块负责执行一次证据入库。
+
+本课沿用 `examples/web-quality-trace/lesson-03`。数据库格式、命令参数和接口地址继续使用前面课程的约定。
+
+## 1. 先划清配置、资源与业务的职责
+
+| 位置 | 承担的工作 | 这样放的原因 |
+| --- | --- | --- |
+| `Program.cs` | 读取 `--Import`、`--Station`，创建数据库作用域，执行完成后退出 | 启动入口掌握当前运行的是服务还是导入命令 |
+| `EvidenceImporter.ImportAsync` | 检查目录与工位，读取证据，判断新增、重复或冲突并提交事务 | 同一次导入的规则集中阅读和修改 |
+| `EvidenceStore.ReadOfflineBundle` | 按现有归档规则读取和校验证据 | 复用工位证据模块已有的读取能力 |
+| `TraceDb` | 跟踪实体并通过 SQLite 保存检测记录 | 保持已有数据库模型和连接配置 |
+
+导入方法接收明确的 `TraceDb`、目录和工位名称。它不需要读取整套应用配置，也不需要取得 `WebApplication`。
+
+## 2. 启动入口怎样调用导入用例
+
+数据库初始化后，入口保留下面的命令分支：
+
+```csharp
+if (builder.Configuration["Import"] is { } folder)
+{
+    var imported = await EvidenceImporter.ImportAsync(
+        db, folder, builder.Configuration["Station"] ?? "station-a");
+    Console.WriteLine(imported.Created
+        ? $"Imported {imported.Id}"
+        : $"Already imported {imported.Id}");
+    return;
+}
+```
+
+`ImportAsync` 返回一个命名元组 `(string Id, bool Created)`：周期标识告诉调用者处理了谁，`Created` 告诉调用者是否新增。控制台输出留在入口，导入方法用返回值表达结果。
+
+这里的 `return` 会结束顶层程序，所以导入命令不会继续执行下面的 `app.RunAsync()`。导入失败时异常向外传播，命令以失败结束，供脚本判断。
+
+前面课程里的升级、备份互斥检查仍在入口更早的位置执行。代码提取时应同时观察调用位置，避免把导入提前到数据库初始化之前。
+
+## 3. DbContext 由谁创建、由谁释放
+
+启动初始化使用独立的异步作用域：
+
+```csharp
+await using (var scope = app.Services.CreateAsyncScope())
+{
+    var db = scope.ServiceProvider.GetRequiredService<TraceDb>();
+    await db.Database.EnsureCreatedAsync();
+    // 按开关初始化复核表、事件结构，然后处理导入命令。
+}
+```
+
+`AddDbContext` 默认注册作用域服务；这个命令没有对应的 HTTP 请求，因此入口显式建立作用域。导入模块借用其中的上下文，作用域结束时负责释放它。导入模块不对传进来的 `db` 再执行 `Dispose`。 [EF Core 上下文生命周期](https://learn.microsoft.com/en-us/ef/core/dbcontext-configuration/)
+
+调用处应等待导入完成。不要把同一个 `TraceDb` 放入多个并行导入任务；EF Core 的同一个上下文实例不支持并发操作。将来确实需要批量并行处理时，需要重新安排各个任务的上下文和 SQLite 写入策略。 [DbContext 并发约束](https://learn.microsoft.com/en-us/ef/core/dbcontext-configuration/#avoiding-dbcontext-threading-issues)
+
+## 4. 校验与事务的顺序
+
+模块内部仍按原先的顺序执行：
+
+1. 将目录转换为绝对路径，去掉末尾目录分隔符。
+2. 检查目录名是否为规范的会话 GUID 与周期编号组合，例如 `sessionN-0000000001`，其中 `sessionN` 代表实际的 32 位 GUID。
+3. 去掉工位名称两端空白，要求长度为 1～64 个字符，且不包含控制字符。
+4. 调用证据模块读取归档、清单与 PGM 字节。
+5. 开启数据库事务，按周期 ID 查询记录。
+6. 新记录入库；已有记录核对关键字段；最后提交事务。
+
+文件读取放在数据库事务之前，读取或校验失败时不会进入后面的记录查询和写入阶段。数据库事务的范围覆盖查询已有记录到提交的过程。
+
+```csharp
+await using var transaction = await db.Database.BeginTransactionAsync();
+var existing = await db.Inspections.FindAsync(id);
+
+if (existing is null)
+{
+    db.Inspections.Add(new(id, station, DateTime.UtcNow.Ticks, result, mean,
+        manifest.Width, manifest.Height, manifest.ImageSha256, pgm));
+    await db.SaveChangesAsync();
+}
+else if (existing.Station != station || existing.Result != result ||
+    existing.RoiMean != mean || existing.ImageSha256 != manifest.ImageSha256)
+{
+    throw new InvalidDataException("Import conflicts with the existing cycle.");
+}
+
+await transaction.CommitAsync();
+return (id, existing is null);
+```
+
+`SaveChangesAsync` 将跟踪的新增实体写入数据库；显式事务还需要 `CommitAsync` 才完成提交。事务在异常退出时由 `await using` 释放，未提交的修改回滚。 [EF Core 事务](https://learn.microsoft.com/en-us/ef/core/saving/transactions)
+
+## 5. 重复执行和冲突的边界
+
+| 输入情况 | 现有处理 | 调用者看到什么 |
+| --- | --- | --- |
+| 周期 ID 尚不存在 | 保存记录和原始证据 | `Created = true` |
+| 已有相同 ID，核对字段相符 | 保留已有记录 | `Created = false` |
+| 已有相同 ID，工位、结论、均值或图像摘要不符 | 抛出冲突异常 | 命令失败，不覆盖原记录 |
+
+重复导入会保留第一次保存的 `ImportedTicks`，因此原记录的导入时间和排序位置不会因为命令重跑而变化。
+
+这里要准确理解保证范围：已有分支比较的是表中列出的关键字段，没有逐字节比较整个归档，也没有逐项比较所有清单字段。本课提取代码时保留了这个既有规则。
+
+这组顺序重跑检查也不能证明多个导入进程会自动协商成功。并发情况下仍可能出现 SQLite 锁竞争或唯一键冲突，调用者必须处理失败。本课没有新增并发重试。
+
+## 6. 用真实命令与接口验收
+
+在仓库根目录运行：
+
+```powershell
+npm run verify:trace -- --api
+```
+
+接口验收会生成独立的离线证据和临时数据库，实际调用导入命令。基础检查包含首次导入、相同周期重跑、换工位导入同周期被拒绝，以及服务重启后的列表、详情和预览像素。
+
+事件场景继续检查新证据入库和重复导入，其他场景覆盖复核、备份、升级、游标与证据下载等已有能力。将这些检查放在代码提取后执行，可以发现导入调用顺序、事务提交或退出路径改变造成的影响。
+
+跟做时可在临时数据库中观察两次导入输出，再修改 `--Station` 重试。使用前面课程生成的真实证据目录，避免把空文件夹误当成有效归档。
+
+复习时想一想：为什么导入模块接收 `TraceDb`，却不负责释放它？相同证据重跑时如果覆盖 `ImportedTicks`，列表排序会出现什么变化？把 `return` 从启动入口删掉后，导入命令的运行方式会怎样改变？
+
+
+**下一课** → [让接口验收的服务启动更可靠](/knowledge/web/full-stack/reliable-test-server-startup/)

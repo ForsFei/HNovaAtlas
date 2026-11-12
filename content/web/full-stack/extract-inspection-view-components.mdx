@@ -1,0 +1,115 @@
+---
+id: web-quality-trace-view-components
+title: "第 45 课 · 拆分检测列表与详情组件"
+description: 接着提取查询 Hook，把列表和详情移出入口，通过 props 与回调明确导航、分页恢复和复核联动的职责。
+tags: [Web, React, TypeScript, 组件, 重构]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 450
+prerequisite: [web-quality-trace-json-query-hook]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 提取查询 Hook](/knowledge/web/full-stack/extract-json-query-hook/)
+
+上一课把 `useJson` 提取为独立 Hook。现在 `main.tsx` 仍同时包含整个页面、页码列表和记录详情。本课沿着实际业务边界，把后两部分分别提取到 `InspectionList.tsx` 和 `InspectionDetail.tsx`，继续使用 `examples/web-quality-trace/lesson-02`。
+
+## 1. 先决定状态放在哪里
+
+| 位置 | 管理什么 |
+| --- | --- |
+| `App` | URL 筛选、当前页、选中 ID、分页方式、刷新版本与页面组合 |
+| `InspectionList` | 普通列表的查询结果、页码展示、空结果和失效页提示 |
+| `InspectionDetail` | 单条记录读取、证据展示、下载和 NG 复核区域 |
+| `ReviewPanel` | 登录交互、未保存草稿与提交结果核对 |
+
+组件间需要协调的 URL 状态继续放在共同父组件中，子组件接收数据和回调。这个安排使一次导航的处理仍集中在 `App`，列表和详情可以沿同一组 URL 参数同步更新。 [React 状态提升](https://react.dev/learn/sharing-state-between-components)
+
+拆分后，入口导入两个组件，再保留原来的页面组合。组件使用命名导出，与已有 `ReviewPanel`、`InspectionTable` 的方式一致。 [组件的导入和导出](https://react.dev/learn/importing-and-exporting-components)
+
+## 2. 列表的依赖变成明确的 props
+
+原先 `InspectionList` 直接读取同文件的 `storageMode` 和 `pageSize`。移到独立文件后，父组件显式传入这两个值：
+
+```tsx
+<InspectionList
+  storageMode={storageMode}
+  pageSize={pageSize}
+  key={listUrl}
+  url={listUrl}
+  result={result}
+  page={page}
+  revision={feed.revision + reviewRefresh}
+  onPage={value => navigate({
+    page: value === 1 ? "" : String(value), id: "",
+  })}
+  onRecoverPage={value => navigate({
+    page: value === 1 ? "" : String(value),
+  })}
+  onSelect={value => navigate({ id: value })}
+/>
+```
+
+`storageMode` 决定按服务端分页模型还是早期数组模型读取数据。`pageSize` 同时用于早期数组切片和总页数计算；父组件构造服务端查询 URL 时也使用同一个值。
+
+组件不会从 URL 再猜一次页大小。以后修改每页数量时，应继续保持 URL 参数和传给组件的值一致。本课程为了容易复现翻页与末页缩小，仍使用每页一条。
+
+Props 中的数据和函数都由父组件传入，子组件通过调用回调报告用户操作。 [React Props](https://react.dev/learn/passing-props-to-a-component)
+
+## 3. 为什么翻页和页码恢复有两个回调
+
+`onPage` 和 `onRecoverPage` 都接收一个数字，但业务含义不同：
+
+| 操作 | URL 变化 | 对详情的影响 |
+| --- | --- | --- |
+| 用户点上一页或下一页 | 修改 `page` 并清除 `id` | 关闭旧详情 |
+| 待办减少后返回有效页 | 只修改 `page` | 保留选中详情供用户核对 |
+| 点击一条记录 | 修改 `id` | 打开对应详情 |
+
+第 38 课已经实现了末页恢复。本课移动代码时，继续保留两个回调，让它们的差异在调用处可见。若为了缩短参数列表而把两者合并，容易在恢复待办列表时意外关闭刚保存的复核详情。
+
+## 4. 详情怎样通知列表更新
+
+详情组件接收记录 ID、两种功能开关和一个完成通知：
+
+```tsx
+<InspectionDetail
+  storageMode={storageMode}
+  reviewMode={reviewMode}
+  key={id}
+  id={id}
+  onReviewSaved={() => setReviewRevision(value => value + 1)}
+/>
+```
+
+详情继续把 `onReviewSaved` 传给 `ReviewPanel` 的 `onSaved`。保存、冲突核对等原有流程在确定需要刷新列表时发出通知，由父组件增加刷新版本，再传到列表。
+
+详情组件不需要知道列表当前使用页码还是游标，也不需要直接修改列表数据。父组件已有的两种刷新路径继续生效。
+
+`storageMode` 控制归档证据的展示，`reviewMode` 控制 NG 记录的复核区域。它们控制页面功能，真正的写入权限仍由后端授权检查决定。
+
+## 5. 提取时要保留组件身份
+
+列表的 `key={listUrl}` 和详情的 `key={id}` 保持原位。切换记录 ID 时，React 会以新的组件身份重新挂载详情，从而结束旧记录对应的局部状态；同一 ID 内的普通刷新则继续沿用原身份。 [React 状态保留与重置](https://react.dev/learn/preserving-and-resetting-state)
+
+复核草稿仍在 `ReviewPanel` 内，代码提取没有增加磁盘保存。关闭详情或切换到另一条记录后，旧草稿会随着对应组件卸载而结束。不要把“提取成独立文件”误解为“自动保存了状态”。
+
+提取后的组件仍然定义在模块顶层，调用者直接导入它们。不要改成在 `App` 函数内部重新定义组件，否则父组件渲染可能改变组件类型并重置子树状态。
+
+## 6. 验收关注实际衔接
+
+在前端目录依次运行：
+
+```powershell
+npm run test:e2e
+npm run test:e2e:live
+```
+
+构建会先检查新文件的类型和导入。浏览器验收继续覆盖普通翻页、详情读取与下载、复核草稿、末页恢复、多人刷新和游标切换。实时模式还要检查通知到来时保留已有列表、主动刷新及重连补查。
+
+本课没有变更服务端接口，因此重点是组件之间的 props、回调和身份是否与原来一致。早期数组分支的代码也被保留，但上述两组浏览器命令主要验收 review 与 live 模式，不能据此宣称早期模式的所有交互都单独测试过。
+
+复习时想一想：如果子组件自己修改 URL 却没有通知 `App`，页面状态可能如何不同步？为什么页码恢复要保留详情？为什么移动组件文件通常不改变状态，而修改组件的 `key` 会改变状态？
+
+
+**下一课** → [整理 URL 导航与历史恢复](/knowledge/web/full-stack/extract-url-navigation-hook/)

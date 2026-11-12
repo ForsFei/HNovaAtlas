@@ -1,0 +1,84 @@
+---
+id: web-quality-trace-delivery-acceptance
+title: "第 40 课 · 用一条命令验收追溯台"
+description: 汇总接口、契约、数据库实验与真实浏览器流程，建立可重复运行的阶段验收入口。
+tags: [Web, 项目验收, 自动化, ASP.NET Core, React]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 400
+prerequisite: [web-quality-trace-collaborative-refresh]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 多人协作刷新](/knowledge/web/full-stack/refresh-collaborative-review-list/)
+
+前 39 课围绕同一个追溯台逐步增加了查询、导入、复核、投递与故障恢复。阶段交付时，需要重新串起这些入口，确认局部改动仍能放回整个流程。这一课提供统一验收命令，并说明失败时应查看哪一层。
+
+## 1. 准备验收环境
+
+本机使用 Node.js 24 或更高版本、.NET 10 SDK，以及供浏览器验收启动的 Microsoft Edge。先在仓库根目录安装网站依赖，再在前端示例目录安装示例自己的依赖。
+
+```powershell
+npm ci
+Push-Location examples/web-quality-trace/lesson-02
+try { npm ci } finally { Pop-Location }
+```
+
+已有依赖安装完整时，可以直接运行验收。脚本会构建 .NET 示例，使用现有的独立数据夹具和临时数据库。接口与浏览器脚本会打印本次数据库、证据或诊断日志的位置，便于失败后查看。
+
+## 2. 执行完整验收
+
+在仓库根目录执行。
+
+```powershell
+npm run verify:trace
+```
+
+入口为 `examples/web-quality-trace/verify-course.mjs`，依次执行以下阶段。
+
+| 阶段 | 主要检查 |
+| --- | --- |
+| .NET 构建 | 后端示例和依赖项目可以编译 |
+| API 场景 | 复核权限、事件与 MES、时间范围、CSV、错误诊断、契约、备份、升级、游标、图片缓存、附件、限流和待办筛选 |
+| 数据库实验 | 复合索引前后结果相同，复合游标能正确跨过同刻记录 |
+| 契约检查 | 已生成的查询类型与当前后端对应，类型漂移实验按预期报错 |
+| 复核模式浏览器 | 从筛选、证据和下载，到复核、冲突、响应丢失、登录恢复、字段校验、超时、限流和多人待办 |
+| 实时模式浏览器 | SignalR 提示、保留已读记录、主动刷新和断线后补查 |
+
+成功结束时，控制台打印 `[trace] PASS --all` 和阶段数、耗时。某个阶段失败时，入口打印该阶段名称并以非零状态退出。
+
+API 场景沿用每种故障自己的数据库夹具。前端的复核构建和实时构建会依次执行，分别启动已有的浏览器验收。
+
+## 3. 分组定位失败
+
+只检查接口和数据库实验。
+
+```powershell
+npm run verify:trace -- --api
+```
+
+只检查契约与真实浏览器流程。
+
+```powershell
+npm run verify:trace -- --browser
+```
+
+两种模式都会先构建 .NET 示例。浏览器组继续包含契约检查，所以前端类型已经过期时，会在打开浏览器前暴露问题。
+
+| 失败位置 | 接着检查 |
+| --- | --- |
+| 构建 | 第一条编译错误及其源文件 |
+| API 场景 | 最后运行的场景名称、断言和打印的临时库 |
+| 契约 | 接口元数据、生成类型以及消费端模型是否同步 |
+| 浏览器 | 失败控件、预期文本和脚本打印的 API 日志 |
+| 实时模式 | 连接状态、首页查询以及重连后的补查 |
+
+## 4. 对照一遍实际操作
+
+自动验收通过后，可以用自己的练习库走一遍操作路径。按第 4 课启动复核模式，先查一条未复核 NG，查看 BMP 预览，下载原始 PGM，再提交复核。检查待办列表更新和已保存的提交人。用两个独立会话复现冲突，再通过第 39 课的刷新入口查看外部处理结果。 [启动复核练习](/knowledge/web/full-stack/ng-review-and-authorization/)
+
+验收夹具验证的是教程约定的场景。使用自己的工位证据时，还需要核对导入来源、实际数据库路径，以及查询出来的周期是否对应这次归档。
+
+复习时试着从一次操作反推检查层次。页面里点击提交、服务端保存、响应返回、列表更新，分别由哪些验收覆盖？如果只检查 HTTP 返回 201，会漏掉哪些用户操作？
+
+[下一课 · 把检测接口整理成独立模块](/knowledge/web/full-stack/extract-inspection-endpoint-module/)

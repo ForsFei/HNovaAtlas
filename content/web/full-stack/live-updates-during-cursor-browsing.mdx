@@ -1,0 +1,63 @@
+---
+id: web-quality-trace-live-cursor-updates
+title: "第 27 课 · 浏览历史记录时提示新入库"
+description: 把 SignalR 变动通知接到游标列表的首页检查，验证无关工位、主动刷新和断线补查。
+tags: [Web, React, SignalR, 游标, 实时更新]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 270
+prerequisite: [web-quality-trace-react-load-more, web-quality-trace-live]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · React 加载更多](/knowledge/web/full-stack/react-load-more-inspections/)
+
+操作员已向下加载两批 NG 时，工位又导入一条新记录。如果直接替换首页，他会丢掉已经展开的记录。第 26 课允许手动刷新。这一课在实时模式中增加提示，告诉操作员何时值得刷新，等他主动操作再替换列表。
+
+## 1. 把通知当成重新查询的信号
+
+后端已有的 `InspectionFeed` 定期检查记录总数，变化时通过 SignalR 广播 `InspectionsChanged`。消息没有工位或结果信息。收到消息后，前端用当前筛选请求 `/api/inspection-pages` 的首页，将返回的首条 ID 与已显示的首条 ID 对比。示例每批只读 1 条，检查可以直接复用上一课的首页请求和 Zod 校验。 [SignalR JavaScript 客户端](https://learn.microsoft.com/aspnet/core/signalr/javascript-client?view=aspnetcore-10.0)
+
+| 发生什么 | 页面如何处理 |
+| --- | --- |
+| 其他工位插入一条 NG | 收到广播后检查当前首页。首条 ID 相同，界面继续保持原样。 |
+| 当前工位插入一条更新的 NG | 首页首条发生变化，显示「当前筛选有更新」。已加载的行和续页游标继续保留。 |
+| 原筛选没有记录，后来出现第一条 | 从空首页变成有记录，同样提示更新。 |
+| 操作员点击「刷新列表」且请求成功 | 用新首页替换已加载的批次，从新游标开始，基于新首页继续检查。 |
+
+提示反映的是首页首条的变化。补录到更早的位置、首条仍相同时，提示可能保持空白。断线时想逐条补齐历史事件，可以使用第 6 课的持久事件流。 [MES 游标补读](/knowledge/web/full-stack/durable-inspection-events/)
+
+## 2. 分开后台检查和用户操作
+
+`CursorInspectionList` 持有已加载的行和用于续页的游标。`CursorUpdateHint` 只持有提示状态，后台请求结果只更新这块提示。即使正在续页，检查到新首页也不会重排表格。后台检查遇到错误时保留上一次已确认的提示，主动刷新的错误仍显示在列表里。
+
+切换筛选会卸载旧列表并取消请求。主动刷新成功时，提示组件也基于新首页重新创建，旧检查被取消。新组件立即查一次首页，覆盖刷新响应返回前后恰好发生写入的情况。后续 SignalR 通知、重连以及原有的定时补查都会触发检查。 [React Effect 的清理](https://react.dev/learn/synchronizing-with-effects#fetching-data)
+
+## 3. 跑实时版和浏览器验收
+
+沿用第 3 课导入过记录的库。在仓库根目录启动 API。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Live:Enabled true --urls http://127.0.0.1:43111
+```
+
+另开终端，在前端目录启动实时模式。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm run dev:live
+```
+
+打开 [实时游标列表](http://127.0.0.1:43112/?paging=cursor&station=station-a&result=NG)。可以在 Network 面板同时观察 SignalR 帧和首页 GET。验证时重点看三个时点，收到广播后表格是否保留，提示出现时是否仍能继续浏览，点击刷新后新首条是否进入列表。
+
+也可以在前端目录运行自动验收。
+
+```powershell
+npm run test:e2e:live
+```
+
+脚本启动临时 SQLite 库和真实的 SignalR 服务。Edge 先展开两批记录，再验证无关工位写入只触发检查，当前工位写入才显示提示。它还会停止服务、离线写入一条记录并重启，检查重连后能提示更新，且表格在主动刷新前保留原内容。
+
+复习时想一想，为什么检查时要使用当前筛选的首页，而界面应保留已经读到的记录和旧游标？
+
+[下一课 · 用 ETag 验证浏览器缓存的证据图](/knowledge/web/full-stack/evidence-preview-etag/)

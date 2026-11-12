@@ -1,0 +1,61 @@
+---
+id: web-quality-trace-delivery-audit
+title: "第 19 课 · 恢复之后核对游标和 MES 回执"
+description: 只读对照追溯库、消费库和 MES 库，区分待投递、待推进游标以及需要核对的冲突。
+tags: [Web, SQLite, MES, 恢复, 对账]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 190
+prerequisite: [web-quality-trace-backup]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：SQLite 备份与恢复](/knowledge/web/full-stack/sqlite-backup-and-restore-drill/)
+
+追溯库恢复后，能看到原图和复核记录只是第一步。还要核对外部系统已经收到哪些记录，以及消费端的游标推进到了哪里。本课把三个数据库的证据放在一起对照。
+
+## 1. 准备三份用于核对的数据库
+
+使用第 06、07 和 18 课生成的文件。先暂停这三个文件的写入，或使用同一次演练中保存的副本。脚本对每个文件建立自己的只读事务，三个事务分别读取各自数据库。
+
+```powershell
+node examples/web-quality-trace/lesson-03/audit-delivery.mjs $traceDb $deliveryDb $mesDb
+```
+
+`$traceDb` 是启用事件流的追溯库，`$deliveryDb` 是 HTTP 投递模式使用的消费库，`$mesDb` 是接收服务保存回执的库。命令把 JSON 报告写到标准输出。可以从报告取出当前流身份、消费游标、流头部以及各类记录数量。 [Node.js SQLite 只读连接](https://nodejs.org/download/release/v24.15.0/docs/api/sqlite.html)
+
+## 2. 按事件身份对齐三边记录
+
+追溯库提供 `streamId`、事件序号、周期 ID 和检测结果。消费库提供流身份、游标、本地回执和保存过的 HTTP 回执。MES 库提供实际受理结果与回执 ID。
+
+脚本先比较流身份，再用 `streamId:sequence` 对齐 HTTP 回执。序号从 SQLite 读出时转成十进制字符串，比较大小使用 BigInt。一个 MES 库可以含多个流，本次只核对追溯库对应的流。
+
+| 分类 | 含义 |
+| --- | --- |
+| confirmed | 游标已经覆盖，消费记录、HTTP 回执和 MES 结果一致 |
+| pending | 事件还在游标之后，MES 尚无受理记录 |
+| awaitingCheckpoint | 事件还在游标之后，MES 已有相同结果 |
+| issues | 流身份、游标、内容或回执存在需要核对的差异 |
+
+第 07 课模拟过 MES 提交后响应丢失。此时 MES 有一条受理记录，消费事务还没有推进。对账会将它归入 `awaitingCheckpoint`。恢复消费时，原来的幂等键可以取回同一回执。
+
+## 3. 看懂需要停下来核对的情况
+
+如果追溯库回到了更早的快照，消费游标可能已超过当前流头部，报告会出现 `CheckpointAhead`。即使流身份相同，这也需要核对备份与消费进度。
+
+游标已覆盖的事件应同时具备本地记录、保存的 HTTP 回执和 MES 受理结果。缺任何一项会出现 `CheckpointGap`。如果两边的回执编号或时间不同，则标记为 `ReceiptConflict`。用报告中的序号查对应周期和事件键，确定是选择了不同批次的副本，还是有记录被修改。
+
+脚本只生成报告。游标、业务结果和 MES 回执继续由各自系统管理。退出码 0 表示此次核对没有发现差异，仍可能有待投递或待推进记录。3 表示存在差异，2 表示参数用法错误，1 表示读库失败。
+
+## 4. 用真实投递回归验证对账
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --mes
+```
+
+脚本在独立数据库上模拟响应丢失，检查报告能分别识别待投递和已受理待推进。接收端重启并重跑消费者后，两条记录都应确认。最后它故意改动测试 MES 回执，确认报告返回冲突与退出码 3，并比较对账前后的三个数据库文件内容。
+
+复习时可以解释为什么仅看游标无法证明外部系统确实受理，也可以指出为什么正常积压与已推进游标下缺少回执需要采用不同的恢复动作。
+
+继续学习 [第 20 课 · 区分服务存活与查询就绪](/knowledge/web/full-stack/liveness-and-readiness/)。

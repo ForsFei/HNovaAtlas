@@ -1,0 +1,87 @@
+---
+id: web-quality-trace-react-list
+title: "第 02 课 · 用 React 和 TypeScript 查询检测记录"
+description: 沿用上一课的 ASP.NET Core API，实现 React 列表、筛选、分页、可分享的查询链接和可取消的详情请求。
+tags: [Web, React, TypeScript, ASP.NET Core]
+difficulty: beginner
+status: published
+updated: "2026-11-05"
+order: 20
+prerequisite: [web-quality-trace-first-api]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：从浏览器到第一个 ASP.NET Core API](/knowledge/web/full-stack/first-inspection-api/)
+
+上一课靠输入周期编号查一条记录。今天让页面先列出已有记录，再选中一条看详情。做完后，你可以把当前页码、筛选条件和打开的周期一起发给同事，对方打开链接就能看到同一个查询视图。
+
+## 1. 先跑通上一课的 API，再开 React 页面
+
+在仓库根目录的第一个终端启动上一课的后端，需要 .NET 10 SDK。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-01/QualityTrace.csproj -- --urls http://127.0.0.1:43111
+```
+
+用第二个终端启动本课前端。示例使用 Node.js 24。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev
+```
+
+打开 [检测记录列表](http://127.0.0.1:43112/)。先翻到第二页，点击 `cycle-002`，应看到 NG 和 ROI 均值 75。保留详情刷新，再用浏览器后退回到打开详情前的列表。两个终端都可以用 Ctrl+C 停止。
+
+## 2. 让列表和详情分别取数据
+
+`App` 持有当前查询字符串，把工位、结果和页码作为 Props 传给 `InspectionList`。选中周期后，`InspectionDetail` 再用周期编号向详情接口查询。列表先给人一个可浏览的入口，详情由独立请求确认，即使某条记录稍后被删除，界面也能显示 404。
+
+| 操作 | 请求或计算 |
+| --- | --- |
+| 打开列表，或切换工位 | 调用上一课的 `GET /api/inspections`，有工位时传 `station` |
+| 筛选 OK／NG，或切换页码 | 对当前列表先过滤，再用 `slice` 取该页 |
+| 打开周期 | 调用 `GET /api/inspections/{id}` |
+
+每页暂放一条，现有两条样例就能练习翻页。试试先翻到第 2 页再筛 NG。修改筛选会把页码重置为 1，避免新结果集只有一页时落到不存在的页。直接打开 `?page=99` 会给出回到第 1 页的按钮。
+
+这里分页发生在浏览器，API 仍返回工位下的所有匹配记录。第 03 课会把过滤和分页交给数据库，届时要定义稳定排序和总数契约，否则连续翻页可能重复或遗漏。
+
+## 3. 用 URL 保存查询条件
+
+打开 `/?station=station-a&result=NG&id=cycle-002`。页面从 `URLSearchParams` 读工位、结果和周期编号，省略页码时使用第 1 页。输入非法页码时也回到第 1 页。
+
+修改筛选、翻页和打开详情都调用 `navigate`。它通过 `history.pushState` 写地址，并立刻更新 React 的查询字符串。浏览器后退或前进会触发 `popstate`，此时重新读地址。刷新时，React 从地址恢复同一组条件。表格行和总页数根据响应数据与 URL 算出来，不需要额外维护一份筛选结果。
+
+## 4. 取消已离开页面的请求
+
+设想先打开周期 A，再打开 B。A 先发出也可能比 B 晚返回。若两个请求都写同一个详情状态，最后一次完成的请求就能覆盖当前画面。
+
+本课的列表以工位为 `key`，详情以周期编号为 `key`。切换时，React 卸载旧实例并从加载态创建新实例。每个请求有自己的 `AbortController`，Effect 清理时中止该请求。成功和失败路径在更新状态前都检查 `signal.aborted`，避免已经取消的任务再写状态。翻页或筛选 OK／NG 时工位没变，继续使用同一份列表数据。
+
+```tsx
+const controller = new AbortController();
+// 将 controller.signal 传给 fetch。
+// 解析 JSON 后，只有信号仍有效时才更新状态。
+return () => controller.abort();
+```
+
+打开 Network 面板并限制网络速度，快速切换工位或关闭详情。可以观察到已发出的请求被取消。开发模式下 Strict Mode 还会额外执行一次建立与清理，用来检验 Effect 能否正确收尾。取消浏览器读取后，服务器已经开始的工作仍可能完成。
+
+`Load<T>` 用三个明确的分支表达加载、成功和错误。成功但没有记录显示空列表，详情 404 显示找不到该周期，服务停掉时显示查询失败。TypeScript 的 `Inspection` 描述前端期待的字段，运行时响应依旧来自 API，类型声明本身不会验证 JSON。
+
+## 5. 从 Network 看懂开发代理
+
+页面向 `http://127.0.0.1:43112/api/inspections` 发请求。Vite 开发服务收到后，在服务端转发到 `43111`，路径保持不变。对浏览器来说，页面和请求目标都是 `43112`，所以这次请求是同源的。如果把浏览器里的 URL 改成直接请求 `43111`，端口不同就属于跨源，浏览器会根据 API 的 CORS 响应决定脚本能否读取结果。
+
+`npm run build` 会先做 TypeScript 检查，再输出静态资源。Vite 的开发代理只在开发服务里运行。后续部署课会处理正式环境里浏览器如何访问同一个 API。
+
+## 6. 验收和复习
+
+1. 打开列表，在第二页查看 NG 详情，刷新后再用后退和前进检查页码与详情能否恢复。
+2. 选择 `station-b`，确认是空列表。再打开 `/?id=missing`，对照详情的 404 和列表的 200。
+3. 用慢速网络切换工位，说明旧请求何时被取消。再切换 OK／NG，确认不产生新的列表请求。
+4. 解释为什么页码适合存在 URL，而总页数可以由数据算出。数据量增大后，指出这一课应把哪几步移到服务器。
+
+[**下一课**](/knowledge/web/full-stack/sqlite-inspection-storage/)会沿用页面和 API 路径，把内存样例替换为 SQLite 数据，导入离线工位记录并用集成测试验证查询契约。
+
+参考：[React Effect 与清理](https://react.dev/learn/synchronizing-with-effects) · [Vite 开发代理](https://vite.dev/config/server-options#server-proxy)

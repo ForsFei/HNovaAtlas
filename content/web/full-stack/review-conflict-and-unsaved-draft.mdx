@@ -1,0 +1,71 @@
+---
+id: web-quality-trace-review-conflict
+title: "第 31 课 · 复核冲突时保留草稿并读取已保存结果"
+description: 用两个独立浏览器会话复现 NG 复核竞争，处理 409、草稿保留和读取失败后的重试。
+tags: [Web, React, SQLite, 并发, NG复核]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 310
+prerequisite: [web-quality-trace-verified-download-ui, web-quality-trace-ng-review]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 详情内的下载校验](/knowledge/web/full-stack/verified-evidence-download-ui/)
+
+操作员查看证据后，可能与另一位复核员同时提交同一个 NG 周期。第 4 课已经用数据库主键保证一次性复核。这一课处理冲突发生之后的页面，让后提交的人既能核对已保存的结论，也能看到自己刚才填写的说明。
+
+## 1. 用两个独立会话打开同一个周期
+
+沿用第 4 课的复核账号配置，API 使用已经导入 NG 证据的数据库。若用过自定义库，追加原来的 `--TraceDb`。练习前选一个尚无复核的周期。 [第 4 课 · 登录和 NG 复核](/knowledge/web/full-stack/ng-review-and-authorization/)
+
+在仓库根目录的 PowerShell 7 中启动服务。
+
+```powershell
+$env:Review__Enabled = 'true'
+$env:Review__Alice = Read-Host 'alice 练习密码，至少 12 字符' -MaskInput
+$env:Review__Bob = Read-Host 'bob 练习密码，至少 12 字符' -MaskInput
+$env:Review__Viewer = Read-Host 'viewer 练习密码，至少 12 字符' -MaskInput
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+另开终端启动前端。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm run dev:review
+```
+
+普通窗口和 InPrivate 窗口分别打开 [NG 列表](http://127.0.0.1:43112/?result=NG)，登录 alice 和 bob。两边先打开同一个尚未复核的周期并填写不同说明，然后让 alice 先提交，bob 再提交。
+
+alice 成功后看到已保存结果。bob 的 POST 收到 409，界面保留他的未保存草稿，同时重新读取 alice 保存的结论、说明、复核人和时间。bob 核对完成后，可以清除这份未保存草稿。
+
+## 2. 让数据库决定谁提交成功
+
+`Reviews.InspectionId` 是主键。两次插入同一个周期时，数据库只接受其中一条。后端将主键约束冲突转换成 409，并给响应添加请求编号。客户端显示冲突信息、保留提交时的草稿，然后发出 GET 查询已保存的结果。提交过程中，表单暂时禁用，草稿快照与这次 POST 对应。
+
+这里的竞争发生在新增复核记录时，EF Core 会收到数据库提供程序的唯一约束异常。更新已有数据时，版本令牌与 `DbUpdateConcurrencyException` 处理的是另一种操作。本例沿用一次性复核流程。 [EF Core 新增与更新的并发处理](https://learn.microsoft.com/ef/core/saving/concurrency)
+
+## 3. 区分提交冲突和重读失败
+
+| 页面状态 | 用户可以做什么 |
+| --- | --- |
+| POST 已返回 409，正在读取已保存结果 | 查看刚才提交的草稿，等待查询完成 |
+| 重读成功 | 对照已保存结果与未保存草稿，确认提交人和时间 |
+| 重读返回 503 等错误 | 保留草稿和冲突请求编号，点击「重新读取已保存结果」 |
+| 核对完成 | 点击「清除未保存草稿」，继续查看已保存结果 |
+
+重读按钮只发送 GET。它的成功表示页面拿到了已保存的结果。原先冲突的 POST 仍然失败，因此草稿会一直显示到用户主动清除。草稿保存在当前详情组件的内存里，关闭详情或刷新页面后会结束这份草稿的生命周期。
+
+## 4. 跑双用户浏览器验收
+
+在前端目录运行以下命令。
+
+```powershell
+npm run test:e2e
+```
+
+验收用独立的浏览器上下文隔离 alice 和 bob 的 Cookie。两人先读取空复核，alice 提交成功后 bob 再提交，脚本检查 bob 收到 409。随后故意让重读返回一次 503，确认草稿仍在、错误有请求编号，再恢复 GET，检查 bob 能读到 alice 的结果。最后直接读取服务端记录，验证保存的提交人和说明。
+
+复习时想一想，如果 POST 已发生冲突，而后续 GET 又失败，界面应该保留哪些信息？为什么重试 GET 和重试 POST 的业务含义不同？
+
+[下一课 · 提交响应丢失后核对复核结果](/knowledge/web/full-stack/reconcile-review-after-response-loss/)

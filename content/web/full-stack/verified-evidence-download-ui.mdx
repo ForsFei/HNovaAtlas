@@ -1,0 +1,71 @@
+---
+id: web-quality-trace-verified-download-ui
+title: "第 30 课 · 在详情里处理下载与摘要校验"
+description: 给原始证据下载加上浏览器 SHA-256 校验、失败重试和关闭详情时的取消处理。
+tags: [Web, React, TypeScript, 文件下载, Web Crypto]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 300
+prerequisite: [web-quality-trace-original-evidence]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 下载原始证据](/knowledge/web/full-stack/original-evidence-download/)
+
+第 29 课已经能下载原始 PGM，并通过 PowerShell 核对摘要。这一课把核对过程接到详情里的下载按钮。操作员点击后，浏览器读取文件、计算 SHA-256，匹配后再发起保存。请求失败或摘要不匹配时，错误留在当前详情，便于查看请求编号和重试。
+
+## 1. 用一次点击完成读取与核对
+
+沿用第 3 课的带证据数据库，启动 API 和存储模式前端。 [导入检测记录](/knowledge/web/full-stack/sqlite-inspection-storage/)
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+在另一终端启动前端，打开 [本地追溯台](http://127.0.0.1:43112/)，进入一条检测记录。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm run dev:storage
+```
+
+点击「下载原始 PGM」后，按钮显示正在下载并校验，完成前禁用重复点击。成功时，以当前周期 ID 命名的文件进入浏览器保存流程，详情显示「SHA-256 校验通过，已发起文件保存」。用户接下来可以选择保存位置或取消浏览器的保存操作。
+
+## 2. 校验收到的完整文件
+
+`EvidenceDownload` 用 `fetch` 请求附件，先检查 200 状态、二进制媒体类型和 `Content-Digest`。本例约定摘要字段包含一个 SHA-256，形式是 `sha-256=:Base64摘要:`。然后读取完整的 `ArrayBuffer`，交给 Web Crypto 计算 SHA-256。将得到的 32 个摘要字节编码成 Base64，就能与响应头中的值比较。 [Content-Digest 格式](https://www.rfc-editor.org/rfc/rfc9530.html#section-2) · [Web Crypto 摘要运算](https://www.w3.org/TR/WebCryptoAPI/#SubtleCrypto-method-digest)
+
+```typescript
+const bytes = await response.arrayBuffer();
+const hash = await window.crypto.subtle.digest("SHA-256", bytes);
+const actual = btoa(String.fromCharCode(...new Uint8Array(hash)));
+```
+
+校验通过后，组件把已核对的字节包装成 Blob，通过临时对象 URL 发起保存。对象 URL 用完后释放。CSV 导出也复用这个保存函数。
+
+Web Crypto 的 `subtle` 需要安全上下文。教学示例可以通过本机回环地址访问，部署到其他主机时需要配置 HTTPS。当前实现会把整个文件读入浏览器内存，适合本系列的单张 PGM。 [Web Crypto API](https://www.w3.org/TR/WebCryptoAPI/) · [可信来源与回环地址](https://www.w3.org/TR/secure-contexts/#is-origin-trustworthy)
+
+## 3. 让失败和取消回到正确位置
+
+| 发生什么 | 用户看到什么 | 下一次点击 |
+| --- | --- | --- |
+| 接口返回 404 或 500 | 详情中的错误带 HTTP 状态和可用的请求编号 | 重新请求当前周期 |
+| 摘要缺失或响应格式有误 | 显示下载响应格式错误 | 重新请求并校验 |
+| 文件内容与摘要不匹配 | 显示文件摘要不匹配 | 重新请求并校验 |
+| 下载期间关闭详情或切换周期 | 取消旧组件的请求 | 新详情使用自己的下载状态 |
+
+`AbortController` 负责取消网络读取。摘要计算完成后也会检查取消信号，再决定是否发起保存。因此，旧详情的下载即使已经进入摘要计算，也会在保存之前检查它是否仍然有效。
+
+## 4. 在真实浏览器里制造失败
+
+在前端目录运行验收。
+
+```powershell
+npm run test:e2e
+```
+
+Edge 会先下载正常文件并与工位归档逐字节比较，再分别模拟 404、500、摘要缺失和文件内容被改动。脚本检查这些情况都保留当前详情、显示错误并阻止文件保存，随后验证可以重试成功。最后拦住一个下载响应，关闭详情，确认请求被取消且没有产生旧文件下载。
+
+复习时可以沿着两个时间点检查代码，文件读取完成时可能已经关闭详情，摘要计算完成时也可能已经关闭详情。保存前为什么需要再次确认取消状态？
+
+[下一课 · 复核冲突时保留草稿并读取已保存结果](/knowledge/web/full-stack/review-conflict-and-unsaved-draft/)

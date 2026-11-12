@@ -1,0 +1,62 @@
+---
+id: web-quality-trace-typed-query
+title: "第 17 课 · 让列表和导出共用查询参数"
+description: 从生成的 OpenAPI 类型取得查询参数，在 React 中分离页面 URL、API 请求和 CSV 导出条件。
+tags: [Web, TypeScript, React, OpenAPI, URL]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 170
+prerequisite: [web-quality-trace-generated-types]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：生成前端类型](/knowledge/web/full-stack/generated-types-and-schema-compatibility/)
+
+上一课把生成类型用在响应校验上。今天从同一个契约读取请求参数类型，让列表和 CSV 导出从同一组条件构造请求。实时模式下，两条请求也会采用相同的最新优先排序。
+
+## 1. 区分页面地址和 API 请求
+
+打开详情时，页面地址可能带有 `id`，翻页时会带有 `page`。其中 `id` 用于恢复当前打开的详情。列表与导出都从页面状态提取明确的筛选字段，再根据操作加入各自需要的参数。
+
+| 参数 | 列表 | CSV 导出 |
+| --- | --- | --- |
+| station、result、since、until | 共用已应用的筛选条件 | 共用已应用的筛选条件 |
+| newest | 实时模式使用最新优先 | 沿用列表的排序方向 |
+| page、pageSize | 分页查询 | 导出整个筛选结果 |
+| format | 默认 JSON | csv |
+
+第 02 课连接内存 API 时，只把工位发给服务端，结果筛选和分页由页面计算。存储、复核和实时模式则使用服务端分页。
+
+## 2. 从操作类型提取查询参数
+
+上一课生成的 `operations` 包含每个操作的参数和响应。这里使用 `ListInspections` 的 query 类型。
+
+```typescript
+type InspectionQuery = NonNullable<
+  operations["ListInspections"]["parameters"]["query"]
+>;
+```
+
+整个查询对象可以省略，所以用 `NonNullable` 取出对象形状，内部字段依旧可选。调用 `inspectionUrl` 时，TypeScript 会检查对象字面量中的字段名和类型。例如误写成 `pageNumber` 就会报错。
+
+## 3. 按明确字段构造 URL
+
+父组件先从页面 URL 读取工位、结果、时间和页码，再构造共享的 `filters`。列表加入 `page` 和 `pageSize`，导出加入 `format: "csv"`。导出按钮只接收构造好的地址。
+
+`inspectionUrl` 使用 `URLSearchParams` 逐项写入值。空字符串和 undefined 表示省略，false 和 0 仍保留，交给 API 按契约校验。中文工位名、加号和与号也由标准编码处理。调用者传入原始字段值即可。 [URLSearchParams 序列化规则](https://url.spec.whatwg.org/#urlsearchparams)
+
+类型检查用于约束调用代码。直接访问 URL 时，时间格式、页码上下限等规则仍由后端校验。 [openapi-typescript 生成类型](https://openapi-ts.dev/introduction)
+
+## 4. 在 Network 中对照两条请求
+
+启动第 03 课 API 与 `dev:storage` 前端，选择 NG 和时间范围。对照列表请求及点击导出后的请求。筛选值应一致，只有列表带页码，只有导出带 CSV 格式。
+
+随后切到 `dev:live`，按第 05 课配置启动后端。检查列表和导出都发送 `newest=true`，比较表格第一条和 CSV 第一条。页面刷新或实时更新仍使用原先的筛选条件。
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 run test:e2e
+```
+
+自动验收会抓取浏览器发出的 CSV 请求，核对它保留 NG 筛选、正确选择 CSV 格式，并检查实际下载的文件内容。
+
+继续学习 [第 18 课 · 备份 SQLite 并用副本验收恢复](/knowledge/web/full-stack/sqlite-backup-and-restore-drill/)。

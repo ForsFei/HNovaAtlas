@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>工业工位质量追溯台 · 第 1 课</title>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <main>
+    <h1>工业工位质量追溯台</h1>
+    <p>输入 cycle-001 或 cycle-002 查询离线检测记录。</p>
+    <form id="lookup">
+      <label for="cycle">周期编号</label>
+      <input id="cycle" value="cycle-002" required>
+      <button>查询</button>
+    </form>
+    <p id="status" role="status"></p>
+    <pre id="record"></pre>
+  </main>
+</body>
+</html>

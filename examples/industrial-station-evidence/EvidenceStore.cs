@@ -83,7 +83,10 @@ public sealed class EvidenceStore : IDisposable
             return ReadBundle(root, session, cycle);
         }
     }
-    internal static EvidenceReceipt ReadBundle(string root, Guid session, long cycle)
+    internal static EvidenceReceipt ReadBundle(string root, Guid session, long cycle) =>
+        ReadOfflineBundle(root, session, cycle, out _);
+
+    public static EvidenceReceipt ReadOfflineBundle(string root, Guid session, long cycle, out byte[] pgm)
     {
             string folder = Path.Combine(root, Name(session, cycle)); RejectLink(folder);
         if (Directory.EnumerateFileSystemEntries(folder).Select(Path.GetFileName).Order().SequenceEqual(new[] { "image.pgm", "manifest.json" }) != true)
@@ -93,7 +96,7 @@ public sealed class EvidenceStore : IDisposable
         EvidenceManifest m = JsonSerializer.Deserialize<EvidenceManifest>(json, Json) ?? throw new InvalidDataException("Missing manifest");
         if (m.Terminal is null || m.Terminal.Session != session || m.Terminal.Cycle != cycle) throw new InvalidDataException("Directory identity mismatch");
         int count = Mono8Image.PixelCount(m.Width, m.Height); byte[] header = Header(m.Width, m.Height);
-        byte[] pgm = ReadBounded(Path.Combine(folder, "image.pgm"), Mono8Image.MaxPixels + 128);
+        pgm = ReadBounded(Path.Combine(folder, "image.pgm"), Mono8Image.MaxPixels + 128);
         if (pgm.Length != header.Length + count || !pgm.AsSpan(0, header.Length).SequenceEqual(header) ||
             Convert.ToHexString(SHA256.HashData(pgm)) != m.ImageSha256) throw new InvalidDataException("Image header/length/hash mismatch");
         Validate(m, Mono8Image.FromPacked(m.Width, m.Height, pgm.AsSpan(header.Length)));

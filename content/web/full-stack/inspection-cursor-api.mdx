@@ -1,0 +1,78 @@
+---
+id: web-quality-trace-cursor-api
+title: "第 25 课 · 把复合游标接入 ASP.NET Core 查询"
+description: 用真实 HTTP 接口按复合游标读取质检记录，处理翻页边界、筛选校验和结束状态。
+tags: [Web, ASP.NET Core, SQLite, 分页, OpenAPI]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 250
+prerequisite: [web-quality-trace-keyset-pagination]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：复合游标实验](/knowledge/web/full-stack/keyset-pagination-for-inspections/)
+
+上一课在内存库里验证了复合游标。这一课把同一个查询接入追溯台的 ASP.NET Core 示例。新接口读取某个工位的一类检测结果，按入库时间从新到旧逐批返回。现有 React 列表继续使用页码接口，游标接口可用 HTTP 客户端单独练习。
+
+## 1. 发出首页和续页请求
+
+沿用第 3 课导入的 SQLite 库。要体验两次请求，目标工位至少需要两条同类检测记录。使用第 23 课已经升级的副本，可以让查询利用包含工位和结果的复合索引。旧库也能执行查询。 [导入检测记录](/knowledge/web/full-stack/sqlite-inspection-storage/) · [升级已有 SQLite 库](/knowledge/web/full-stack/versioned-sqlite-index-migration/)
+
+~~~powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Contract:Enabled true --urls http://127.0.0.1:43117
+~~~
+
+如果使用升级副本，追加 `--TraceDb $copy`，其中 `$copy` 是该副本的完整路径。在另一个 PowerShell 窗口发出请求。
+
+~~~powershell
+$base = 'http://127.0.0.1:43117'
+$url = "$base/api/inspection-pages?station=station-a&result=NG&pageSize=1"
+$first = Invoke-RestMethod $url
+$first
+if ($first.nextCursor) {
+    $after = [uri]::EscapeDataString($first.nextCursor)
+    Invoke-RestMethod "$url&after=$after"
+}
+~~~
+
+| 字段 | 约定 |
+| --- | --- |
+| `station`、`result` | 必填，结果传 `OK` 或 `NG` |
+| `since`、`until` | 可选，沿用 UTC 时间范围，起点包含、终点排除 |
+| `pageSize` | 可选，默认 20，允许 1 到 100 |
+| `after` | 首页省略，续页传上一页的 `nextCursor` |
+| `items`、`nextCursor` | 响应返回检测摘要与下页游标。游标为 `null` 时结束本轮读取，空首页也使用这个响应形状 |
+
+时间输入示例为 `2025-01-01T00:00:00.000Z`。打开 [本地 OpenAPI 文档](http://127.0.0.1:43117/openapi/v1.json) 可查看 `ListInspectionCursorPage`，客户端类型生成也包含了这个操作。
+
+## 2. 从最后一条已返回的记录继续
+
+`InspectionPages.cs` 只选择列表摘要需要的字段。首次查询省略游标条件。续页则追加复合键边界，工位、时间、结果和 ID 都通过 SQLite 参数绑定。 [SQLite 行值比较](https://www.sqlite.org/rowvalue.html#scrolling_window_queries) · [Microsoft.Data.Sqlite 参数](https://learn.microsoft.com/dotnet/standard/data/sqlite/parameters)
+
+~~~sql
+SELECT Id, Station, ImportedTicks, Result, RoiMean
+FROM Inspections
+WHERE Station = $station AND Result = $result
+  AND (ImportedTicks, Id) < ($ticks, $id)
+ORDER BY ImportedTicks DESC, Id DESC
+LIMIT $limit
+~~~
+
+`$limit` 是页大小加 1。比如要返回 2 条时，SQL 最多读 3 条。读到了第 3 条就生成游标，但把**第 2 条**的键放进游标里。第 3 条会在下一个请求里再次被查到，并第一次进入响应。最后一页刚好有 2 条时，查不到第 3 条，因此当页就能返回 `nextCursor: null`。
+
+游标中包含格式版本、工位、结果、解析后的时间边界和最后一条记录的 `(ImportedTicks, Id)`。服务器用原始 `long` ticks 生成边界。调用方原样传回 URL 安全的字符串，避免把时间转成 JavaScript 数字再拼游标。
+
+## 3. 验证查询条件和写入时的行为
+
+客户端切换工位、结果或时间范围时，从首页重读。如果误把旧游标传给新筛选，API 返回带请求编号的 400。页大小只决定每批读多少条，可以沿同一个边界调整。这里的 Base64URL 游标可以被调用方解码或构造。服务端校验结构和查询范围，游标只表示从哪里继续读。每次请求仍按当前数据查询。插在边界之前的新记录可通过刷新首页查看，边界之后的补录则可能出现在后续页。
+
+~~~powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --cursor-pages --contract
+~~~
+
+验收脚本用临时数据库启动真实 HTTP 服务。它让两个 NG 共用一个精确到 100 ns 的入库时间，把它们分到相邻两页，再在两次请求间插入一条较新的记录。第二页仍返回同一时刻剩下的那条和更早的记录。刷新首页能看到新记录。脚本还检查了时间范围边界、末页和空页、无效游标、变更筛选时的 400，以及 OpenAPI 的响应字段。
+
+复习时试着回答，如果把游标取自多读的那条记录，哪条会消失？React 接入「加载更多」时，如果用户切换工位而上一工位的请求还在途中，哪个响应可以更新当前列表？
+
+[下一课 · 在 React 中加载更多检测记录](/knowledge/web/full-stack/react-load-more-inspections/)

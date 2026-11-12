@@ -1,0 +1,120 @@
+---
+id: web-quality-trace-json-query-hook
+title: "第 44 课 · 提取列表与详情的查询 Hook"
+description: 把页面内的 useJson 提取成独立 Hook，沿着请求生命周期理解加载状态、响应归属、取消、重试与后台刷新。
+tags: [Web, React, TypeScript, 自定义Hook, 重构]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 440
+prerequisite: [web-quality-trace-test-server-startup]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 可靠的测试服务启动](/knowledge/web/full-stack/reliable-test-server-startup/)
+
+前几课整理了后端路由、导入流程和验收服务。本课回到浏览器：`main.tsx` 里的列表和详情已经共用 `useJson`，现在把它提取到 `src/useJson.ts`，并把这段请求逻辑的边界讲清楚。跟做目录仍为 `examples/web-quality-trace/lesson-02`。
+
+## 1. 三个文件各自负责什么
+
+| 文件 | 职责 |
+| --- | --- |
+| `read-json.ts` | 发 HTTP 请求，处理状态码、15 秒截止时间、JSON 解析与 Zod 校验 |
+| `useJson.ts` | 把一次查询接入 React 状态和 Effect 生命周期，提供重试入口 |
+| `main.tsx` | 选择 URL 和模型，将加载结果显示为列表、详情或错误提示 |
+
+自定义 Hook 可以封装有状态逻辑；不同组件调用同一个 Hook 时，各自拥有独立状态。提取函数不会让列表和详情自动共享同一份数据。 [React 自定义 Hook](https://react.dev/learn/reusing-logic-with-custom-hooks)
+
+因此，本课提取的是现有查询逻辑，没有增加跨组件缓存、请求合并或全局数据仓库。
+
+## 2. 调用者需要提供什么
+
+提取后的签名保持原样：
+
+```typescript
+export function useJson<T>(url: string, schema: ZodType<T>, revision = 0)
+```
+
+列表把查询 URL、列表模型和刷新版本传入；详情把记录 URL 和详情模型传入。返回值为 `{ load, retry }`。
+
+```typescript
+const { load, retry } = useJson<Inspection>(
+  inspectionPath,
+  storageMode ? storageInspectionSchema : inspectionSchema,
+);
+```
+
+泛型 `T` 说明成功数据的静态类型，`schema` 校验运行时实际收到的内容。两者沿用第 15、16 课的配合方式。
+
+模型从模块级导出后引用。若在组件每次渲染时重新创建一个 schema 对象，它的引用就会变化，进而重新触发 Effect。应先确认模型身份稳定，再讨论是否需要额外优化。
+
+## 3. 用联合类型表达加载结果
+
+```typescript
+type Load<T> =
+  | { state: "loading" }
+  | { state: "ready"; data: T }
+  | { state: "error"; message: string };
+```
+
+组件先检查 `load.state`，进入 `ready` 分支后再使用 `load.data`。这种结构让页面代码直接对应三种展示状态，避免分别维护多个可能互相矛盾的布尔值。
+
+当前 Hook 没有额外返回 `refreshing` 状态。后台刷新期间仍显示已有结果，失败后转成现有错误展示；界面行为保持与前面课程一致。
+
+## 4. 结果属于哪个请求
+
+Hook 使用 URL 与手动尝试编号组成身份：
+
+```typescript
+const [attempt, setAttempt] = useState(0);
+const key = JSON.stringify([url, attempt]);
+```
+
+保存的结果同时记录 `key` 和 `schema` 引用。渲染时只有身份匹配，才显示这份结果，否则立即返回加载状态：
+
+```typescript
+const load: Load<T> = result?.key === key && result.schema === schema
+  ? result.load
+  : { state: "loading" };
+```
+
+例如从周期 A 切换到周期 B 时，即使 B 的 Effect 尚未开始，A 的结果也不属于 B 的 URL，不会被当作 B 的详情显示。这一检查与请求取消配合，分别处理渲染归属和异步完成后的写入。
+
+## 5. 取消发生在什么时刻
+
+每轮 Effect 新建 `AbortController`，把信号交给 `readJson`，清理时执行 `abort`。成功和失败分支在写状态前都检查信号是否已取消。
+
+React 在依赖变化后会先清理旧 Effect，再执行新的设置逻辑；组件卸载时也会清理。 [useEffect 生命周期](https://react.dev/reference/react/useEffect)
+
+依赖仍为 `[url, schema, key, revision]`。快速切换筛选或详情时，旧请求被取消，其结果也不能继续写入当前组件的状态。开发环境的 StrictMode 可能额外执行设置与清理，用来检查这类逻辑是否对称。
+
+主动取消和查询超时还需要区分。Hook 的控制器代表当前查询已经失效；`readJson` 内部的截止时间代表当前查询等待太久。后者在调用方没有主动取消时，仍会转成页面可见的超时错误。
+
+## 6. 重试和后台刷新为什么不同
+
+| 触发方式 | 改变什么 | 展示效果 |
+| --- | --- | --- |
+| 切换 URL 或 schema | 查询身份变化 | 显示加载状态，发起对应查询 |
+| 点击 `retry` | 增加 `attempt`，使 `key` 变化 | 结束旧错误展示，显示加载状态再查询 |
+| 增加 `revision` | Effect 重新执行，`key` 保持不变 | 保留已有结果，后台重新查询 |
+
+`revision` 有意没有放进 `key`。复核成功后列表需要更新，但在请求完成前可以保留已有记录；用户明确点击重试时，则需要看见这次尝试已经开始。
+
+后台刷新保留的是上一次结果，其中可能是成功数据，也可能是错误状态。当前实现没有额外的刷新提示，阅读时应按实际代码理解。
+
+## 7. 提取后怎样验收
+
+在前端目录依次运行，两个模式使用同一个输出目录，因此按顺序执行：
+
+```powershell
+npm run test:e2e
+npm run test:e2e:live
+```
+
+这些命令先执行 TypeScript 检查和对应模式的构建，再启动真实 API 与浏览器。关注列表和详情读取失败后的重试、超时提示、切换筛选时取消旧请求，以及复核完成后的列表更新。
+
+游标列表继续使用它自己的追加与续页逻辑；本次提取覆盖的是原有普通列表和详情。游标模式也要跑，是因为同一页面的详情仍会使用这个 Hook。
+
+复习时想一想：把 `revision` 加进 `key` 会改变什么？只取消网络请求，却不检查渲染时的结果身份，切换 URL 时可能短暂展示什么？把 Hook 放进独立文件后，列表和详情是否就共享了加载状态？
+
+
+**下一课** → [拆分检测列表与详情组件](/knowledge/web/full-stack/extract-inspection-view-components/)

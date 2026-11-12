@@ -1,0 +1,80 @@
+---
+id: web-quality-trace-event-contract
+title: "第 14 课 · 把事件游标与恢复规则写进契约"
+description: 为 MES 事件补读接口描述字符串序号、流身份、空页和错误状态，验证契约与消费恢复一致。
+tags: [Web, OpenAPI, MES, 游标, ASP.NET Core]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 140
+prerequisite: [web-quality-trace-write-contract]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：登录与复核契约](/knowledge/web/full-stack/authenticated-write-contracts/)
+
+第 06 课实现了事件补读，第 07 课让消费者通过 HTTP 投递 MES。今天给事件接口补齐文档，使接入方能知道从哪里开始、什么时候继续、什么时候暂停核对。
+
+## 1. 同时开启事件与文档入口
+
+沿用已有证据数据库，在仓库根目录运行。自定义数据库需要继续指定相同的 `--TraceDb`。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Events:Enabled true --Contract:Enabled true --urls http://127.0.0.1:43111
+```
+
+打开 [OpenAPI 文档](http://127.0.0.1:43111/openapi/v1.json)，找到 `GET /api/inspection-events`。本课接口用于本机回环消费者。只有开启事件功能后，路径才注册并进入文档。
+
+先用 PowerShell 读一条，再把服务器返回的游标带入下一次请求。
+
+```powershell
+$base = 'http://127.0.0.1:43111'
+$first = Invoke-RestMethod "$base/api/inspection-events?after=0&limit=1"
+$first
+$next = $first.nextAfter
+Invoke-RestMethod "$base/api/inspection-events?after=$next&limit=1"
+```
+
+## 2. 参数与响应的含义
+
+| 字段 | 契约 |
+| --- | --- |
+| after | 十进制字符串，默认 0，允许 0 到有符号 64 位整数上限 |
+| limit | 默认 20，每批允许 1 到 100 条 |
+| streamId | 源数据库事件流身份，消费者连同游标保存 |
+| items | 序号严格大于 after，按序号递增 |
+| items[].sequence | 十进制字符串，序号可以有空缺 |
+| nextAfter | 本批最后交付的序号，空批次保留输入游标 |
+| hasMore | 本次读取捕获的流头部内还有后续事件 |
+
+事件响应改用具名的 `InspectionEventPage` 和 `InspectionEventItem` 描述。JSON 字段沿用原来的名称，字符串序号也保留字符串类型。这样生成客户端时，可以从 schema 看到游标字段的类型，并在模型说明中找到其业务含义。
+
+把序号作为 JavaScript number 处理，超过安全整数范围时可能失去精度。示例消费者用字符串传输和保存，用 BigInt 比较顺序。下一次请求直接使用 `nextAfter`，无需自己给序号加一。
+
+## 3. 空页与追平
+
+消费者收到 `hasMore=true` 时继续获取后续页。收到 false，说明已经读到本次请求捕获的头部。后续导入仍会产生新事件，所以定期运行时继续使用保存的游标。
+
+空页保留原游标。如果把它重置为 0，下次就会重新读取历史。原消费者会在保存本地业务回执之后才提交游标，遇到批次写入失败则整批回滚。
+
+这个读取方式按唯一序号定位后续记录。它适合依次补读，查询列表需要按页跳转时仍使用分页接口。 [EF Core 分页与唯一排序](https://learn.microsoft.com/ef/core/querying/pagination)
+
+## 4. 409 需要结合操作解释
+
+非法游标或批大小返回 400。本机范围以外的调用返回 403。输入游标大于当前流头部返回 409，提示对接方核对源库与保存进度。
+
+第 13 课的复核也可能返回 409，但表示周期已复核或原结果不允许复核。相同状态码表达冲突类别，具体处理依赖当前操作的契约。消费端还会比较 `streamId`，发现不同源流时停止。
+
+备份恢复可能保留旧的流身份，却让数据库回到较早进度。此时应按第 06 课的恢复约定建立新的流身份并对账，再决定消费起点。
+
+## 5. 对照真实补读验证文档
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --events --contract --mes
+```
+
+事件检查会确认参数、具名响应字段和字符串序号，再读取真实的第一页与空页。之后继续验证停机导入、游标续读、批次回滚和流身份不匹配。MES 检查则验证响应丢失后，同一事件键能取得原来的回执。
+
+接口元数据帮助生成文档和客户端，输入边界与游标行为仍由处理函数和消费者实现。复习时可以指出每条规则在哪段代码中执行，再说明哪个测试能观察到它。 [ASP.NET Core 响应元数据](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/include-metadata?view=aspnetcore-10.0)
+
+继续学习 [第 15 课 · 检查浏览器实际收到的 JSON](/knowledge/web/full-stack/runtime-response-validation/)。

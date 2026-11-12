@@ -1,0 +1,67 @@
+---
+id: web-quality-trace-original-evidence
+title: "第 29 课 · 下载原始证据并核对 SHA-256"
+description: 给质检详情增加原始 PGM 附件，验证文件名、HTTP 摘要和入库后损坏时的响应。
+tags: [Web, ASP.NET Core, React, 文件下载, SHA-256]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 290
+prerequisite: [web-quality-trace-evidence-etag]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 证据图缓存验证](/knowledge/web/full-stack/evidence-preview-etag/)
+
+操作员在追溯台里看 BMP 就能判断图像大致情况。需要离线分析像素或交接证据时，可以从同一条记录下载工位归档的 PGM。原始附件的内容应与入库时保存的文件逐字节一致，下载方也能核对摘要。
+
+## 1. 在质检详情中下载原始文件
+
+按第 3 课启动带有证据数据的 API 和 React 存储模式，打开一条检测记录，点击预览下方的「下载原始 PGM」。浏览器保存以周期 ID 命名的 `.pgm` 文件，当前详情页继续显示。 [第 3 课 · 导入检测记录](/knowledge/web/full-stack/sqlite-inspection-storage/)
+
+| 请求 | 返回内容 | 用途 |
+| --- | --- | --- |
+| `GET /api/inspections/{id}/image` | 由 PGM 转换得到的 BMP | 详情内嵌预览，通过 ETag 复用缓存 |
+| `GET /api/inspections/{id}/evidence` | SQLite 保存的原始 PGM 字节 | 下载归档文件，通过 SHA-256 核对文件 |
+
+React 使用普通同源链接。ASP.NET Core 的 `Results.File` 收到 `fileDownloadName` 后生成 `Content-Disposition: attachment`，浏览器据此使用建议文件名。本例用 `application/octet-stream` 表示二进制附件，并用 `Cache-Control: no-store` 让 HTTP 缓存跳过存储。用户主动保存的文件仍会留在下载位置。 [ASP.NET Core 文件响应](https://learn.microsoft.com/aspnet/core/fundamentals/minimal-apis/responses?view=aspnetcore-10.0) · [Content-Disposition](https://www.rfc-editor.org/rfc/rfc6266.html)
+
+## 2. 理解两次核对
+
+入库时，证据读取器已经用工位清单里的 SHA-256 验证了完整 PGM。下载时，API 对数据库里的 PGM 重新计算 SHA-256，并与同一行保存的摘要比较。如果字节和摘要不一致，就返回带请求编号的 500，并停止发送附件。没有对应周期时返回 404。
+
+校验通过后，API 把本次摘要写入 `Content-Digest`。例如，`sha-256=:…:` 的两个冒号之间是摘要字节的 Base64 表示。清单和 `Get-FileHash` 则使用十六进制。两种编码可以互转，再比较摘要。哈希覆盖 PGM 的头部和像素数据。上一课的 ETag 由另一份数据生成，覆盖的是转换后的 BMP。 [HTTP Content-Digest](https://www.rfc-editor.org/rfc/rfc9530.html#section-2)
+
+## 3. 用 PowerShell 核对本地文件
+
+以下命令需要 PowerShell 7 和一个已经导入记录的后端。示例端口为 `43111`。如果手上有工位的 `manifest.json`，还可以把本地摘要与其中的 `ImageSha256` 对照。
+
+```powershell
+$base = 'http://127.0.0.1:43111'
+$inspection = (Invoke-RestMethod "$base/api/inspections?pageSize=1").items[0]
+$url = "$base/api/inspections/$($inspection.id)/evidence"
+$download = Join-Path $env:TEMP ("atlas-evidence-" + [guid]::NewGuid().ToString("N") + ".pgm")
+$response = Invoke-WebRequest $url -OutFile $download -PassThru
+
+$field = $response.Headers['Content-Digest'][0]
+if ($field -notmatch '^sha-256=:([A-Za-z0-9+/]+={0,2}):$') {
+    throw 'Content-Digest 格式错误。'
+}
+$expected = [Convert]::ToHexString([Convert]::FromBase64String($Matches[1]))
+$actual = (Get-FileHash -LiteralPath $download -Algorithm SHA256).Hash
+if ($expected -ne $actual) { throw '文件摘要不匹配。' }
+$download
+$actual
+```
+
+## 4. 验证正常下载与损坏拒绝
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --evidence-download
+```
+
+HTTP 验收会对照原始 PGM、工位清单和响应头，再在临时库里翻转一个像素位，确认损坏附件被拒绝。OpenAPI 将附件描述为二进制响应。前端目录的 `npm run test:e2e` 也会用 Edge 点击下载链接，检查文件名和保存后的字节。
+
+复习时想一想，预览、附件和工位清单分别适合哪些操作？为什么翻转一个像素后，文件大小可以相同，SHA-256 却会变化？
+
+[下一课 · 在详情里处理下载与摘要校验](/knowledge/web/full-stack/verified-evidence-download-ui/)

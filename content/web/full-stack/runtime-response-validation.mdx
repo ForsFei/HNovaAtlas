@@ -1,0 +1,83 @@
+---
+id: web-quality-trace-runtime-validation
+title: "第 15 课 · 检查浏览器实际收到的 JSON"
+description: 用 Zod 在 React 的数据入口校验检测记录和分页响应，让字段漂移变成可定位的页面错误。
+tags: [Web, React, TypeScript, Zod, API契约]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 150
+prerequisite: [web-quality-trace-event-contract]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：事件补读契约](/knowledge/web/full-stack/event-feed-contract-and-cursor-semantics/)
+
+接口文档描述了字段和类型，但浏览器实际收到的响应仍可能有差异。例如前后端版本不匹配时，`total` 可能被改成字符串，某条记录也可能缺少工位名。今天在数据进入 React 状态之前校验响应，使错误能在这个边界被发现。
+
+## 1. 先运行正常的查询页面
+
+后端和前端仍按之前的命令启动。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [检测列表](http://127.0.0.1:43112/)，查看详情、筛 NG，再用时间表单查询。正常响应通过校验后，界面继续显示原来的数据。运行 `npm ci` 会按锁文件安装本课增加的 Zod。
+
+## 2. 把 JSON 当作 unknown 读取
+
+写出 `const data: Inspection = await response.json()` 时，类型标注让编译器按 `Inspection` 使用变量。字段是否真的存在，还需要执行时检查。类型断言也会在编译后移除。 [TypeScript 类型断言](https://www.typescriptlang.org/docs/handbook/2/everyday-types.html#type-assertions)
+
+本课先把解析结果保存为 `unknown`，再交给 schema。
+
+```typescript
+const parsed = schema.safeParse(payload);
+if (!parsed.success) {
+  throw new Error(httpError(response, "接口数据格式不符合约定，请联系维护人员。"));
+}
+setLoad({ state: "ready", data: parsed.data });
+```
+
+实际请求函数还保留取消检查。切换筛选后，已经取消的响应即使完成解析，也不能覆盖当前查询。
+
+## 3. 从 schema 推导页面类型
+
+`inspection-schema.ts` 定义检测记录、旧课程数组响应和当前分页响应。页面用 `z.infer` 推导类型，把编译期使用的字段和运行期校验放在一起。
+
+| 数据 | 校验规则 |
+| --- | --- |
+| id、station | 非空字符串 |
+| result | OK 或 NG |
+| roiMean | 0 到 255 的有限数字 |
+| inspectedAt、importedAt | 合法的带时区时间，至少有一个 |
+| total | 非负整数 |
+| page、pageSize | 合法正整数，pageSize 最多 100 |
+| items | 检测记录数组，长度不超过 pageSize 或 total |
+
+第 01 课的时间字段是 `inspectedAt`，第 03 课以后是 `importedAt`。这两个检查点分别使用数组和分页模型，查询入口按当前课程模式选择对应 schema。
+
+schema 接受并丢弃未声明的额外字段，便于服务端增加展示信息。缺少已有必需字段或字段类型改变则报错。本课手写的 schema 与后端 OpenAPI 需要同步维护，契约检查和浏览器验收一起帮助发现不一致。 [Zod safeParse 与类型推导](https://zod.dev/basics)
+
+## 4. 区分读取失败的阶段
+
+HTTP 状态非成功时，继续使用原来的状态码提示。收到成功状态却无法解析 JSON，会显示「响应不是有效的 JSON」。JSON 可解析但不满足 schema，则显示「接口数据格式不符合约定」。
+
+这些提示都尝试附带后端的请求编号，方便查日志。界面保留输入和筛选条件，维护人员可以用同样的查询复现。前端校验处理的是收到的数据，后端对写入内容的校验和授权仍在服务端执行。
+
+## 5. 用浏览器复现字段漂移
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 run test:e2e
+```
+
+浏览器验收先执行正常业务流程，再拦截测试页面的列表响应，依次模拟缺少 station、total 变成字符串和无效 JSON。它检查页面显示错误且没有渲染错误行。最后给响应增加一个额外字段，确认兼容的新增信息仍能显示列表。
+
+这些拦截只作用于本次测试的浏览器会话。测试继续使用独立数据库和真实后端，故障响应由 Playwright 在客户端测试边界修改。复习时可以解释为什么返回 200 仍需检查数据，以及为什么输入框能保存查询条件有助于排查响应错误。
+
+继续学习 [第 16 课 · 从 OpenAPI 生成前端类型](/knowledge/web/full-stack/generated-types-and-schema-compatibility/)。

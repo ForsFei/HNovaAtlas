@@ -1,0 +1,75 @@
+---
+id: web-quality-trace-evidence-etag
+title: "第 28 课 · 用 ETag 验证浏览器缓存的证据图"
+description: 为追溯台的 BMP 预览加上条件请求，比较 200 与 304 并验证图片改变后的缓存更新。
+tags: [Web, HTTP, ASP.NET Core, ETag, 浏览器缓存]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 280
+prerequisite: [web-quality-trace-live-cursor-updates]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 浏览时提示新入库](/knowledge/web/full-stack/live-updates-during-cursor-browsing/)
+
+上一课让操作员能停在已展开的列表。操作员也可能在几条 NG 之间来回查看证据。图片 URL 相同，只要浏览器还保留上次的副本，就可以先问服务器这份副本是否依然有效。图片没变时，服务器回一个 304，浏览器继续显示自己手里的图片。
+
+## 1. 对照首次请求和条件请求
+
+用第 3 课已经导入过检测记录的库启动服务。如果曾用 `--TraceDb` 指定库文件，这里也传入同一路径。 [导入检测记录](/knowledge/web/full-stack/sqlite-inspection-storage/)
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Contract:Enabled true --urls http://127.0.0.1:43111
+```
+
+在另一个 PowerShell 7 窗口运行以下命令。用列表的首条检测记录找到图片，先保存响应里的 ETag，再把它原样传回。值两端的双引号属于 ETag 格式。
+
+```powershell
+$base = 'http://127.0.0.1:43111'
+$inspection = (Invoke-RestMethod "$base/api/inspections?pageSize=1").items[0]
+$image = "$base/api/inspections/$($inspection.id)/image"
+
+$first = Invoke-WebRequest $image
+$tag = $first.Headers['ETag'][0]
+$again = Invoke-WebRequest $image -Headers @{ 'If-None-Match' = $tag } -SkipHttpErrorCheck
+
+$first.StatusCode
+$tag
+$again.StatusCode
+```
+
+| 请求条件 | 典型响应 | 浏览器如何使用 |
+| --- | --- | --- |
+| 第一次获取，或手里的 ETag 与当前版本不同 | `200 OK`，带 BMP 和当前 ETag | 显示这次收到的图片 |
+| 发送匹配的 `If-None-Match` | `304 Not Modified`，带 ETag 和缓存策略，无响应体 | 复用已保存的图片 |
+| 图片资源不存在 | `404 Not Found` | 进入缺失资源处理 |
+
+用追溯台详情里的原生 `<img>` 也能观察这个流程。保持开发者工具的「停用缓存」关闭，打开一条详情，再正常重新加载。Network 面板里查看图片请求的 `If-None-Match` 和响应状态。浏览器是否发出网络请求取决于它有没有可验证的缓存副本，命令行演练可以固定发送条件请求。 [HTTP 条件请求](https://www.rfc-editor.org/rfc/rfc9110.html#section-13.1.2)
+
+## 2. 从最终 BMP 生成 ETag
+
+后端从 SQLite 读出原始 PGM，并用 `Preview.ToBmp` 生成实际返回给浏览器的 BMP。对这份 BMP 字节计算 SHA-256，再把带引号的结果交给 `Results.File`。如果以后修改了 BMP 编码并产生不同字节，同一 URL 会得到新的 ETag。ASP.NET Core 的文件结果会处理 `If-None-Match`，包括多个候选值和弱标签匹配。 [ASP.NET Core 文件结果与缓存验证](https://learn.microsoft.com/aspnet/core/fundamentals/minimal-apis/responses?view=aspnetcore-10.0)
+
+```csharp
+byte[] bmp = Preview.ToBmp(image.Pgm, image.Width, image.Height);
+var tag = new EntityTagHeaderValue($"\"{Convert.ToHexString(SHA256.HashData(bmp))}\"");
+http.Response.Headers.CacheControl = "private, no-cache";
+return Results.File(bmp, "image/bmp", entityTag: tag);
+```
+
+`private` 把响应副本留给浏览器这类私有缓存。`no-cache` 要求复用前先验证。这个示例把哈希放在生成 BMP 之后，所以即使最终返回 304，服务器仍然读取 PGM、转换 BMP 并计算哈希。这次节省的是图片响应体的网络传输。 [HTTP 缓存指令](https://www.rfc-editor.org/rfc/rfc9111.html#section-5.2.2)
+
+在 [本地 OpenAPI 文档](http://127.0.0.1:43111/openapi/v1.json) 查看 `GetInspectionImage`。其中列出了请求条件头、200 的 `image/bmp`、无响应体的 304，以及校验 `If-Match` 失败时的 412。
+
+## 3. 验证同一 URL 的图片发生变化
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --image-cache
+```
+
+验收从独立的测试库读取图片并记录响应体大小。它先验证匹配的条件请求返回 304 和零字节响应体，再改变测试库中一条证据的像素，用旧 ETag 请求相同 URL。此时应返回新 BMP 和新 ETag。脚本还检查不存在的图片仍返回 404，以及 OpenAPI 和真实响应一致。
+
+复习时可以先区分原始 PGM 和最终 BMP，再解释为什么一次 304 能节省下载，却仍会执行预览转换。
+
+[下一课 · 下载原始证据并核对 SHA-256](/knowledge/web/full-stack/original-evidence-download/)

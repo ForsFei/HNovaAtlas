@@ -1,0 +1,62 @@
+---
+id: web-quality-trace-backup
+title: "第 18 课 · 备份 SQLite 并用副本验收恢复"
+description: 使用 SQLite 在线备份保存一致快照，在独立副本中验证检测记录、证据图、复核和事件游标。
+tags: [Web, SQLite, ASP.NET Core, 备份, 恢复]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 180
+prerequisite: [web-quality-trace-typed-query]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：列表与导出共用查询参数](/knowledge/web/full-stack/typed-query-parameters/)
+
+CSV 保存的是筛选后可查看的数据。如果要恢复追溯系统，还需要证据图、复核和事件序号。本课用 SQLite 自己的备份接口保存数据库快照，再从独立副本启动 API，检查几条业务路径。
+
+## 1. 在现有数据库旁生成快照
+
+从仓库根目录执行，`$source` 指向实际使用的数据库。如果之前指定了 `--TraceDb`，请用对应的文件路径。
+
+```powershell
+$source = (Resolve-Path 'examples/web-quality-trace/lesson-03/.local/trace.db').Path
+$backup = Join-Path $env:TEMP ("atlas-trace-" + [guid]::NewGuid().ToString("N") + ".db")
+dotnet run --project examples/web-quality-trace/lesson-03 -- --TraceDb $source --Backup $backup
+```
+
+命令完成后打印快照路径并退出。目标文件必须是新文件，已有同名文件会报错。应用运行时也可以备份，但当前 Microsoft.Data.Sqlite 的实现可能阻塞其他连接写入，工位忙时要把这段占用计入操作时间。 [Microsoft.Data.Sqlite 在线备份](https://learn.microsoft.com/dotnet/standard/data/sqlite/backup)
+
+## 2. 从活动库取得一个可单独打开的文件
+
+数据库启用 WAL 时，一部分已提交记录可能还在 WAL 中。只复制主文件会漏掉它们。这里用只读连接打开源库，让 `BackupDatabase` 从 SQLite 的一致视图复制数据。 [SQLite Backup API](https://sqlite.org/backup.html)
+
+输出先写到目标目录下的临时文件，完成后切为可独立打开的日志模式，执行 `PRAGMA quick_check`，关闭连接，再用同目录的移动发布新文件。快照失败时不会发布最终文件。这个检查主要确认 SQLite 文件的结构，还需要在实际业务入口验证能查到预期结果。
+
+快照保存追溯库中的记录、导入的原图字节、复核和事件表。工位原始证据目录、MES 接收库、消费者游标库以及练习账号配置分别位于其他位置。
+
+## 3. 启动副本做恢复演练
+
+保留刚生成的快照，用同一条命令将它复制到新的恢复文件。随后启动一个独立 API，观察内容是否符合备份时的状态。
+
+```powershell
+$restored = Join-Path $env:TEMP ("atlas-restored-" + [guid]::NewGuid().ToString("N") + ".db")
+dotnet run --project examples/web-quality-trace/lesson-03 -- --TraceDb $backup --Backup $restored
+dotnet run --project examples/web-quality-trace/lesson-03 -- --TraceDb $restored --urls http://127.0.0.1:43116
+```
+
+打开 [恢复库的检测列表](http://127.0.0.1:43116/api/inspections)。从响应取一条周期 ID，查询它的详情和 `/api/inspections/{id}/image`。也可以按前面的课程开启复核和事件接口，再核对复核人、时间以及事件页的流身份和游标。
+
+恢复演练中的 API 使用副本，原库可继续工作。旧备份包含当时的流身份。若要用它接替原库继续产生事件，需先对照第 14 课的流身份与游标规则，核对消费者已经确认到哪里，再决定恢复策略。
+
+## 4. 验证 WAL、冲突和业务恢复
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --backup
+```
+
+脚本生成独立工位证据，在数据库以 WAL 模式运行时写入一条复核，再创建快照。源库在快照后修改说明，恢复副本仍读到备份时的说明。测试还会启动恢复副本的 API，读取 NG 详情、图像和事件续页，检查同名目标拒绝覆盖。
+
+复习时可以分别说明，为什么文件能打开、记录能查询、消费者能按预期继续是三项不同的恢复检查。
+
+继续学习 [第 19 课 · 恢复之后核对游标和 MES 回执](/knowledge/web/full-stack/restore-delivery-reconciliation/)。

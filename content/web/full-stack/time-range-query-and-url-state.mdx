@@ -1,0 +1,85 @@
+---
+id: web-quality-trace-time-range
+title: "第 08 课 · 用时间表单查询一个班次的记录"
+description: 把导入时间范围从 React 表单写进 URL，再转换为 UTC 数据库筛选，验证边界、刷新和浏览器时区。
+tags: [Web, React, TypeScript, ASP.NET Core, UTC]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 80
+prerequisite: [web-quality-trace-http-mes]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：HTTP MES 幂等投递](/knowledge/web/full-stack/http-mes-idempotent-delivery/)
+
+追溯页面里已经能按工位和 OK／NG 查询。今天让使用者选择一个时间范围，比如只看某个班次导入的记录。你会把尚未提交的表单值、URL 中已应用的条件，以及 API 的 UTC 时间串起来。
+
+## 1. 先查一段实际有记录的时间
+
+沿用第 03 课的数据库启动 API，在另一个终端启动 React。若使用了自定义库，继续传入相同的 `--TraceDb`。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [检测记录列表](http://127.0.0.1:43112/)，先查看一条详情里的导入时间。选择覆盖它的开始、结束时间，点击「应用时间范围」。控件旁显示当前浏览器时区，地址栏里的 `since` 和 `until` 则是以 Z 结尾的 UTC 字符串。
+
+这个数据源按**导入时间**筛选。原始证据没有检测时间，因此班次练习也是对导入时间分组。实际生产若以曝光或检测结束时间划分班次，应先为相应事件记录可信时间字段，再调整查询字段。
+
+## 2. 表单草稿与已应用条件
+
+你可以在两个日期框里依次修改开始、结束。修改过程中，列表继续使用 URL 中已应用的条件，点击提交后才把整组时间写进地址，并把页码重置为 1、关闭当前详情。
+
+时间表单由独立的 `TimeRangeForm` 处理。输入框使用 `defaultValue`，提交时从 `FormData` 一次读取两个值。URL 条件改变时，父组件使用新的 `key` 创建表单，恢复相应的本地显示值。分页和详情继续按原来的 URL 状态工作。
+
+| 操作 | 页面行为 |
+| --- | --- |
+| 编辑日期，尚未提交 | 地址和查询结果继续使用已应用条件 |
+| 提交合法范围 | 更新 URL，重置分页并重新请求 |
+| 开始晚于结束，或两者相等 | 显示表单错误，保留现有查询 |
+| 清除时间范围 | 移除两个参数，保留工位和 OK／NG 条件 |
+| 刷新或浏览器前进、后退 | 从 URL 恢复范围及表单显示 |
+
+## 3. 从本地墙上时间转换为 UTC
+
+`datetime-local` 的值本身不带时区。例如浏览器时区为 Asia/Shanghai 时，输入 `2026-11-05T09:00`，脚本按浏览器本地时间创建 `Date`，再调用 `toISOString()` 得到 `2026-11-05T01:00:00.000Z`。
+
+恢复表单时则反向转换，用本地年月日、时分秒构造输入值。换一个浏览器时区打开同一条链接，URL 指向相同的时间段，输入框显示对应时区的当地时间。输入值保留到毫秒，所以刷新后再次提交可以保持相同边界。
+
+部分时区在夏令时切换日会跳过或重复一段本地时间。本例检查日期转换后的本地字段，拒绝被自动跳过的时间。重复出现的时刻按 JavaScript Date 的本地时间规则解析。需要按特定工厂时区排班时，应在界面明确选择时区和偏移。 [HTML 日期与时间格式](https://developer.mozilla.org/en-US/docs/Web/HTML/Guides/Date_and_time_formats) · [Date.toISOString](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/toISOString)
+
+## 4. API 再检查一次范围
+
+API 接收 `since`、`until`，格式固定为 `yyyy-MM-ddTHH:mm:ss.fffZ`。任意一边可以省略，非法日期、缺少 UTC 标记或倒置范围都会返回 400。前端检查改善输入体验，API 检查保证直接调用接口时也遵守相同规则。
+
+解析后的 UTC ticks 用于数据库条件。
+
+```csharp
+if (start.HasValue)
+    query = query.Where(row => row.ImportedTicks >= start.Value);
+if (end.HasValue)
+    query = query.Where(row => row.ImportedTicks < end.Value);
+```
+
+开始用大于等于，结束用小于。如果第一个班次是 01:00 到 02:00，第二个班次从 02:00 开始，恰好 02:00 的记录属于第二段。将结束时间写成 01:59:59.999 会依赖字段精度，还容易漏掉最后一小段时间。
+
+筛选在 `CountAsync` 和分页之前加入 `IQueryable`，所以总数和当前页使用同一个时间范围。原来按导入时间和 ID 建的索引也与这个查询方向相符。 [DateTimeOffset.TryParseExact](https://learn.microsoft.com/en-us/dotnet/api/system.datetimeoffset.tryparseexact?view=net-10.0)
+
+## 5. 验证边界与页面恢复
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --range
+```
+
+验证脚本使用独立的教学库，把两条记录安排在相邻时段的边界，检查开始包含、结束排除、单边范围和非法输入。
+
+再做一次浏览器练习。在第二页应用时间范围，检查页码归 1。刷新后确认两个输入框仍显示原来的本地时间，然后清除范围，再按后退恢复。切换工位或 OK／NG，确认 Network 请求里依然带着已应用的 UTC 范围。`dev:live` 模式也会按这个范围刷新当前页。
+
+继续学习 [第 09 课 · 把当前筛选结果导出为 CSV](/knowledge/web/full-stack/filtered-csv-export/)。

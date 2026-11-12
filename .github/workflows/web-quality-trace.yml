@@ -1,0 +1,76 @@
+name: Web quality trace acceptance
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: web-quality-trace-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  content:
+    name: Knowledge content
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: package-lock.json
+      - run: npm ci
+      - run: npm run prepare:content
+      - run: npm run test:content
+
+  trace:
+    name: API and browser acceptance
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            examples/web-quality-trace/lesson-02/package-lock.json
+      - uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install repository dependencies
+        run: npm ci
+      - name: Install tutorial frontend dependencies
+        run: npm ci
+        working-directory: examples/web-quality-trace/lesson-02
+      - name: API scenarios and database experiments
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .local/ci-logs -Force | Out-Null
+          npm run verify:trace -- --api 2>&1 | Tee-Object -FilePath .local/ci-logs/api.log -ErrorAction Stop
+          exit $LASTEXITCODE
+      - name: Contracts and browser scenarios
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path .local/ci-logs -Force | Out-Null
+          npm run verify:trace -- --browser 2>&1 | Tee-Object -FilePath .local/ci-logs/browser.log -ErrorAction Stop
+          exit $LASTEXITCODE
+      - name: Upload failed acceptance logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
+        with:
+          name: web-quality-trace-logs-${{ github.run_attempt }}
+          path: .local/ci-logs/*.log
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 7

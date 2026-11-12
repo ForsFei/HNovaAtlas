@@ -1,0 +1,73 @@
+---
+id: web-quality-trace-generated-types
+title: "第 16 课 · 从 OpenAPI 生成前端类型"
+description: 用 openapi-typescript 生成查询类型，把 Zod 输出接到契约检查，并用负向编译验证必需字段漂移。
+tags: [Web, TypeScript, OpenAPI, Zod, 契约]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 160
+prerequisite: [web-quality-trace-runtime-validation]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：响应运行时校验](/knowledge/web/full-stack/runtime-response-validation/)
+
+上一课把运行时 schema 和页面类型放在了一起。后端也有自己的 OpenAPI 模型。现在让生成工具读取这份模型，检查前端通过校验后的数据能否满足后端声明，帮助发现必需字段漏同步。
+
+## 1. 生成查询类型
+
+在仓库根目录运行以下命令，需要 .NET 10 SDK 和 Node.js 24。
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 ci
+npm --prefix examples/web-quality-trace/lesson-02 run generate:contract
+npm --prefix examples/web-quality-trace/lesson-02 run build:review
+```
+
+生成脚本构建后端，创建独立的临时空数据库，开启查询契约并监听随机端口。读取文档后，它把类型写入 `src/generated-query.d.ts`，随后关闭自己启动的 API。这个生成过程只注册查询入口，所需的分页与检测详情模型都来自这份文档。
+
+生成文件纳入仓库，因此正常安装和构建可以直接使用已保存的类型。修改后端模型或端点声明后，重新生成，再检查差异。内容完全相同时不会重写文件。 [openapi-typescript Node API](https://openapi-ts.dev/node)
+
+## 2. 在 Zod 输出上检查兼容性
+
+生成文件里的 `components["schemas"]["InspectionPage"]` 描述后端分页模型。前端 schema 使用 `satisfies`，让 TypeScript 检查其输出是否可以作为该模型使用。
+
+```typescript
+// inspectionPageSchema 的定义末尾
+satisfies z.ZodType<components["schemas"]["InspectionPage"]>;
+```
+
+如果生成模型多了一个必需字段，而前端 schema 还没输出它，编译就会失败。页面使用的类型仍从 Zod 推导，因此运行时校验和页面字段继续保持一致。
+
+当前数据库详情要求 `importedAt`，所以本课为它建立了单独的 storage schema。第 01 课使用 `inspectedAt` 的内存样例仍有自己的数据入口。这样当前后端的必需时间字段可以接受更明确的检查。
+
+## 3. 生成类型与运行时规则配合
+
+生成工具根据 OpenAPI 得到 TypeScript 类型，Zod 在实际收到响应时执行检查。两者的精度取决于各自的声明。
+
+例如这份 ASP.NET Core 文档允许部分数值字段采用 number 或 string 的表示，生成结果保留这两种类型。页面 schema 要求数字，因此字符串响应仍会被拒绝。OK／NG 枚举、ROI 范围和至少一个时间字段等规则也继续由手写 schema 表达。
+
+`satisfies` 检查的是可赋值关系。它能发现缺少必需字段，额外字段或某些更宽松的类型则需要其他验证。数值范围、时间含义、Cookie 与重试行为也要继续通过运行时校验和集成测试确认。 [Zod 匹配现有类型](https://zod.dev/api?id=matching-an-existing-type)
+
+## 4. 在检查模式下发现过期文件
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 run check:contract
+```
+
+检查模式重新从当前后端生成类型，与已保存文件比较。不同就退出并提示重新生成，文件保留原内容。这样可以发现后端已经修改、生成文件却还停在旧版本的情况。
+
+工作顺序可以是修改后端模型、更新生成类型、查看差异、调整 schema，最后构建并运行浏览器验收。生成结果只是映射已经声明的契约，后端元数据本身也需要第 12 课的接口检查验证。
+
+## 5. 证明漏同步时确实会失败
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 run test:type-drift
+npm --prefix examples/web-quality-trace/lesson-02 run test:e2e
+```
+
+第一个脚本在 `.local` 中复制 schema 和生成类型，为测试模型临时增加一个必需字段 `requiredByServer`，再启动 TypeScript 编译器。预期结果是编译失败，而且诊断必须提到这个字段。脚本把这种预期失败视为验证通过。
+
+浏览器验收再检查真实正常响应与上一课的异常响应。复习时可以分别指出生成类型、编译兼容性检查、运行时 schema 和浏览器业务验收各自能发现的问题。
+
+继续学习 [第 17 课 · 让列表和导出共用查询参数](/knowledge/web/full-stack/typed-query-parameters/)。

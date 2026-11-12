@@ -1,0 +1,88 @@
+---
+id: web-quality-trace-endpoint-module
+title: "第 41 课 · 把检测接口整理成独立模块"
+description: 从启动入口提取检测查询、预览和附件下载路由，并用已有契约与接口验收确认重构结果。
+tags: [Web, ASP.NET Core, Minimal API, 重构, 项目结构]
+difficulty: intermediate
+status: published
+updated: "2026-11-09"
+order: 410
+prerequisite: [web-quality-trace-delivery-acceptance]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 阶段交付验收](/knowledge/web/full-stack/course-delivery-acceptance/)
+
+前 40 课已经积累了一组可重复运行的验收。接下来整理代码结构时，就可以用这些检查确认改动是否影响实际入口。本课从 `Program.cs` 提取检测接口，把相关路由集中放到 `InspectionEndpoints.cs`。
+
+## 1. 先找到启动代码和路由的边界
+
+`Program.cs` 负责读取配置、注册服务、建立中间件管道、初始化数据库，以及处理导入、备份和升级命令。检测记录的 HTTP 查询可以集中在一个路由注册模块里。
+
+| 文件 | 当前承担的工作 |
+| --- | --- |
+| `Program.cs` | 创建应用，准备数据库，组合各个功能入口 |
+| `InspectionEndpoints.cs` | 注册检测列表、详情、BMP 预览和原始 PGM 下载 |
+| `InspectionPages.cs` | 注册复合游标查询 |
+| `ReviewEndpoints.cs` | 注册会话与复核接口 |
+| `InspectionEvents.cs` | 注册持久事件补读 |
+
+Minimal API 的路由可以定义在独立文件中，再通过扩展方法完成注册。 [ASP.NET Core Minimal API 路由组织](https://learn.microsoft.com/aspnet/core/fundamentals/minimal-apis?view=aspnetcore-10.0)
+
+## 2. 用一个调用组合检测接口
+
+启动入口现在调用：
+
+```csharp
+app.MapInspectionEndpoints(reviewEnabled, readLimitEnabled);
+app.MapInspectionPages(readLimitEnabled);
+```
+
+扩展方法接收应用和两个已经解析好的功能开关，然后注册对应路由。
+
+```csharp
+public static void MapInspectionEndpoints(
+    this WebApplication app, bool reviewEnabled, bool readLimitEnabled)
+{
+    // 注册列表、详情、预览和原始附件端点。
+}
+```
+
+`reviewEnabled` 用于判断复核状态筛选是否可用。`readLimitEnabled` 用于给列表入口附加查询限流策略。它们都来自应用启动时的配置。
+
+HTTP 处理函数仍通过参数接收本次请求的 `TraceDb`、`HttpContext` 和取消令牌。路由注册模块在启动时建立映射，请求到来后再解析这些请求所需的服务。
+
+## 3. 用行为检查判断提取是否完整
+
+本次提取涉及四个 HTTP 入口，需要沿各自的正常路径检查。
+
+| 入口 | 验收重点 |
+| --- | --- |
+| 检测列表 | 参数绑定、计数、页码、排序、复核筛选与 CSV |
+| 单条详情 | ID 查询、成功响应和缺失记录 |
+| BMP 预览 | 像素转换、ETag 和条件请求 |
+| PGM 附件 | 原始字节、文件名、摘要与损坏拒绝 |
+
+路由旁的 `WithName` 和响应元数据也一起进入模块。端点名称会参与 OpenAPI 的 operationId，前端生成类型使用这些标识定位操作。 [OpenAPI 端点元数据](https://learn.microsoft.com/aspnet/core/fundamentals/openapi/include-metadata)
+
+查询限流仍由启动入口配置中间件，路由模块负责给目标端点附加策略。阅读这两处代码，可以分别看清管道能力在哪里启用，以及哪些端点使用它。
+
+## 4. 用上一课的入口验收
+
+在仓库根目录运行接口组。
+
+```powershell
+npm run verify:trace -- --api
+```
+
+它会构建提取后的后端，再运行接口场景和数据库实验。随后，在前端目录核对契约。
+
+```powershell
+Push-Location examples/web-quality-trace/lesson-02
+try { npm run check:contract } finally { Pop-Location }
+```
+
+契约检查会从当前后端读取 OpenAPI，与已有生成类型比较。把构建、真实 HTTP 场景和契约放在一起，才能检查代码移动是否遗漏了参数、响应说明或策略绑定。
+
+复习时想一想，为什么处理函数通过参数接收请求作用域的数据库上下文，而启动入口只把配置开关传给注册方法？如果提取时漏掉 `WithName`，哪一项验收最可能先暴露差异？
+
+**下一课** → [把证据导入整理成独立用例](/knowledge/web/full-stack/extract-evidence-importer/)

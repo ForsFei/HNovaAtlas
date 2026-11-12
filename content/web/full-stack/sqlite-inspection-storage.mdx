@@ -1,0 +1,91 @@
+---
+id: web-quality-trace-sqlite
+title: "第 03 课 · 导入工位证据，用 SQLite 查询检测记录"
+description: 用 EF Core 持久化真实离线证据，让 React 使用服务端分页，并验证重启后的记录和原图预览。
+tags: [Web, EF Core, SQLite, ASP.NET Core, React]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 30
+prerequisite: [web-quality-trace-react-list]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：React 检测记录列表](/knowledge/web/full-stack/react-inspection-list/)
+
+上一课用内存样例练习查询和浏览器分页。这一课把模拟工位实际生成的 OK、NG 证据导进 SQLite。React 继续用原来的列表与详情界面，按页请求数据，点开详情还能查看对应图像。
+
+## 1. 生成证据并导入
+
+在仓库根目录运行以下命令。第一条会打印两个周期目录，分别对应 OK 和 NG。每个目录都包含 `manifest.json` 和 `image.pgm`。用实际打印的路径替换下面的占位符。
+
+```powershell
+dotnet run --project examples/industrial-station-evidence -- --demo
+
+$ok = '实际的 OK 周期目录'
+$ng = '实际的 NG 周期目录'
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Import $ok --Station station-a
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Import $ng --Station station-a
+```
+
+导入命令结束后会退出。再次导入相同周期，输出 `Already imported`。同一个周期若对应不同工位、检测结果、ROI 均值或图像哈希，导入会报冲突。默认库位于 `lesson-03/.local/trace.db`，也可以给每条导入和服务命令传同一个 `--TraceDb` 绝对路径，独立练习。
+
+接着启动 API。若第一课的 API 仍占用 43111，先在对应终端用 Ctrl+C 结束它。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+在另一个终端打开同一个 React 项目，用本课的模式启动。
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [检测记录列表](http://127.0.0.1:43112/?station=station-a&result=NG)，应只有一条 NG。打开详情，检查 ROI 均值 75 和原图预览。重启后端并刷新，页面应恢复筛选和当前周期。
+
+## 2. 验证证据，再写数据库
+
+`--Import` 接收一个已发布的周期目录。它先从目录名取得会话 GUID 和周期号，再调用工位项目原有的校验逻辑核对身份、图像头、像素数、SHA-256、测量值与判定。校验通过后，才把查询字段和同一批已校验的 PGM 字节写入数据库。会话 GUID 加周期号组成主键，因为不同会话都可能出现第 1 个周期。
+
+这批证据有帧号和周期号，未记录检测时间。页面显示的是**导入时间**。数据库以 UTC ticks 保存它，适合 SQLite 比较与排序，API 再输出带 UTC 标记的时间。工位名由导入命令提供，示例使用 `station-a`。
+
+导入在事务内查主键、判断冲突并写入。这样重试时可以复用已有行，图像和查询字段也会一起提交。启动时用 `EnsureCreatedAsync` 初始化本课的教学库。它适合新库初始化，表结构演进需要 EF Core migrations。
+
+## 3. 先筛选和排序，再取一页
+
+列表路径仍是 `GET /api/inspections`。第 03 课的后端返回分页对象，React 的 `storage` 模式按这个对象渲染。
+
+| 请求 | 预期 |
+| --- | --- |
+| `?page=1&pageSize=1` | `items` 只有第一页，`total` 是筛选后的总数 |
+| `?station=station-a&result=NG` | 仅匹配 NG，示例的总数为 1 |
+| `?page=99&pageSize=1` | 200 和空的 `items`，前端可以提示回到第一页 |
+| `?pageSize=101` | 400，页大小允许 1 到 100 |
+
+从 `DbSet` 建立 `IQueryable`，按输入追加 `Where`，再执行 `CountAsync` 和 `Skip/Take`。两条查询共用筛选和一次事务视图。排序先用导入时间，再用唯一主键打破时间相同的情况，避免同一批数据的顺序随请求变化。连续翻页期间若有数据变动，偏移分页仍可能漂移。
+
+列表和详情通过 `Select` 投影查询字段，点击详情后才单独请求 `/api/inspections/{id}/image`。图像端点把保存的 P5 灰度像素转换为浏览器可显示的 BMP，数据库仍保存原 PGM 字节。
+
+## 4. 用真实 HTTP 验证重启
+
+在仓库根目录运行下面两条命令。验证脚本会生成一批新证据，使用独立的临时数据库，并打印两者的位置。
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs
+```
+
+脚本检查重复导入、冲突拒绝、筛选、分页和错误状态，然后停止 API、用同一个库重新启动，核对 NG 详情和 BMP 每个像素是否对应原始 PGM。
+
+## 5. 练习与复习
+
+1. 在 Network 面板筛选 NG，确认 `result=NG` 出现在请求里，再检查响应的 `items` 和 `total`。
+2. 给同一周期换一个工位名重新导入，观察冲突后原记录的工位。
+3. 解释为什么用导入时间排序时还需要主键，以及数据库分页如何减少浏览器收到的数据。
+4. 看详情的两次请求，指出列表或详情 JSON 为什么没有携带原图字节。
+
+[**下一课**](/knowledge/web/full-stack/ng-review-and-authorization/)会在 NG 详情里加入需要授权的复核操作，并记录操作人和时间。
+
+参考：[EF Core SQLite 提供程序限制](https://learn.microsoft.com/ef/core/providers/sqlite/limitations) · [EF Core 分页](https://learn.microsoft.com/ef/core/querying/pagination)

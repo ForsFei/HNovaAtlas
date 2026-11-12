@@ -1,0 +1,77 @@
+---
+id: web-quality-trace-first-api
+title: "第 01 课 · 从浏览器到第一个 ASP.NET Core API"
+description: 启动质量追溯台，在浏览器中查询离线检测样例，逐段理解路由、参数绑定、JSON 和 HTTP 错误。
+tags: [Web, ASP.NET Core, HTTP, JavaScript]
+difficulty: beginner
+status: published
+updated: "2026-11-05"
+order: 10
+prerequisite: [web-quality-trace-course]
+---
+
+[返回系列路线图](/knowledge/web/full-stack/overview/)
+
+这一课交付检测记录的**列表接口、详情接口和查询页面**。样例以离线工位模拟演示的 ROI 均值 220 和 75 为原型，周期编号和时间固定，便于在每台机器上复现。后续会沿用这两个查询入口，逐步接入 React 和真实离线文件导入。
+
+## 1. 先跑通一条记录
+
+在仓库根目录打开终端。确认装有 .NET 10 SDK，然后启动示例。
+
+```powershell
+dotnet --list-sdks
+dotnet run --project examples/web-quality-trace/lesson-01/QualityTrace.csproj -- --urls http://127.0.0.1:43111
+```
+
+打开 [查询页](http://127.0.0.1:43111/)，查询默认的 `cycle-002`。你应该看到 `result: "NG"` 和 `roiMean: 75`。改成 `cycle-001`，结果应是 OK；再查 `missing`，页面显示找不到该周期。用 Ctrl+C 结束服务。
+
+示例中的 `Program.cs` 写 API，`wwwroot/index.html` 提供表单，`wwwroot/app.js` 处理提交和显示。浏览器先下载 HTML 和 JavaScript，随后点击查询才发出 API 请求。
+
+## 2. 在 Network 面板追踪请求
+
+打开开发者工具的 Network 面板，选择 Fetch/XHR，再查询一次。点开 `cycle-002`，检查请求方法为 GET，路径为 `/api/inspections/cycle-002`，响应状态为 200。再打开 Response，找到 JSON 里的 `id`、`station`、`inspectedAt`、`result` 和 `roiMean`。
+
+| 请求 | 输入来自哪里 | 预期结果 |
+| --- | --- | --- |
+| `GET /api/inspections` | 无过滤参数 | 200，两条记录 |
+| `GET /api/inspections?station=station-a` | 查询字符串 `station` | 200，两条匹配记录 |
+| `GET /api/inspections?station=station-b` | 查询字符串 `station` | 200，空数组 |
+| `GET /api/inspections/cycle-002` | 路径参数 `id` | 200，一条 NG 记录 |
+| `GET /api/inspections/missing` | 路径参数 `id` | 404，Problem Details JSON |
+
+列表表达的是查询结果，零条结果也是一次成功查询。详情要定位一个特定资源，找不到该资源时用 404。HTTP 200 描述请求成功，记录里的 NG 描述工件检测结果，排查时分别看这两个值。
+
+## 3. 后端怎样找到处理请求的代码
+
+`WebApplication.CreateBuilder(args)` 建立应用配置，`Build()` 生成应用。接着注册静态文件处理和 API 路由，最后由 `Run()` 启动宿主。首页通过 `UseDefaultFiles()` 找到默认文档，再由 `UseStaticFiles()` 读取 `wwwroot` 中的文件。
+
+```csharp
+app.MapGet("/api/inspections/{id}", IResult (string id) =>
+{
+    var inspection = Array.Find(inspections, row => row.Id == id);
+    return inspection is null
+        ? Results.Problem(statusCode: 404, title: "Inspection not found")
+        : Results.Ok(inspection);
+});
+```
+
+`MapGet` 将 GET 请求与路径模板关联。模板中的 `{id}` 绑定到处理函数同名参数。列表接口的 `station` 没有出现在路径模板里，框架从查询字符串取值，参数缺失时用 `null`。找到记录后，`Results.Ok` 把 C# 对象序列化成 JSON，网页读到的是序列化后的字段和值。
+
+## 4. 前端怎样读到数据
+
+表单提交时，`preventDefault()` 阻止整页导航。脚本用 `encodeURIComponent(id)` 编码用户输入，再用 `fetch` 请求详情。收到响应后先看 `response.status` 和 `response.ok`，成功时才调用 `response.json()` 读取响应体。最后用 `textContent` 显示文本。
+
+一次普通的 404 仍会得到一个 `Response`，所以要主动处理状态码。连接失败或浏览器阻止读取跨源响应时，`fetch` 可能拒绝；成功收到响应但响应体无法解析为 JSON 时，错误发生在 `response.json()`。这两种情况可以从 Network 面板里有没有可读响应来区分。
+
+页面和 API 都由 `http://127.0.0.1:43111` 提供，协议、主机和端口相同，属于同源。到了下一课，若 React 开发服务与 API 端口不同，浏览器就会按跨源请求处理。届时会通过开发代理保持浏览器发出的 API 请求同源，并解释直接跨源时 CORS 怎样参与。
+
+## 5. 练习与复习
+
+1. 直接打开列表接口，分别查询 `station-a` 和 `station-b`。确认响应状态一致，数组长度不同。
+2. 在内存数组新增一个周期。重新启动后，从页面查询它，再确认列表里也能找到它。
+3. 说说为什么先检查 `response.ok`，再解析和显示记录。用不存在的编号验证你的解释。
+4. 解释为什么工件 NG 可以对应 HTTP 200，以及哪个层次负责判断各自的含义。
+
+完成后，你应能从页面上的一次点击追到 C# 处理函数，并从响应里说清数据怎样回到页面。[**下一课**](/knowledge/web/full-stack/react-inspection-list/)会在这两个 API 上接 React 列表，把筛选写入 URL，并处理快速切换查询时的请求竞争。
+
+参考：[ASP.NET Core Minimal API](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/minimal-apis?view=aspnetcore-10.0) · [ASP.NET Core 静态文件](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/static-files?view=aspnetcore-10.0) · [Fetch 标准](https://fetch.spec.whatwg.org/)

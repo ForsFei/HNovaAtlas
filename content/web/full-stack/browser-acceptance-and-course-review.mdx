@@ -1,0 +1,70 @@
+---
+id: web-quality-trace-browser-acceptance
+title: "第 11 课 · 用真实浏览器验收整个追溯流程"
+description: 从独立工位证据开始，用 Playwright 验证查询、图像、CSV 下载、登录复核、重启和请求编号。
+tags: [Web, Playwright, React, ASP.NET Core, 集成测试]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 110
+prerequisite: [web-quality-trace-diagnostics]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：请求诊断](/knowledge/web/full-stack/request-diagnostics-and-problem-details/)
+
+前面的课程逐步加上了查询、证据、复核和导出。最后这一课从使用者的一次实际操作出发，确认前端、后端和数据库一起工作。把这次验收保留下来，后续修改字段或页面时就能再次运行。
+
+## 1. 运行完整浏览器验收
+
+需要 .NET 10 SDK、Node.js 24，以及本机已安装的 Microsoft Edge。在仓库根目录运行。
+
+```powershell
+npm --prefix examples/web-quality-trace/lesson-02 ci
+npm --prefix examples/web-quality-trace/lesson-02 run test:e2e
+```
+
+脚本先构建复核模式的前端和 .NET 后端，再生成两份独立工位证据。它创建临时数据库，导入 OK 和 NG，启动使用随机端口的 API，并让 API 提供刚构建的静态页面。
+
+Playwright 用独立的无头 Edge 会话执行操作。三个练习账号的密码在运行时生成，浏览器会话与测试库分别创建。验收完成后，脚本关闭自己启动的浏览器和 API，打印测试库与下载文件的位置。 [Playwright 浏览器通道](https://playwright.dev/docs/api/class-browsertype)
+
+## 2. 检查业务结果
+
+| 操作 | 检查什么 |
+| --- | --- |
+| 翻页后筛 NG | URL 重置页码，表格显示 NG |
+| 点击 CSV 导出 | 浏览器实际收到文件，内容包含 NG |
+| 进入周期详情 | 原图成功解码，显示可见图片 |
+| 独立会话登录 viewer | 可以查看详情，提交按钮不显示 |
+| alice 登录并提交 | 说明保存到复核记录 |
+| 停止再启动 API | 原会话刷新后仍读到复核记录 |
+| 提交时间范围 | 上海当地时间转换为预期 UTC |
+| 刷新再清除范围 | 输入框恢复，列表可以重新查到记录 |
+| 请求不存在的周期 | 页面错误编号与响应头、后端日志一致 |
+
+这些检查通过点击、填写和下载完成。CSV 验收先等待浏览器的下载事件，再点击按钮，最后保存并读取下载文件。这样既检查接口内容，也检查下载交互是否真的触发。 [Playwright 下载](https://playwright.dev/docs/api/class-download)
+
+## 3. 等待可观察的状态
+
+页面完成加载后还可能继续发请求。脚本等待某一行出现、图片完成解码或复核说明显示，而不是在每次点击后固定睡几秒。
+
+例如筛选后既检查 URL，也检查表格中的结果。只有地址改变还不足以证明请求完成。重启后等待保存的说明重新出现，才能说明页面已经读取了持久化记录。有限时长的等待会在目标状态始终没有出现时失败。
+
+如果脚本失败，先看终端报出的断言，再看打印路径中的 `api.log`。错误编号可以继续用于定位对应请求。修复后重新运行，会创建一批新的独立数据。
+
+## 4. 对照不同层次的验证
+
+浏览器验收覆盖使用者完成主要业务的路径。更细的事务失败、并发和游标恢复继续运行之前的 HTTP 验证。
+
+```powershell
+node examples/web-quality-trace/lesson-03/verify.mjs --review --events --mes --range --csv --diagnostics
+```
+
+这条命令会使用独立数据库，依次验证复核权限、事件补读、HTTP MES 幂等、时间边界、导出和请求诊断。每项故障都有明确的预期状态，例如批次失败后游标保留原值，重复投递后回执 ID 一致。
+
+## 5. 回看你已经完成的项目
+
+从第 01 课的两条内存记录开始，你已经把检测数据送入 SQLite，通过 React 查询和筛选，查看证据并提交授权复核。之后给页面加入实时刷新，让模拟 MES 按游标补读，再处理 HTTP 响应丢失。最后通过时间查询、CSV 和请求编号完善了追溯工作流。
+
+这轮教程在本机回环环境完成验收，使用本地教学账号和模拟工位证据。复习时可以从任意一条 NG 出发，说明其周期身份怎样贯穿证据、API、复核、CSV 和 MES 回执，并用测试证明一次故障之后系统保留了哪些状态。
+
+继续学习 [第 12 课 · 用 OpenAPI 明确前后端查询契约](/knowledge/web/full-stack/openapi-query-contracts/)。

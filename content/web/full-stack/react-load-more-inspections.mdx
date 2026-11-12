@@ -1,0 +1,61 @@
+---
+id: web-quality-trace-react-load-more
+title: "第 26 课 · 在 React 中加载更多检测记录"
+description: 把复合游标接入追溯台界面，处理列表追加、失败重试、筛选变化和旧请求取消。
+tags: [Web, React, TypeScript, 游标, 浏览器验收]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 260
+prerequisite: [web-quality-trace-cursor-api]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：ASP.NET Core 游标查询](/knowledge/web/full-stack/inspection-cursor-api/)
+
+上一课可以通过 HTTP 请求拿到 `nextCursor`。这一课让操作员在浏览器里逐批看某个工位的 OK 或 NG。已经读到的记录继续留在表格里，点「加载更多」才请求下一批。
+
+## 1. 在追溯台切换分页方式
+
+用第 3 课导入过数据的库。选定工位至少要有两条同类记录，才能看到「加载更多」按钮。也可以直接跑本课的浏览器验收，它会为测试准备这样的数据。 [导入检测记录](/knowledge/web/full-stack/sqlite-inspection-storage/)
+
+在仓库根目录启动 API，另开一个终端启动 React。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+```powershell
+cd examples/web-quality-trace/lesson-02
+npm ci
+npm run dev:storage
+```
+
+打开 [本地追溯台](http://127.0.0.1:43112/?paging=cursor&station=station-a&result=NG)。也可以从页面的「分页方式」下拉框切换。按页码仍是默认选项。选择「加载更多」后，需要选定一个工位以及 OK 或 NG。示例沿用前几课每批 1 条的配置，便于用小样本观察请求。
+
+在 Network 面板查看 `/api/inspection-pages`。首页带工位、结果和可选时间范围，续页再加 `after`。表格标题显示已加载的条数。接口返回 `nextCursor: null` 后，界面提示已加载全部，结束这轮读取。
+
+## 2. 让请求结果只更新它所属的列表
+
+分页方式、工位、结果和时间范围可以保存在页面 URL 里。当前游标与已累计的行由 `CursorInspectionList` 持有。页面刷新，或用浏览器前进、后退切换到不同筛选时，会按地址中的条件从首页读取。选中一条记录会打开已有的详情，筛选条件相同就会保留已加载的行。
+
+组件的 React `key` 使用首页请求 URL。工位、结果或时间范围变了，旧组件被卸载，旧的行与游标随之丢弃。清理函数取消进行中的请求。写入状态前还会确认请求仍由当前控制器持有，避免旧请求的结果、错误或结束状态影响当前页面。 [React 的请求清理](https://react.dev/learn/synchronizing-with-effects#fetching-data)
+
+同一时刻只允许当前列表发出一个请求。请求期间禁用「加载更多」与「刷新列表」。成功续页时一次更新行和游标，失败时保留已有行和原游标，再按一次「加载更多」即可重试。响应先经过 Zod 校验，游标在浏览器中始终作为字符串传递。
+
+## 3. 区分续页和刷新
+
+续页从旧边界向较早的记录推进。实时模式下，新入库记录可以通过「刷新列表」查看，刷新成功后以新首页替换已加载的行。这样操作员连续向下查看时，SignalR 通知不会重置当前浏览位置。CSV 仍按当前筛选导出整批结果，并沿用游标模式的时间降序。
+
+## 4. 用真实浏览器验收
+
+在示例前端目录运行下面的命令。脚本会构建前端，启动临时 SQLite 库和 ASP.NET Core 服务，然后用 Edge 验收。
+
+```powershell
+npm run test:e2e
+```
+
+验收先制造一次续页 503，确认表格保留已读记录、错误带请求编号、重试仍发送同一个游标。接着拦住一条已经取到数据的续页响应，在浏览器中切换工位，检查旧请求被取消且页面只显示新工位的数据。最后验证刷新、浏览器后退和切回页码分页。
+
+复习时对比两个动作。点击某条记录只改变详情 ID，切换工位改变整个查询范围。为什么只有后者应该重建列表？
+
+[下一课 · 浏览历史记录时提示新入库](/knowledge/web/full-stack/live-updates-during-cursor-browsing/)

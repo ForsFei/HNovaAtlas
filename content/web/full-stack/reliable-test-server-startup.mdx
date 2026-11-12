@@ -1,0 +1,110 @@
+---
+id: web-quality-trace-test-server-startup
+title: "第 43 课 · 让接口验收的服务启动更可靠"
+description: 从上一课遇到的随机端口失败出发，区分监听成功、Fetch 可访问和业务断言，增加有限重试与可复现的故障注入。
+tags: [Web, Node.js, 集成测试, 故障注入]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 430
+prerequisite: [web-quality-trace-evidence-importer]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 独立证据导入用例](/knowledge/web/full-stack/extract-evidence-importer/)
+
+上一课执行接口组时，最后一个场景出现 `TypeError: fetch failed`，内层原因是 `bad port`。单独重跑后通过。这类偶发失败会让学习者难以判断到底是接口出错还是测试环境没有准备好。本课沿着这个实际问题，完善现有 `withServer`，并把恢复行为也纳入验收。
+
+## 1. 监听成功还需要检查什么
+
+示例通过 `http://127.0.0.1:0` 启动 ASP.NET Core，由系统分配可绑定端口，再从日志取得实际地址。这样可以避免写死测试端口，但系统能绑定某个端口，并不等于 Fetch 会允许访问。
+
+Fetch 标准对 HTTP(S) 请求有端口阻止规则。遇到被阻止的端口，请求可以在建立 HTTP 通信之前失败。 [Fetch 端口限制](https://fetch.spec.whatwg.org/#port-blocking)
+
+因此需要分清三个阶段：
+
+| 阶段 | 当前检查 | 失败意味着什么 |
+| --- | --- | --- |
+| 进程启动与监听 | 日志出现实际监听地址 | 程序没有及时监听，或启动失败 |
+| 客户端可访问 | Fetch 请求 `/health/live` 并完整读取响应 | 当前地址不能按预期完成 HTTP 通信 |
+| 业务场景 | 查询、复核、下载等具体断言 | 接口行为不符合测试预期 |
+
+探测成功也不能代表数据库或所有业务都正常。存活检查的含义仍沿用第 20 课；数据库行为由后续场景验证。
+
+## 2. 在业务断言之前探测
+
+`examples/web-quality-trace/lesson-03/verify.mjs` 现在先请求已有的存活入口：
+
+```javascript
+const probe = await fetch(origin + "/health/live", {
+  signal: AbortSignal.timeout(5000),
+});
+await probe.arrayBuffer();
+assert.equal(probe.status, 200, "Startup liveness probe failed");
+```
+
+这一步既检查响应状态，也消费响应体，让后续场景从已完成的探测开始。五秒超时限制本次探测的等待时间。
+
+所有业务请求仍在探测成功后交给原来的 `check` 回调。列表数据错误、图片摘要不符、授权状态错误等断言都按原规则失败。
+
+## 3. 重试必须限定原因与次数
+
+本课最多启动三次，仅接受探测阶段的这一种错误进入重试分支：
+
+```javascript
+error instanceof TypeError && error.cause?.message === "bad port"
+```
+
+前两次命中时记录地址和尝试次数，进入下一轮；第三次仍命中则抛出错误。其他网络错误、超时、HTTP 非 200 或业务断言失败均直接向外传播。
+
+这里使用的是当前 Node Fetch 的错误形状。将来升级运行时，如果错误形状变化，应核对实际异常并更新检查；匹配不到时会失败，而不会把未知错误当成可恢复端口问题。
+
+外层循环中保留 `try/finally`：
+
+```javascript
+try {
+  // 等待监听、探测；只有探测中的 bad port 可以 continue。
+  await check(get, origin, readLog);
+  return;
+} finally {
+  if (server.exitCode === null) server.kill();
+  await exited;
+}
+```
+
+上面是控制流程示意；实际代码中的 `get` 和日志读取函数仍以内联函数传给回调。`continue` 也会执行 `finally`，所以旧服务退出后才启动新服务。成功返回和断言抛错也走同一条清理路径。
+
+测试仍使用原来的临时数据库。重启阶段尚未执行业务回调，所以不会重复提交复核或执行该回调内的其他写入。
+
+## 4. 不等随机故障再次发生
+
+新增的 `verify-server-startup.mjs` 在独立 Node 子进程中，通过 `--import` 加载仅用于测试的内存模块，替换该子进程的 `fetch`。后端和临时数据库都是真实启动的；只有指定的客户端响应被注入故障。
+
+| 注入场景 | 验收结果 |
+| --- | --- |
+| 第一次存活探测抛出 `bad port`，后续正常 | 日志记录一次拒绝，新服务完成基础查询与图片检查 |
+| 每次存活探测都抛出 `bad port` | 恰好三次拒绝后失败，业务检查没有完成 |
+| 存活正常，列表返回不符合预期的数据 | 业务断言失败，没有端口重试日志 |
+
+注入使用当前异常的形状，验证的是恢复分支和次数限制，没有真的把系统随机端口改成受限端口。测试修改只存在于子进程，父进程与正常 API 服务不受影响。
+
+## 5. 跟着运行
+
+在仓库根目录先构建，然后单独执行故障注入：
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03 --nologo
+node examples/web-quality-trace/lesson-03/verify-server-startup.mjs
+```
+
+通过后会显示 `Startup fault injection passed`。也可以继续使用统一入口：
+
+```powershell
+npm run verify:trace -- --api
+```
+
+统一入口在构建后增加了服务启动故障注入阶段，再执行已有接口场景和数据库实验。这个顺序先验证测试设施，再验证业务。
+
+复习时想一想：为什么不能将整个业务回调也放进自动重试范围？如果在旧进程退出之前就创建新进程，会给数据库文件和日志排查带来什么影响？存活探测通过后，为什么还需要真正查询数据库？
+
+
+**下一课** → [提取列表与详情的查询 Hook](/knowledge/web/full-stack/extract-json-query-hook/)

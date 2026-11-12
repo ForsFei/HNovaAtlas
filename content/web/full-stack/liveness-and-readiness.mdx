@@ -1,0 +1,73 @@
+---
+id: web-quality-trace-health
+title: "第 20 课 · 区分服务存活与查询就绪"
+description: 用 ASP.NET Core 健康检查分别验证进程和 SQLite 查询，在故障演练中观察 200、503 及恢复。
+tags: [Web, ASP.NET Core, SQLite, 健康检查, 运维]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 200
+prerequisite: [web-quality-trace-delivery-audit]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：恢复之后核对游标和 MES 回执](/knowledge/web/full-stack/restore-delivery-reconciliation/)
+
+上一课用业务记录确认恢复结果。这一课从服务运行角度判断两个问题。进程能响应 HTTP 吗？现在还能查检测数据吗？把这两个问题分别交给存活与就绪检查，运行人员可以更准确地判断故障影响。
+
+## 1. 查询两个健康入口
+
+沿用前面的追溯数据库。从仓库根目录启动 API。如果使用自定义库，继续传入相同的 `--TraceDb`。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+另开终端调用接口。
+
+```powershell
+curl.exe -i http://127.0.0.1:43111/health/live
+curl.exe -i http://127.0.0.1:43111/health/ready
+```
+
+正常时两个接口都返回 200 和 `Healthy`。查询就绪失败时，`/health/ready` 返回 503 和 `Unhealthy`。响应头包含请求编号，可以到第 10 课的日志里查同一请求。探测响应禁止缓存，以便每次读取当前状态。 [ASP.NET Core 健康检查](https://learn.microsoft.com/en-us/aspnet/core/host-and-deploy/health-checks?view=aspnetcore-10.0)
+
+## 2. 存活和就绪各查什么
+
+用 `AddHealthChecks` 注册 `TraceReadiness`，标签为 `ready`。映射两个路径时，通过 `Predicate` 选择要执行的检查。
+
+```csharp
+app.MapHealthChecks("/health/live", new HealthCheckOptions { Predicate = _ => false });
+app.MapHealthChecks("/health/ready", new HealthCheckOptions
+{
+    Predicate = check => check.Tags.Contains("ready")
+});
+```
+
+存活端点接到请求并成功响应就算通过。就绪检查实际执行一次数据库查询，用列表已有的投影最多读取一条摘要。这个查询会检查列表依赖的字段，且避免读取原图字节。数据库暂时没有记录时也能通过，只要查询可以执行。
+
+| 观察结果 | 在本项目里怎么解读 |
+| --- | --- |
+| live 200，ready 200 | HTTP 可达，检测摘要可读 |
+| live 200，ready 503 | HTTP 可达，检测摘要查询失败 |
+| 两个地址都无法连接 | 从端口、进程状态和启动日志开始排查 |
+
+当前就绪范围是检测摘要读取。完整的图像、复核、事件及 MES 恢复仍可通过之前的业务验收确认。
+
+## 3. 让依赖失败和进程失败有不同动作
+
+在部署环境里，就绪检查可作为是否接收流量的依据。数据库短暂不可用时，进程仍然能够记录日志、响应存活检查，等待依赖恢复。把数据库查询放进存活检查，则可能让外部管理器在依赖故障期间反复重启服务。
+
+检查本身也会占用资源，所以这里执行小范围查询。它设置 SQLite 命令超时，并通过健康检查框架把失败记录到服务端日志。探测响应只返回简短状态，维护人员再用请求编号查具体错误。
+
+## 4. 用独立库演练故障和恢复
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --diagnostics
+```
+
+脚本沿用第 10 课的独立测试库，启动时先验证两个探测都返回 200。接着暂时改名检测记录表，核对存活仍为 200、就绪为 503，业务查询返回带请求编号的 500。最后恢复表名，确认就绪和业务查询重新成功。
+
+练习时可以解释为什么空数据库能够就绪，以及为何服务端 503 和工件 NG 分别描述不同对象的状态。
+
+继续学习 [第 21 课 · 观察请求耗时和状态分布](/knowledge/web/full-stack/request-metrics-and-traffic-drill/)。

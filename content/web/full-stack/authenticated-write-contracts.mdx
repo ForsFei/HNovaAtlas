@@ -1,0 +1,84 @@
+---
+id: web-quality-trace-write-contract
+title: "第 13 课 · 把登录与复核写入接口契约"
+description: 描述 Cookie 会话、CSRF、复核请求体和并发冲突，并对照真实登录与提交验证 OpenAPI。
+tags: [Web, OpenAPI, ASP.NET Core, Cookie, CSRF]
+difficulty: intermediate
+status: published
+updated: "2026-11-05"
+order: 130
+prerequisite: [web-quality-trace-openapi]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：查询契约](/knowledge/web/full-stack/openapi-query-contracts/)
+
+查询时给 URL 和参数通常就能开始对接。提交复核还要知道怎样登录、怎样带 Cookie、从哪里取得 CSRF 请求令牌，以及重复提交会发生什么。今天把第 04 课已经实现的规则放进同一份 OpenAPI 文档。
+
+## 1. 同时开启复核与契约
+
+按第 04 课设置三个本地练习密码，每个至少 12 个字符，再在仓库根目录运行。使用原来的数据库时，保持相同的 `--TraceDb`。
+
+```powershell
+$env:Review__Alice = Read-Host 'alice 练习密码' -MaskInput
+$env:Review__Bob = Read-Host 'bob 练习密码' -MaskInput
+$env:Review__Viewer = Read-Host 'viewer 练习密码' -MaskInput
+dotnet run --project examples/web-quality-trace/lesson-03 -- --Review:Enabled true --Contract:Enabled true --urls http://127.0.0.1:43111
+```
+
+打开 [OpenAPI 文档](http://127.0.0.1:43111/openapi/v1.json)，找到 `/api/session`、登录、退出和 `/api/inspections/{id}/review`。启用复核时，这些端点才会注册并进入文档。
+
+## 2. 一次提交的前置条件
+
+| 步骤 | 需要保留什么 |
+| --- | --- |
+| GET /api/session | 响应中的 csrf，以及响应设置的防伪 Cookie |
+| POST /api/session/login | 登录请求携带上述 Cookie 和 X-CSRF-Token |
+| 再次 GET /api/session | 保留登录后的会话 Cookie，并获取当前身份的 csrf |
+| POST /api/inspections/{id}/review | 会话 Cookie、防伪 Cookie、csrf 请求头和 JSON |
+| POST /api/session/logout | 同样携带当前身份的 csrf，退出后重新读取会话 |
+
+OpenAPI 用名为 `localSession` 的安全方案描述 `QualityTrace.Session` Cookie。读取复核、提交复核和退出操作引用这个方案。登录与读取会话允许访客调用。
+
+CSRF 是另一个条件，在所有三个 POST 上作为必需的 `X-CSRF-Token` 请求头描述。它必须与防伪 Cookie 和当前身份配对。浏览器经同源代理调用时自动带 Cookie，命令行客户端则需要自己的 Cookie 容器。 [ASP.NET Core Cookie 认证](https://learn.microsoft.com/en-us/aspnet/core/security/authentication/cookie?view=aspnetcore-10.0) · [防伪令牌](https://learn.microsoft.com/en-us/aspnet/core/security/anti-request-forgery?view=aspnetcore-10.0)
+
+## 3. 用 PowerShell 完成登录
+
+另开一个 PowerShell 7 终端。下面的 `WebRequestSession` 为这次调用保留 Cookie。输入与服务端 alice 配置相同的密码。
+
+```powershell
+$base = 'http://127.0.0.1:43111'
+$jar = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$guest = Invoke-RestMethod "$base/api/session" -WebSession $jar
+$credentials = @{
+    user = 'alice'
+    password = Read-Host 'alice 密码' -MaskInput
+} | ConvertTo-Json
+Invoke-RestMethod "$base/api/session/login" -Method Post -WebSession $jar -ContentType 'application/json' -Headers @{ 'X-CSRF-Token' = $guest.csrf } -Body $credentials
+$current = Invoke-RestMethod "$base/api/session" -WebSession $jar
+$current.user
+```
+
+随后从 NG 列表选择一条未复核的周期，按文档里的请求体提交 `decision` 和 `note`。注意使用登录后重新取得的 `$current.csrf`。
+
+## 4. 请求体、身份与冲突
+
+`decision` 支持 `confirmed-ng` 和 `false-reject`。说明去掉首尾空白后必须为 1 到 500 个字符。操作描述明确这些业务规则，响应 schema 则描述保存后的周期 ID、结论、说明、复核人和 UTC 时间。
+
+复核人从服务器会话取得，JSON 请求体只接收结论与说明。已登录的 viewer 可以读取，提交需要 reviewer 角色。未登录返回 401，角色不足返回 403，非法内容或 CSRF 返回 400。
+
+同一周期只允许一次复核。成功返回 201，已复核或原结果为 OK 返回 409。对接方收到 409 后应重新读取复核，确认当前状态。保持同一个页面不断重发旧内容无法解决业务冲突。
+
+读取复核返回 `{ review: ... }`。当前没有保存的复核时返回 `{ review: null }`，使用者可以先通过详情接口确认周期是否存在。
+
+## 5. 文档声明与实际权限一起验收
+
+```powershell
+dotnet build examples/web-quality-trace/lesson-03
+node examples/web-quality-trace/lesson-03/verify.mjs --review --contract
+```
+
+复核检查现在会同时验证 OpenAPI 中的 Cookie 方案、公开操作、必需 CSRF 请求头、请求体和响应状态，再执行真实的登录、viewer 拒绝、跨会话令牌拒绝，以及两位复核员竞争提交。
+
+OpenAPI 的声明用于帮助客户端对接。实际请求的授权仍由后端中间件与端点策略完成，文档里的角色文字也需要真实的权限测试配合。 [OpenAPI 文档自定义](https://learn.microsoft.com/en-us/aspnet/core/fundamentals/openapi/customize-openapi?view=aspnetcore-10.0)
+
+继续学习 [第 14 课 · 把事件游标与恢复规则写进契约](/knowledge/web/full-stack/event-feed-contract-and-cursor-semantics/)。

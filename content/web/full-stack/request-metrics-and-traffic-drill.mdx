@@ -1,0 +1,77 @@
+---
+id: web-quality-trace-request-metrics
+title: "第 21 课 · 观察请求耗时和状态分布"
+description: 使用 ASP.NET Core 内建 HTTP 指标与 dotnet-counters，结合有限流量练习定位路由、状态和请求日志。
+tags: [Web, ASP.NET Core, 指标, dotnet-counters, 运维]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 210
+prerequisite: [web-quality-trace-health]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：服务存活与查询就绪](/knowledge/web/full-stack/liveness-and-readiness/)
+
+健康检查回答此刻是否可用，请求日志可以追踪某一次失败。这一课观察一段时间内不同路由的响应耗时，再用同一批请求的编号回到日志。
+
+## 1. 启动 API 和指标采集
+
+沿用追溯库，在仓库根目录运行 API。自定义数据库需要继续传同一个 `--TraceDb`。
+
+```powershell
+dotnet run --project examples/web-quality-trace/lesson-03 -- --urls http://127.0.0.1:43111
+```
+
+另开终端，将 `dotnet-counters` 安装在临时目录并列出可附加的进程。已经安装该工具时，可直接使用现有命令。
+
+```powershell
+$metricsTools = Join-Path $env:TEMP 'atlas-metrics-tools'
+dotnet tool install dotnet-counters --tool-path $metricsTools --version 10.0.750501
+$counters = Join-Path $metricsTools 'dotnet-counters.exe'
+& $counters ps
+```
+
+找到当前追溯 API 进程的 ID，填入下面的命令。采集工具与 API 使用同一个本机账号运行。
+
+```powershell
+$apiProcessId = Read-Host '输入追溯 API 的进程 ID'
+$csv = Join-Path $env:TEMP 'atlas-hosting-metrics.csv'
+& $counters collect --process-id $apiProcessId --refresh-interval 1 --format csv --output $csv --counters 'Microsoft.AspNetCore.Hosting[http.server.request.duration]'
+```
+
+看到采集开始后，再发送下一步的请求。完成后用 Ctrl+C 停止采集并查看 CSV。若要直接观察终端，可使用 `monitor` 子命令与同样的进程和指标参数。 [dotnet-counters 命令参考](https://learn.microsoft.com/en-us/dotnet/core/diagnostics/dotnet-counters)
+
+## 2. 发送有限的本机请求
+
+第三个终端运行示例流量脚本。脚本每轮并行发送四个只读请求，轮次之间间隔 250 毫秒。它只连接 `127.0.0.1`，接受 1 到 40 轮。
+
+```powershell
+node examples/web-quality-trace/lesson-03/probe-traffic.mjs http://127.0.0.1:43111 16
+```
+
+| 每轮的请求 | 正常响应 |
+| --- | --- |
+| 查询检测列表 | 200 |
+| 查询非法页码 | 400 |
+| 查询不存在的周期 | 404 |
+| 查询就绪状态 | 200 |
+
+16 轮的预期是 32 次 200、16 次 400 和 16 次 404。脚本从客户端汇总本批状态码，并在 JSON 中保留第一轮请求编号与耗时。实际状态不符合预期时，报告保留差异并以失败退出。
+
+## 3. 看路由模板、状态码和分位数
+
+CSV 中的 `http.server.request.duration` 来自 ASP.NET Core 内建 Meter，单位是秒。按 `http.route` 与 `http.response.status_code` 查对应行。列表的 200 与非法页码的 400 使用同一个路由，状态标签不同。
+
+脚本每轮使用不同的不存在周期编号。指标仍用 `/api/inspections/{id}` 表示它们，所以这些请求可以汇总到同一组。请求编号、周期编号和完整 URL 适合日志检索。将这些每次变化的值做成指标标签会产生大量分组。 [ASP.NET Core 内建 HTTP 指标](https://learn.microsoft.com/en-us/aspnet/core/metrics/http?view=aspnetcore-10.0)
+
+本次采集的 CSV 用 `Percentile=50`、95 和 99 表示各采样窗口的耗时分位数。P95 可理解为该组请求中约 95% 的耗时低于或等于这个值。一次窗口只有少量请求时，分位数容易受个别请求影响。这次小流量用于核对采集链路，延迟指标需要结合更有代表性的负载解读。
+
+脚本统计的是本批请求的状态次数，并从客户端测到读取完响应为止。CSV 耗时来自服务器。可以对照两者观察请求过程，但它们的计时边界和单位不同。
+
+## 4. 从汇总回到一次请求
+
+在 CSV 找到详情路由的 404，再复制脚本第一轮样例中的 `requestId`。去 API 终端查这串编号，可以找到具体的周期路径、状态和耗时。
+
+复习时试着解释，为什么健康检查的 200 无法说明某个业务路由的耗时，以及为什么按路由模板聚合后仍需要请求日志来定位个别失败。
+
+继续学习 [第 22 课 · 看懂 SQLite 查询计划，再决定怎样建索引](/knowledge/web/full-stack/sqlite-query-plan-and-composite-index/)。

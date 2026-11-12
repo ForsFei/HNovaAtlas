@@ -1,0 +1,73 @@
+---
+id: web-quality-trace-query-plan
+title: "第 22 课 · 看懂 SQLite 查询计划，再决定怎样建索引"
+description: 用独立的 24000 行数据对照列表与总数查询，观察复合索引如何支持筛选和排序。
+tags: [Web, SQLite, SQL, 索引, 性能]
+difficulty: intermediate
+status: published
+updated: "2026-11-06"
+order: 220
+prerequisite: [web-quality-trace-request-metrics]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课：请求耗时和状态分布](/knowledge/web/full-stack/request-metrics-and-traffic-drill/)
+
+上一课看到列表请求的耗时，这一课把其中的 SQLite 查询单独取出来观察。追溯列表每次都要查总数和当前页，两条查询使用相同条件，但访问的数据量和执行计划可能不同。
+
+## 1. 运行索引对照
+
+在仓库根目录使用 Node.js 24 运行。
+
+```powershell
+node examples/web-quality-trace/lesson-03/explain-inspection-query.mjs
+```
+
+脚本在内存 SQLite 中生成 24000 条固定分布的记录。它复用列表接口的筛选和排序思路，选定工位、NG 和导入时间范围，查询总数以及从第 21 条起的一页 10 条。摘要字段与应用查询相对应，测试库只保存这些字段。
+
+先运行仅有时间与 ID 索引的查询，再建立候选复合索引。脚本比较总数和当前页逐字段结果，确认两次读取相同。每次都执行 `ANALYZE`，让 SQLite 根据当前索引和样本统计选择计划。
+
+## 2. 按条件读执行计划
+
+列表查询的主要形状如下。总数查询使用相同的 WHERE 条件，投影改为 `COUNT(*)`。
+
+```sql
+SELECT Id, Station, ImportedTicks, Result, RoiMean
+FROM Inspections
+WHERE Station = ? AND Result = ?
+  AND ImportedTicks >= ? AND ImportedTicks < ?
+ORDER BY ImportedTicks DESC, Id DESC
+LIMIT ? OFFSET ?;
+```
+
+在本次 SQLite 3.51.3 演练中，原索引按时间范围缩小扫描，再检查工位和结果。新增索引后，执行计划可以同时利用工位、结果与时间范围。
+
+| 查询 | 原索引 | 增加候选索引后 |
+| --- | --- | --- |
+| 有工位、结果和时间的列表 | 用时间范围查找 | 用工位、结果和时间范围查找 |
+| 同条件的总数 | 用时间范围查找，再读取其余条件 | 使用覆盖索引完成计数 |
+| 全部工位的最新十条 | 沿时间与 ID 索引读取 | 仍选择时间与 ID 索引 |
+
+`SEARCH` 表示使用查询条件定位到部分索引或表记录。执行计划出现 `SCAN` 时，也可能是在按索引顺序读取。第三条查询有 LIMIT，只要取得十条即可停止。看计划时要一起看过滤条件、排序和 LIMIT。 [SQLite EXPLAIN QUERY PLAN](https://www.sqlite.org/eqp.html)
+
+## 3. 复合索引怎样配合这条请求
+
+实验新增的索引列顺序如下。
+
+```sql
+CREATE INDEX IX_Inspections_Station_Result_ImportedTicks_Id
+ON Inspections (Station, Result, ImportedTicks, Id);
+```
+
+查询先用工位和结果两个等值条件，再沿时间范围读取。在这个组合内，时间和 ID 提供确定的排序，两个字段同为降序时 SQLite 可以反向读取索引。ID 也用于区分同一时刻的不同记录。
+
+计数需要的过滤字段都在索引里，所以执行计划显示 `COVERING INDEX`。列表还要取 ROI 均值，这一列在索引之外，需要访问表记录。无工位或结果筛选时，原有时间索引更符合全局排序。 [SQLite 查询规划](https://www.sqlite.org/queryplanner.html)
+
+## 4. 从实验读出适用范围
+
+本次匹配 209 条，两次都返回相同的 10 条当前页。报告里的 `medianMs` 是在同一进程内重复 40 次，每次执行列表与计数两条 SQL 后得到的中位数。它方便在本机对照两份计划。服务端 HTTP 耗时还包括连接、路由、序列化等过程，现场数据分布也会影响索引选择。
+
+索引会占用空间，写入时也需要维护。是否为某个请求建立索引，要看它实际使用哪些条件、执行频率及读写成本。这个练习用独立内存库验证候选索引。
+
+练习时尝试在本地副本调整样本分布，观察 NG 比例升高时的计划与耗时，再解释为什么一个复合索引适合特定筛选组合，以及为什么无筛选列表仍会选择另一个索引。
+
+继续学习 [第 23 课 · 给已有 SQLite 库做一次版本化升级](/knowledge/web/full-stack/versioned-sqlite-index-migration/)。

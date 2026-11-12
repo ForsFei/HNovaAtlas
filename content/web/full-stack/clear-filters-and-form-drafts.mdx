@@ -1,0 +1,120 @@
+---
+id: web-quality-trace-clear-filters
+title: "第 50 课 · 清除筛选与尚未应用的表单草稿"
+description: 为追溯台增加一键清除筛选，保留分页偏好，同时处理 URL、时间草稿、校验错误、详情和历史恢复。
+tags: [Web, React, 表单, URL, 浏览器验收]
+difficulty: intermediate
+status: published
+updated: "2026-11-12"
+order: 500
+prerequisite: [web-quality-trace-page-size]
+---
+
+[系列路线图](/knowledge/web/full-stack/overview/) · [上一课 · 选择每页条数](/knowledge/web/full-stack/selectable-page-size/)
+
+上一课可以保存每页条数，但查完某个工位、班次和复核状态后，还需要逐项清除条件。本课在原有筛选区域增加一个原生按钮“清除筛选”，不增加弹窗或新的操作面板。
+
+## 1. 清除的是业务条件，保留的是浏览偏好
+
+| 参数或状态 | 点击后的结果 |
+| --- | --- |
+| `station`、`result`、`since`、`until`、`reviewStatus` | 从 URL 删除 |
+| `page` | 删除，回到默认第一页 |
+| `id` | 删除，关闭详情 |
+| `pageSize`、`paging` | 保留 |
+| 未应用的时间输入与校验错误 | 清空 |
+
+这样用户可以继续使用上一课选择的 10 条或 20 条，同时回到不限定工位、结果和时间的范围。其他未列出的 URL 参数也会由导航函数保留。
+
+关闭详情会结束对应的局部复核草稿，沿用前面筛选切换的规则；本课没有新增草稿保存能力。
+
+## 2. 用一次导航清除整组参数
+
+在 `main.tsx` 的筛选区加入：
+
+```tsx
+<button type="button" onClick={() => {
+  navigate({
+    station: "", result: "", since: "", until: "",
+    reviewStatus: "", page: "", id: "",
+  });
+  setFilterResetRevision(value => value + 1);
+}}>清除筛选</button>
+```
+
+第 46 课的导航函数把空字符串解释为删除参数。一次调用合并所有变更，使浏览器历史保存完整的清除操作，用户后退时可以回到之前的筛选条件。
+
+工位、结果和复核状态控件直接使用 URL 解析值，清除后自然回到“全部”。没有再为这个按钮单独发送查询请求，新的 URL 会进入现有列表查询流程。
+
+## 3. 为什么删除 URL 还不够
+
+时间表单与几个下拉框不同。它使用 `defaultValue`，允许用户先编辑本地时间，点“应用时间范围”后才将合法的 UTC 条件写入 URL。
+
+因此页面同时存在两类数据：已经应用的查询条件，以及尚未应用的表单草稿。后者可能包含开始晚于结束的输入，也可能正在显示校验错误。
+
+假设 URL 原本没有 `since` 和 `until`，用户只填写草稿后点击清除。删除空参数不会改变 URL，原先只依赖 `[since, until]` 的组件 `key` 也不会改变，表单草稿就会继续留下。
+
+## 4. 用局部版本重置时间表单
+
+父组件增加一个仅用于表单重置的状态：
+
+```typescript
+const [filterResetRevision, setFilterResetRevision] = useState(0);
+```
+
+时间表单的身份由当前条件和重置版本共同决定：
+
+```tsx
+<TimeRangeForm
+  key={JSON.stringify([since, until, filterResetRevision])}
+  since={since}
+  until={until}
+  onApply={navigate}
+/>
+```
+
+点击清除后版本增加，React 重新创建这个表单，输入恢复为空默认值，内部错误状态也重新初始化。使用 `key` 重置表单是 React 支持的状态重置方式。 [React 表单状态重置](https://react.dev/learn/preserving-and-resetting-state#resetting-a-form-with-a-key)
+
+这个版本不进入 URL，也不用于刷新列表。它表达的是一次本地表单重置，而不是新的数据库查询条件。
+
+当 URL 本来就已清除时，导航函数仍会跳过重复的历史写入；表单重置版本照常增加，所以按钮仍能清空未应用的草稿。
+
+## 5. 游标模式保留后怎样展示
+
+游标接口需要明确的工位和 OK 或 NG 结果。清除后保留 `paging=cursor`，但必要条件为空，因此页面显示已有提示：“请选择一个工位和 OK 或 NG 结果。”
+
+这时旧游标列表卸载，不再继续显示之前条件下的累计记录。用户重新选择工位和结果后，从新的游标首页开始。
+
+页码模式没有这两个必选条件，清除后可以直接显示所有范围的第一页。两种展示方式继续使用现有接口规则。
+
+CSV 的 URL 也从已清除的筛选值重新生成，仍按现有上限导出完整筛选范围；它不会把保留的每页条数当作导出数量。
+
+## 6. 历史恢复的范围
+
+如果清除改变了 URL，后退会恢复清除前的工位、结果、时间、页码和详情 ID，前进则再次进入清除后的状态。时间条件改变时表单也会重新挂载，显示对应的已应用值。
+
+未应用的时间草稿和错误提示不在历史条目中，复核草稿也没有进入 URL。历史恢复只承诺恢复已保存的条件与选择。
+
+## 7. 加入真实浏览器检查
+
+`verify-browser.mjs` 新增 `verifyClearFilters`，在已有功能场景之前执行，检查以下路径：
+
+1. 同时携带工位、NG、待复核、时间、页码和详情时清除。
+2. URL 只保留每页条数，控件、时间输入和详情同步更新。
+3. 后退恢复已应用的条件，前进恢复清除后的列表。
+4. URL 已无时间条件时，填入无效时间草稿并触发错误，再清除输入和错误。
+5. 游标模式保留分页方式和条数，转入缺少必选条件的提示。
+
+在前端目录依次执行：
+
+```powershell
+npm run test:e2e
+npm run test:e2e:live
+```
+
+两种模式都会先执行新增路径，再检查原有复核、下载、分页或实时行为。测试复用初始临时证据，不通过删除业务记录来实现“清除”。
+
+复习时想一想：为什么仅删除 `since` 和 `until` 不能清空所有时间输入？为什么重置表单的版本不应传给查询 Hook？如果把整个 `App` 的 `key` 都改掉，会额外重置哪些不需要清除的状态？
+
+
+**下一课** → [第一阶段交付与从零启动](/knowledge/web/full-stack/stage-one-handover/)
