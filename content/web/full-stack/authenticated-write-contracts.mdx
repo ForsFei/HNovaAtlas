@@ -34,7 +34,7 @@ dotnet run --project examples/web-quality-trace/lesson-03 -- --Review:Enabled tr
 | GET /api/session | 响应中的 csrf，以及响应设置的防伪 Cookie |
 | POST /api/session/login | 登录请求携带上述 Cookie 和 X-CSRF-Token |
 | 再次 GET /api/session | 保留登录后的会话 Cookie，并获取当前身份的 csrf |
-| POST /api/inspections/{id}/review | 会话 Cookie、防伪 Cookie、csrf 请求头和 JSON |
+| `POST /api/inspections/{id}/review` | 会话 Cookie、防伪 Cookie、csrf 请求头和 JSON |
 | POST /api/session/logout | 同样携带当前身份的 csrf，退出后重新读取会话 |
 
 OpenAPI 用名为 `localSession` 的安全方案描述 `QualityTrace.Session` Cookie。读取复核、提交复核和退出操作引用这个方案。登录与读取会话允许访客调用。

@@ -29,6 +29,7 @@ jobs:
       - run: npm ci
       - run: npm run prepare:content
       - run: npm run test:content
+      - run: npm run test:web-articles
 
   trace:
     name: API and browser acceptance

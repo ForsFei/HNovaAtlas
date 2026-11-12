@@ -15,6 +15,7 @@
     "pretypecheck": "tsx scripts/prepare-content.ts --if-missing",
     "typecheck": "tsc --noEmit",
     "verify:trace": "node examples/web-quality-trace/verify-course.mjs",
+    "test:web-articles": "node scripts/verify-web-articles.mjs",
     "test:content": "tsx --test tests/content.test.ts tests/home.test.ts tests/search.test.ts tests/mdx.test.tsx tests/interactive.test.tsx tests/performance.test.ts tests/pdo-lab.test.ts tests/tags.test.ts",
     "test:csharp-articles": "tsx scripts/verify-csharp-article-examples.ts"
   },
