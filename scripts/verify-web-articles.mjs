@@ -14,8 +14,8 @@ for (const file of (await readdir(directory)).sort()) {
   const { data, content } = matter(await readFile(new URL(file, directory), "utf8"));
   if (data.status !== "published") continue;
   try {
-    const module = await evaluate(content, { ...runtime, development: false });
-    renderToStaticMarkup(createElement(module.default));
+    const compiled = await evaluate(content, { ...runtime, development: false });
+    renderToStaticMarkup(createElement(compiled.default));
     count++;
   } catch (error) {
     throw new Error(`${file}: tutorial rendering failed`, { cause: error });
